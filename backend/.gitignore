@@ -1,0 +1,23 @@
+# Secrets and per-environment settings
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.pytest_cache/
+
+# Local runtime state and generated artifacts
+ai_madac.db
+uploads/
+charts/
+models/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

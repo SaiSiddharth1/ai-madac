@@ -1,0 +1,41 @@
+Age,Gender,Investment_Avenues,Mutual_Funds,Equity_Market,Debentures,Government_Bonds,Fixed_Deposits,PPF,Gold,Stock_Market,Factor,Objective,Purpose,Duration,Invest_Monitor,Expect,Avenue,Source
+28,Male,Mutual Funds,Yes,No,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,3-5 years,Monthly,20-30%,Mutual Funds,Financial Consultants
+35,Female,Fixed Deposits,No,No,No,No,Yes,No,No,No,Risk,Capital Preservation,Safety,1-3 years,Weekly,10-20%,Fixed Deposits,Newspapers
+22,Male,Equity Market,No,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,5+ years,Daily,30-40%,Equity Market,Internet
+45,Male,Government Bonds,No,No,No,Yes,No,No,No,No,Risk,Capital Preservation,Safety,5+ years,Monthly,10-20%,Government Bonds,Financial Consultants
+30,Female,Mutual Funds,Yes,No,No,No,No,Yes,No,No,Returns,Wealth Creation,Growth,3-5 years,Monthly,20-30%,Mutual Funds,Internet
+27,Male,Equity Market,No,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,3-5 years,Daily,30-40%,Equity Market,Internet
+52,Female,Fixed Deposits,No,No,No,No,Yes,Yes,No,No,Risk,Capital Preservation,Safety,1-3 years,Monthly,10-20%,Fixed Deposits,Financial Consultants
+33,Male,Mutual Funds,Yes,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,3-5 years,Weekly,20-30%,Mutual Funds,Internet
+40,Female,PPF,No,No,No,No,No,Yes,No,No,Risk,Retirement,Safety,5+ years,Monthly,10-20%,PPF,Financial Consultants
+25,Male,Equity Market,No,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,3-5 years,Daily,30-40%,Equity Market,Internet
+38,Female,Gold,No,No,No,No,No,No,Yes,No,Risk,Capital Preservation,Safety,1-3 years,Monthly,10-20%,Gold,Newspapers
+29,Male,Mutual Funds,Yes,No,No,No,No,No,No,No,Returns,Wealth Creation,Growth,3-5 years,Monthly,20-30%,Mutual Funds,Internet
+31,Female,Government Bonds,No,No,Yes,Yes,No,No,No,No,Risk,Retirement,Safety,5+ years,Monthly,10-20%,Government Bonds,Financial Consultants
+26,Male,Mutual Funds,Yes,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,3-5 years,Weekly,20-30%,Mutual Funds,Internet
+48,Male,Fixed Deposits,No,No,No,No,Yes,No,No,No,Risk,Capital Preservation,Safety,1-3 years,Monthly,10-20%,Fixed Deposits,Newspapers
+23,Female,Mutual Funds,Yes,No,No,No,No,Yes,No,No,Returns,Education,Growth,1-3 years,Monthly,10-20%,Mutual Funds,Internet
+36,Male,Equity Market,No,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,5+ years,Daily,30-40%,Equity Market,Financial Consultants
+42,Female,PPF,No,No,No,No,No,Yes,Yes,No,Risk,Retirement,Safety,5+ years,Monthly,10-20%,PPF,Newspapers
+34,Male,Mutual Funds,Yes,No,No,No,Yes,No,No,No,Returns,Wealth Creation,Growth,3-5 years,Monthly,20-30%,Mutual Funds,Internet
+55,Female,Government Bonds,No,No,Yes,Yes,No,No,No,No,Risk,Retirement,Safety,5+ years,Monthly,10-20%,Government Bonds,Financial Consultants
+24,Male,Equity Market,No,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,3-5 years,Daily,30-40%,Equity Market,Internet
+37,Female,Mutual Funds,Yes,No,No,No,No,Yes,No,No,Returns,Wealth Creation,Growth,3-5 years,Weekly,20-30%,Mutual Funds,Financial Consultants
+28,Male,Gold,No,No,No,No,No,No,Yes,No,Returns,Capital Preservation,Growth,1-3 years,Monthly,10-20%,Gold,Internet
+44,Male,Fixed Deposits,No,No,No,No,Yes,No,No,No,Risk,Retirement,Safety,3-5 years,Monthly,10-20%,Fixed Deposits,Financial Consultants
+32,Female,Mutual Funds,Yes,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,3-5 years,Monthly,20-30%,Mutual Funds,Internet
+21,Male,Equity Market,No,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,5+ years,Daily,30-40%,Equity Market,Internet
+50,Female,PPF,No,No,No,No,No,Yes,Yes,No,Risk,Retirement,Safety,5+ years,Monthly,10-20%,PPF,Newspapers
+39,Male,Mutual Funds,Yes,No,No,No,No,No,No,No,Returns,Wealth Creation,Growth,3-5 years,Monthly,20-30%,Mutual Funds,Financial Consultants
+27,Female,Debentures,No,No,Yes,No,No,No,No,No,Returns,Income,Growth,1-3 years,Monthly,10-20%,Debentures,Internet
+46,Male,Government Bonds,No,No,No,Yes,No,No,No,No,Risk,Retirement,Safety,5+ years,Monthly,10-20%,Government Bonds,Financial Consultants
+30,Male,Mutual Funds,Yes,Yes,No,No,No,No,Yes,Yes,Returns,Wealth Creation,Growth,3-5 years,Weekly,20-30%,Mutual Funds,Internet
+43,Female,Fixed Deposits,No,No,No,No,Yes,Yes,No,No,Risk,Capital Preservation,Safety,1-3 years,Monthly,10-20%,Fixed Deposits,Newspapers
+26,Male,Equity Market,No,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,3-5 years,Daily,30-40%,Equity Market,Internet
+35,Female,Mutual Funds,Yes,No,No,No,No,No,Yes,No,Returns,Wealth Creation,Growth,3-5 years,Monthly,20-30%,Mutual Funds,Financial Consultants
+29,Male,PPF,No,No,No,No,No,Yes,No,No,Risk,Retirement,Safety,5+ years,Monthly,10-20%,PPF,Internet
+41,Female,Gold,No,No,No,No,No,No,Yes,No,Risk,Capital Preservation,Safety,1-3 years,Monthly,10-20%,Gold,Newspapers
+33,Male,Mutual Funds,Yes,Yes,No,No,No,No,No,Yes,Returns,Wealth Creation,Growth,3-5 years,Monthly,20-30%,Mutual Funds,Internet
+47,Female,Government Bonds,No,No,Yes,Yes,No,No,No,No,Risk,Retirement,Safety,5+ years,Monthly,10-20%,Government Bonds,Financial Consultants
+22,Male,Mutual Funds,Yes,No,No,No,No,No,No,No,Returns,Education,Growth,1-3 years,Monthly,10-20%,Mutual Funds,Internet
+38,Male,Fixed Deposits,No,No,No,No,Yes,No,No,No,Risk,Capital Preservation,Safety,3-5 years,Monthly,10-20%,Fixed Deposits,Financial Consultants
