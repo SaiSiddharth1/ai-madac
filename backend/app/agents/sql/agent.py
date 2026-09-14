@@ -27,8 +27,12 @@ CRITICAL RULES:
 2. Use the EXACT table name provided in quotes: "{table_name}".
 3. Use the EXACT column names provided in quotes or as lowercase identifiers.
 4. Keep queries efficient. Add LIMIT 1000 unless performing an aggregation (COUNT, SUM, AVG, GROUP BY).
-5. If the question asks about impact, relationship, effect, or comparison (e.g. "Did events affect stock impact?"), write an AGGREGATED query using GROUP BY or conditional averages/counts (e.g. grouping by whether event is NULL or event categories) to compute exact comparison metrics.
-6. Output ONLY the raw SQL query. Do NOT include markdown code blocks (```sql ... ```) or explanation.
+5. Determine the metric before writing SQL: total/funding/commitment/amount = SUM; average/mean = AVG; highest/lowest = MAX/MIN; count/how many = COUNT.
+6. Never answer a requested financial total with COUNT(*). For a top-N category total, GROUP BY the category, SUM the relevant numeric column, ORDER BY that SUM, then LIMIT N.
+7. Apply filters before aggregation. Exclude NULL grouping values and NULL numeric measures from grouped calculations unless the user asks otherwise.
+8. Use descriptive aliases such as total_commitment, average_commitment, maximum_commitment, minimum_commitment, and project_count.
+9. If the question asks about impact, relationship, effect, or comparison (e.g. "Did events affect stock impact?"), write an AGGREGATED query using GROUP BY or conditional averages/counts (e.g. grouping by whether event is NULL or event categories) to compute exact comparison metrics.
+10. Output ONLY the raw SQL query. Do NOT include markdown code blocks (```sql ... ```) or explanation.
 
 Schema details for table "{table_name}":
 {schema_description}
@@ -86,27 +90,28 @@ class SQLAgent:
             columns_info.append(f"  - {col.get('name')} ({col.get('dtype')})")
         schema_desc = "\n".join(columns_info)
 
-        # 1. Generate SQL via LLM
+        # Metric questions are handled by deterministic rules. This protects
+        # against returning a row count for a requested financial total.
         sql_query = ""
-        try:
-            sys_msg = SQL_AGENT_PROMPT.format(
-                table_name=safe_table,
-                schema_description=schema_desc,
-            )
-            response = self.llm.invoke([
-                SystemMessage(content=sys_msg),
-                HumanMessage(content=question),
-            ])
-            raw_sql = response.content.strip()
-
-            # Clean markdown code blocks if present
-            raw_sql = re.sub(r"^```(sql)?\s*", "", raw_sql, flags=re.IGNORECASE)
-            raw_sql = re.sub(r"\s*```$", "", raw_sql)
-            sql_query = raw_sql.strip()
-
-        except Exception as e:
-            logger.warning(f"LLM SQL generation failed: {e}. Using schema-aware query rules.")
+        if self._requires_metric_guardrail(question):
             sql_query = self._build_heuristic_query(question, schema, safe_table)
+        else:
+            try:
+                sys_msg = SQL_AGENT_PROMPT.format(
+                    table_name=safe_table,
+                    schema_description=schema_desc,
+                )
+                response = self.llm.invoke([
+                    SystemMessage(content=sys_msg),
+                    HumanMessage(content=question),
+                ])
+                raw_sql = response.content.strip()
+                raw_sql = re.sub(r"^```(sql)?\s*", "", raw_sql, flags=re.IGNORECASE)
+                raw_sql = re.sub(r"\s*```$", "", raw_sql)
+                sql_query = raw_sql.strip()
+            except Exception as e:
+                logger.warning(f"LLM SQL generation failed: {e}. Using schema-aware query rules.")
+                sql_query = self._build_heuristic_query(question, schema, safe_table)
 
         # 2. Validate SQL
         is_valid, error_msg = validate_sql(sql_query)
@@ -173,7 +178,7 @@ class SQLAgent:
 
         categories = [
             name for name in names
-            if any(token in name.lower() for token in ("country", "sector", "status", "type", "category", "source"))
+            if any(token in name.lower() for token in ("country", "sector", "status", "type", "category", "source", "region", "project", "year", "date"))
         ]
         numeric = [
             str(column.get("name", "")) for column in columns
@@ -181,9 +186,15 @@ class SQLAgent:
             or any(token in str(column.get("name", "")).lower() for token in ("amount", "commitment", "revenue", "profit", "value", "cost", "price", "capital"))
         ]
 
-        requested_categories = [name for name in categories if matches_question(name)]
+        requested_categories = [
+            name for name in categories
+            if matches_question(name) or any(token in q for token in name.lower().split("_") if len(token) > 2)
+        ]
         category = requested_categories[0] if requested_categories else (categories[0] if categories else None)
-        requested_numeric = [name for name in numeric if matches_question(name)]
+        requested_numeric = [
+            name for name in numeric
+            if matches_question(name) or any(token in q for token in name.lower().split("_") if len(token) > 2)
+        ]
         measure = requested_numeric[0] if requested_numeric else (numeric[0] if numeric else None)
 
         # "How many countries/sectors ..." means the number of unique values,
@@ -192,39 +203,73 @@ class SQLAgent:
             selected = requested_categories[0]
             return f"SELECT COUNT(DISTINCT {quoted(selected)}) AS {selected}_count FROM {quoted(table_name)}"
 
-        # For an explicitly requested categorical chart, a frequency table is
-        # the appropriate source data (rather than an arbitrary raw preview).
-        if category and any(word in q for word in ("chart", "plot", "graph", "visualize", "distribution")):
-            return (
-                f"SELECT {quoted(category)}, COUNT(*) AS record_count FROM {quoted(table_name)} "
-                f"GROUP BY {quoted(category)} ORDER BY record_count DESC"
-            )
+        numeric_metric_requested = any(word in q for word in (
+            "total", "sum", "average", "mean", "highest", "lowest", "largest", "smallest",
+            "commitment", "revenue", "funding", "amount", "value",
+        ))
 
-        # Aggregated comparisons, e.g. total commitment by country/sector.
-        if category and measure and any(word in q for word in ("by ", "each ", "per ", "highest", "lowest", "top")) and any(
-            word in q for word in ("total", "sum", "average", "mean", "highest", "lowest", "commitment", "revenue", "amount", "value")
-        ):
-            function = "AVG" if any(word in q for word in ("average", "mean")) else "SUM"
-            alias = f"{function.lower()}_{measure}"
-            order = "ASC" if any(word in q for word in ("lowest", "smallest")) else "DESC"
-            limit = " LIMIT 10" if any(word in q for word in ("highest", "lowest", "top")) else ""
+        # A top-project ranking orders project records by their numeric measure.
+        if category and "project" in category.lower() and requested_categories and measure and any(word in q for word in ("top", "bottom")):
+            order = "ASC" if "bottom" in q else "DESC"
+            top_match = re.search(r"\b(?:top|bottom)\s+(\d+)", q)
+            limit = f" LIMIT {top_match.group(1)}" if top_match else " LIMIT 10"
+            return f"SELECT {quoted(category)}, {quoted(measure)} FROM {quoted(table_name)} WHERE {quoted(category)} IS NOT NULL AND {quoted(measure)} IS NOT NULL ORDER BY {quoted(measure)} {order}{limit}"
+
+        # Numeric aggregation comes before the visualization branch so a chart
+        # of total commitment remains a SUM rather than a project count.
+        if requested_categories and category and measure and any(word in q for word in ("by ", "each ", "per ", "highest", "lowest", "top", "bottom", "compare")) and numeric_metric_requested:
+            if any(word in q for word in ("average", "mean")):
+                function, alias_prefix = "AVG", "average"
+            elif any(word in q for word in ("highest", "largest")):
+                function, alias_prefix = "MAX", "maximum"
+            elif any(word in q for word in ("lowest", "smallest")):
+                function, alias_prefix = "MIN", "minimum"
+            else:
+                function, alias_prefix = "SUM", "total"
+            alias = f"{alias_prefix}_{measure}"
+            order = "ASC" if any(word in q for word in ("lowest", "smallest", "bottom")) else "DESC"
+            top_match = re.search(r"\b(?:top|bottom)\s+(\d+)", q)
+            limit = f" LIMIT {top_match.group(1)}" if top_match else (" LIMIT 10" if any(word in q for word in ("top", "bottom")) else "")
             return (
                 f"SELECT {quoted(category)}, {function}({quoted(measure)}) AS {quoted(alias)} "
-                f"FROM {quoted(table_name)} GROUP BY {quoted(category)} "
+                f"FROM {quoted(table_name)} WHERE {quoted(category)} IS NOT NULL "
+                f"AND {quoted(measure)} IS NOT NULL GROUP BY {quoted(category)} "
                 f"ORDER BY {quoted(alias)} {order}{limit}"
             )
 
-        if measure and any(word in q for word in ("total", "sum", "average", "mean")):
-            function = "AVG" if any(word in q for word in ("average", "mean")) else "SUM"
-            return f"SELECT {function}({quoted(measure)}) AS {quoted(function.lower() + '_' + measure)} FROM {quoted(table_name)}"
+        # A frequency table is appropriate only when no numeric metric was requested.
+        if category and not numeric_metric_requested and any(word in q for word in ("chart", "plot", "graph", "visualize", "distribution")):
+            return (
+                f"SELECT {quoted(category)}, COUNT(*) AS project_count FROM {quoted(table_name)} "
+                f"WHERE {quoted(category)} IS NOT NULL GROUP BY {quoted(category)} ORDER BY project_count DESC"
+            )
+
+        if measure and any(word in q for word in ("total", "sum", "average", "mean", "highest", "largest", "lowest", "smallest")):
+            if any(word in q for word in ("average", "mean")):
+                function, alias = "AVG", "average"
+            elif any(word in q for word in ("highest", "largest")):
+                function, alias = "MAX", "maximum"
+            elif any(word in q for word in ("lowest", "smallest")):
+                function, alias = "MIN", "minimum"
+            else:
+                function, alias = "SUM", "total"
+            return f"SELECT {function}({quoted(measure)}) AS {quoted(alias + '_' + measure)} FROM {quoted(table_name)} WHERE {quoted(measure)} IS NOT NULL"
 
         if category and (asks_for_count() or "breakdown" in q):
             return (
-                f"SELECT {quoted(category)}, COUNT(*) AS record_count FROM {quoted(table_name)} "
-                f"GROUP BY {quoted(category)} ORDER BY record_count DESC"
+                f"SELECT {quoted(category)}, COUNT(*) AS project_count FROM {quoted(table_name)} "
+                f"WHERE {quoted(category)} IS NOT NULL GROUP BY {quoted(category)} ORDER BY project_count DESC"
             )
 
         return f"SELECT * FROM {quoted(table_name)} LIMIT 50"
+
+    @staticmethod
+    def _requires_metric_guardrail(question: str) -> bool:
+        """Return true when a wrong aggregation would change the answer's meaning."""
+        return bool(re.search(
+            r"\b(?:total|sum|average|mean|highest|lowest|largest|smallest|count|how many|number of|commitment|funding|revenue|amount)\b",
+            question.lower(),
+        ))
 
     @staticmethod
     def _unsupported_metric_message(question: str, schema: dict) -> str | None:

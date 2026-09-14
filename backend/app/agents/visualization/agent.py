@@ -84,16 +84,16 @@ class VisualizationAgent:
 
                 if chart_type == "bar":
                     fig = px.bar(
-                        df.head(15),
+                        df,
                         x=x_col,
                         y=y_col,
-                        title=f"Bar Chart: {y_col or 'Count'} by {x_col}",
+                        title=f"{y_col or 'Count'} by {x_col}",
                         color_discrete_sequence=["#6366f1"],
                         template="plotly_dark",
                     )
                 elif chart_type == "line":
                     fig = px.line(
-                        df.head(50),
+                        df,
                         x=x_col,
                         y=y_col,
                         title=f"Line Chart: {y_col} over {x_col}",
@@ -102,7 +102,7 @@ class VisualizationAgent:
                     )
                 elif chart_type == "pie":
                     fig = px.pie(
-                        df.head(10),
+                        df,
                         names=x_col,
                         values=y_col,
                         title=f"Distribution: {x_col}",
@@ -118,13 +118,19 @@ class VisualizationAgent:
                     )
                 elif chart_type == "scatter":
                     fig = px.scatter(
-                        df.head(100),
+                        df,
                         x=x_col,
                         y=y_col,
                         title=f"Scatter Plot: {x_col} vs {y_col}",
                         color_discrete_sequence=["#22d3ee"],
                         template="plotly_dark",
                     )
+                elif chart_type == "area":
+                    fig = px.area(df, x=x_col, y=y_col, title=f"{y_col} over {x_col}", template="plotly_dark")
+                elif chart_type == "box":
+                    fig = px.box(df, x=x_col, y=y_col, title=f"Distribution of {y_col} by {x_col}", template="plotly_dark")
+                elif chart_type == "violin":
+                    fig = px.violin(df, x=x_col, y=y_col, box=True, points="outliers", title=f"Distribution of {y_col} by {x_col}", template="plotly_dark")
                 else:
                     fig = px.bar(
                         df.head(15),
@@ -142,28 +148,9 @@ class VisualizationAgent:
                 margin=dict(l=40, r=40, t=50, b=40),
             )
 
-            # Add a distribution chart when the returned data has a numeric
-            # measure. This gives a non-technical reader both a comparison or
-            # trend view and a sense of the data's spread.
+            # Produce exactly the requested view. An automatic histogram of
+            # aggregate values can change the meaning of a ranking chart.
             figures = [fig]
-            numeric_columns = df.select_dtypes(include=["number"]).columns.tolist()
-            if numeric_columns and chart_type != "histogram" and "Group" not in df.columns:
-                distribution_column = numeric_columns[0]
-                distribution = px.histogram(
-                    df,
-                    x=distribution_column,
-                    nbins=min(20, max(5, len(df) // 2)),
-                    title=f"Distribution of {distribution_column}",
-                    color_discrete_sequence=["#22d3ee"],
-                    template="plotly_dark",
-                )
-                distribution.update_layout(
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="Inter, sans-serif", color="#f1f5f9"),
-                    margin=dict(l=40, r=40, t=50, b=40),
-                )
-                figures.append(distribution)
 
             settings.ensure_directories()
             chart_paths = []
@@ -256,8 +243,20 @@ class VisualizationAgent:
             elif selected_type == "scatter" and y_column:
                 ax.scatter(df[x_column], df[y_column], color="#22d3ee", alpha=0.8)
                 ax.set_ylabel(y_column, color="#dbeafe")
-            elif selected_type == "line" and y_column:
+            elif selected_type == "pie" and y_column:
+                ax.pie(df[y_column], labels=df[x_column].astype(str), autopct="%1.1f%%")
+            elif selected_type in {"line", "area"} and y_column:
+                if selected_type == "area":
+                    ax.fill_between(range(len(df)), df[y_column], color="#22d3ee", alpha=0.35)
                 ax.plot(df[x_column].astype(str), df[y_column], color="#22d3ee", marker="o")
+                ax.set_ylabel(y_column, color="#dbeafe")
+            elif selected_type == "box" and y_column:
+                ax.boxplot([group[y_column].dropna() for _, group in df.groupby(x_column)], tick_labels=[str(name) for name, _ in df.groupby(x_column)])
+                ax.set_ylabel(y_column, color="#dbeafe")
+            elif selected_type == "violin" and y_column:
+                groups = [group[y_column].dropna() for _, group in df.groupby(x_column)]
+                ax.violinplot(groups, showmedians=True)
+                ax.set_xticks(range(1, len(groups) + 1), [str(name) for name, _ in df.groupby(x_column)])
                 ax.set_ylabel(y_column, color="#dbeafe")
             elif y_column:
                 plotted = df.head(15)
@@ -285,6 +284,21 @@ class VisualizationAgent:
         cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
 
         q_lower = question.lower()
+
+        if "area" in q_lower:
+            x_col = cat_cols[0] if cat_cols else cols[0]
+            y_col = num_cols[0] if num_cols else (cols[1] if len(cols) > 1 else None)
+            return "area", x_col, y_col
+
+        if "box plot" in q_lower or "boxplot" in q_lower:
+            x_col = cat_cols[0] if cat_cols else cols[0]
+            y_col = num_cols[0] if num_cols else None
+            return "box", x_col, y_col
+
+        if "violin" in q_lower:
+            x_col = cat_cols[0] if cat_cols else cols[0]
+            y_col = num_cols[0] if num_cols else None
+            return "violin", x_col, y_col
 
         if "pie" in q_lower or "share" in q_lower or "proportion" in q_lower:
             x_col = cat_cols[0] if cat_cols else cols[0]
