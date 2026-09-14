@@ -163,7 +163,18 @@ class ReportAgent:
 
             if len(columns) >= 2:
                 group_column, metric_column = columns[0], columns[1]
-                highest = max(rows, key=lambda row: (row.get(metric_column) is not None, row.get(metric_column, 0)))
+
+                # SQL results are serialized for JSON with missing cells as an
+                # empty string. Convert metric values safely before ranking so
+                # a blank cannot be compared to a float at report time.
+                def numeric_value(row: dict) -> float:
+                    value = row.get(metric_column)
+                    try:
+                        return float(value) if value not in (None, "") else float("-inf")
+                    except (TypeError, ValueError):
+                        return float("-inf")
+
+                highest = max(rows, key=numeric_value)
                 ans = (
                     f"The result contains {len(rows)} {group_column.replace('_', ' ')} group(s). "
                     f"The highest {metric_column.replace('_', ' ')} is {highest.get(metric_column)} "
