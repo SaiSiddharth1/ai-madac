@@ -1,4 +1,7 @@
 import unittest
+from unittest.mock import patch
+
+import pandas as pd
 
 from app.agents.sql.agent import SQLAgent
 
@@ -37,6 +40,16 @@ class SQLMetricGuardrailTests(unittest.TestCase):
         self.assertIn('SELECT "project_name", "commitment_in_u_a"', sql)
         self.assertIn('ORDER BY "commitment_in_u_a" DESC LIMIT 10', sql)
 
+
+    @patch("app.agents.sql.agent.pd.read_sql")
+    def test_sql_result_keeps_missing_numeric_values_as_none(self, mock_read_sql):
+        mock_read_sql.return_value = pd.DataFrame({
+            "country": ["Example", "Missing"],
+            "commitment_in_u_a": [10.0, float("nan")],
+        })
+        state = {"table_name": "finance1", "question": "Show records", "schema": SCHEMA}
+        result = SQLAgent().run(state)
+        self.assertIsNone(result["sql_result"]["rows"][1]["commitment_in_u_a"])
 
 if __name__ == "__main__":
     unittest.main()

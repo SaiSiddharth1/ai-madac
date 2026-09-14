@@ -126,7 +126,10 @@ class SQLAgent:
             df_truncated = df.head(1000)
 
             columns = df_truncated.columns.tolist()
-            rows = df_truncated.fillna("").to_dict(orient="records")
+            # Keep missing numeric values as JSON null, not an empty string.
+            # Mixing empty strings with floats later breaks ordering/ranking.
+            serializable_df = df_truncated.astype(object).where(pd.notna(df_truncated), None)
+            rows = serializable_df.to_dict(orient="records")
 
             result_data = {
                 "query": sql_query,
