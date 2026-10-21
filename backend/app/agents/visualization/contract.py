@@ -54,39 +54,146 @@ SEMANTIC_ALIASES: dict[str, list[str]] = {
 }
 
 
+RANGE_REGEX = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(?:%|-|–|—|to)\s*(\d+(?:\.\d+)?)\s*%?\s*$", re.IGNORECASE)
+
+
+class DataTypeClassifier:
+    """Classifies dataset columns into precise semantic data types."""
+
+    @classmethod
+    def classify(cls, series: Optional[pd.Series], col_name: str = "") -> str:
+        """
+        Classifies series into:
+        - 'numerical': continuous or discrete numbers
+        - 'range_category': discrete brackets like '10-20%', '20-30%'
+        - 'categorical': nominal/ordinal text categories
+        - 'boolean': boolean True/False or 0/1
+        - 'datetime': temporal dates/timestamps
+        - 'identifier': unique IDs/keys
+        """
+        if series is None or len(series) == 0:
+            name_lower = col_name.lower()
+            if any(k in name_lower for k in ("id", "uuid", "key", "code")):
+                return "identifier"
+            if any(k in name_lower for k in ("date", "time", "year", "month", "day", "quarter")):
+                return "datetime"
+            if any(k in name_lower for k in ("age", "salary", "income", "amount", "price", "count", "sales")):
+                return "numerical"
+            if any(k in name_lower for k in ("return", "expect", "range", "bracket")):
+                return "range_category"
+            return "categorical"
+
+        # Check boolean
+        if pd.api.types.is_bool_dtype(series):
+            return "boolean"
+        non_null = series.dropna()
+        if len(non_null) == 0:
+            return "categorical"
+
+        # Check datetime
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return "datetime"
+
+        # Check numerical dtype
+        if pd.api.types.is_numeric_dtype(series):
+            # Check if identifier
+            if series.nunique() == len(series) and any(k in col_name.lower() for k in ("id", "key", "code")):
+                return "identifier"
+            return "numerical"
+
+        # Check range category (e.g. '10-20%', '20-30%', '30-40%')
+        str_vals = non_null.astype(str).str.strip()
+        range_matches = str_vals.apply(lambda v: bool(RANGE_REGEX.match(v)))
+        if range_matches.mean() >= 0.6:
+            return "range_category"
+
+        # Check if can convert to float
+        numeric_series = pd.to_numeric(str_vals, errors="coerce")
+        if numeric_series.notna().mean() >= 0.85:
+            return "numerical"
+
+        # Check identifier
+        if series.nunique() == len(series) and (
+            any(k in col_name.lower() for k in ("id", "key", "code", "ssn", "uuid")) or len(series) > 100
+        ):
+            return "identifier"
+
+        return "categorical"
+
+
 @dataclass
 class QueryContract:
     """
     Structured query contract created before chart selection.
-    Preserved throughout the pipeline and used to strictly validate the final specification.
+    Source of truth for validation, chart selection, data calculation, and rendering.
     """
     raw_question: str
-    requested_fields: list[str] = field(default_factory=list)
-    dimensions: list[str] = field(default_factory=list)
-    measure: dict[str, Any] = field(default_factory=lambda: {"type": "count", "column": None})
+    visualization_required: bool = False
     intent: str = "categorical_comparison"
-    explicit_chart_type: Optional[str] = None
+    requested_dimensions: list[str] = field(default_factory=list)
+    requested_measures: list[dict[str, Any] | str] = field(default_factory=lambda: ["count"])
+    requested_fields: list[str] = field(default_factory=list)
     filters: list[dict[str, Any]] = field(default_factory=list)
+    bin: Optional[dict[str, Any]] = None
+    requested_chart: Optional[str] = None
     sorting: dict[str, Any] = field(default_factory=lambda: {"field": None, "direction": None})
     limit: Optional[int] = None
-    binning: Optional[dict[str, Any]] = None
     is_follow_up: bool = False
-    visualization_required: bool = False
+
+    # Backward compatibility properties
+    @property
+    def dimensions(self) -> list[str]:
+        return self.requested_dimensions
+
+    @dimensions.setter
+    def dimensions(self, val: list[str]):
+        self.requested_dimensions = val
+
+    @property
+    def measure(self) -> dict[str, Any]:
+        if self.requested_measures and isinstance(self.requested_measures[0], dict):
+            return self.requested_measures[0]
+        return {"type": "count", "column": None}
+
+    @measure.setter
+    def measure(self, val: dict[str, Any]):
+        self.requested_measures = [val]
+
+    @property
+    def binning(self) -> Optional[dict[str, Any]]:
+        return self.bin
+
+    @binning.setter
+    def binning(self, val: Optional[dict[str, Any]]):
+        self.bin = val
+
+    @property
+    def explicit_chart_type(self) -> Optional[str]:
+        return self.requested_chart
+
+    @explicit_chart_type.setter
+    def explicit_chart_type(self, val: Optional[str]):
+        self.requested_chart = val
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "raw_question": self.raw_question,
             "visualization_required": self.visualization_required,
-            "requested_fields": self.requested_fields,
-            "dimensions": self.dimensions,
-            "measure": self.measure,
             "intent": self.intent,
-            "explicit_chart_type": self.explicit_chart_type,
+            "requested_dimensions": self.requested_dimensions,
+            "requested_measures": self.requested_measures,
+            "requested_fields": self.requested_fields,
             "filters": self.filters,
+            "bin": self.bin,
+            "binning": self.bin,
+            "requested_chart": self.requested_chart,
+            "explicit_chart_type": self.requested_chart,
             "sorting": self.sorting,
             "limit": self.limit,
-            "binning": self.binning,
             "is_follow_up": self.is_follow_up,
+            # Legacy field aliases
+            "dimensions": self.requested_dimensions,
+            "measure": self.measure,
         }
 
 
@@ -192,61 +299,42 @@ def extract_query_contract(
     anaphoric_tokens = (" it ", " that ", " this ", " the same ", " same result ", " same data ")
     has_anaphoric = any(tok in q for tok in anaphoric_tokens)
 
-    # Identify requested column matches from the query
-    matched_cols: list[str] = []
-    matched_positions: list[tuple[int, str]] = []
+    # Identify requested column matches with token spans to avoid duplicate column collisions
+    candidate_spans: list[tuple[int, int, str]] = []
 
-    # Score each column against the query
     for col in available_cols:
         col_norm = normalize_term(col)
         col_singular = col_norm[:-1] if col_norm.endswith("s") else col_norm
         col_plural = (col_norm[:-1] + "ies") if col_norm.endswith("y") else (col_norm + "s")
 
-        # Check exact phrases
         patterns = [
             r"\b" + re.escape(col_norm) + r"\b",
             r"\b" + re.escape(col_singular) + r"\b",
             r"\b" + re.escape(col_plural) + r"\b",
         ]
-        # Also check semantic aliases
         for alias_key, aliases in SEMANTIC_ALIASES.items():
             if col_norm == alias_key or col_norm in aliases:
                 for alias in aliases:
                     patterns.append(r"\b" + re.escape(alias) + r"\b")
 
-        pos = -1
         for pat in patterns:
-            m = re.search(pat, q)
-            if m:
-                pos = m.start()
-                break
+            for m in re.finditer(pat, q):
+                candidate_spans.append((m.start(), m.end(), col))
 
-        if pos != -1 and col not in matched_cols:
-            matched_positions.append((pos, col))
+    # Span deduplication: if two column matches overlap on the same token span in user query,
+    # keep only one column (preventing collision like 'investment_avenues' + 'avenue' on "investment avenues")
+    accepted_spans: list[tuple[int, int, str]] = []
+    for start, end, col in sorted(candidate_spans, key=lambda x: (x[1] - x[0]), reverse=True):
+        overlap = any(max(start, s[0]) < min(end, s[1]) for s in accepted_spans)
+        if not overlap:
+            accepted_spans.append((start, end, col))
 
-    # Sort matched columns by order of appearance in the user query
-    matched_positions.sort(key=lambda x: x[0])
-    matched_cols = [col for _, col in matched_positions]
-
-    # Special handling for "gender" if "male" or "female" or "gender" appears in question
-    gender_col = next((c for c in available_cols if c.lower() == "gender" or "gender" in c.lower()), None)
-    if gender_col and gender_col not in matched_cols:
-        if any(term in q for term in (" male ", " female ", " men ", " women ", " gender ", " males ", " females ")):
-            matched_cols.append(gender_col)
-
-    # Special handling for "objective" if "objective" or "goal" in question
-    obj_col = next((c for c in available_cols if "objective" in c.lower() or "goal" in c.lower()), None)
-    if obj_col and obj_col not in matched_cols:
-        if any(term in q for term in (" objective ", " objectives ", " goal ", " goals ")):
-            matched_cols.append(obj_col)
-
-    # Special handling for "avenue" if "avenue" in question
-    ave_col = next((c for c in available_cols if c.lower() == "avenue" or ("avenue" in c.lower() and "investment" not in c.lower())), None)
-    if not ave_col:
-        ave_col = next((c for c in available_cols if "avenue" in c.lower()), None)
-    if ave_col and ave_col not in matched_cols:
-        if any(term in q for term in (" avenue ", " avenues ", " investment avenue ")):
-            matched_cols.append(ave_col)
+    # Sort accepted spans by appearance order in query
+    accepted_spans.sort(key=lambda x: x[0])
+    matched_cols: list[str] = []
+    for _, _, col in accepted_spans:
+        if col not in matched_cols:
+            matched_cols.append(col)
 
     # An explicit follow-up is ONLY valid if NO new dataset columns are requested
     is_follow_up = False
@@ -277,17 +365,67 @@ def extract_query_contract(
     elif re.search(r"\barea chart\b|\barea\b", q):
         explicit_chart = "area"
 
-    # Identify numerical columns among matched columns
-    numeric_dtypes = {"int", "int64", "integer", "float", "float64", "double", "number"}
-    numeric_matched = [c for c in matched_cols if dtypes_map.get(c, "") in numeric_dtypes or "age" in c.lower() or "return" in c.lower() or "income" in c.lower() or "salary" in c.lower()]
-    categorical_matched = [c for c in matched_cols if c not in numeric_matched]
+    # Identify numerical columns and data types
+    numeric_matched = []
+    range_matched = []
+    categorical_matched = []
+
+    for c in matched_cols:
+        col_type = dtypes_map.get(c, "")
+        if any(nt in col_type for nt in ("int", "float", "double", "number")) or "age" in c.lower() or "income" in c.lower() or "salary" in c.lower():
+            numeric_matched.append(c)
+        elif any(rt in c.lower() for rt in ("expect", "return", "range", "bracket")) and not any(nt in col_type for nt in ("int", "float", "double")):
+            range_matched.append(c)
+        else:
+            categorical_matched.append(c)
+
+    # Detect Filters
+    filters: list[dict[str, Any]] = []
+
+    # 1. Return percentage range / category: "between 30% and 40%", "30-40%"
+    return_range_match = re.search(r"(\d+)\s*(?:%|-|–|—|to|and)\s*(\d+)\s*%", q)
+    if return_range_match:
+        ret_col = next((c for c in available_cols if "expect" in c.lower() or "return" in c.lower()), "Expect")
+        low, high = int(return_range_match.group(1)), int(return_range_match.group(2))
+        filters.append({
+            "column": ret_col,
+            "field": ret_col,
+            "op": "==",
+            "operator": "equals",
+            "value": f"{low}-{high}%",
+            "range_val": (low, high),
+        })
+
+    # 2. Age filters: "above 40", "> 40", "older than 40"
+    age_filter_match = re.search(r"\b(?:above|older than|greater than|>)\s*(\d+)", q)
+    if age_filter_match:
+        age_col = next((c for c in available_cols if c.lower() == "age" or "age" in c.lower()), "age")
+        filters.append({"column": age_col, "field": age_col, "op": ">", "operator": "greater_than", "value": int(age_filter_match.group(1))})
+    age_under_match = re.search(r"\b(?:under|younger than|less than|<)\s*(\d+)", q)
+    if age_under_match:
+        age_col = next((c for c in available_cols if c.lower() == "age" or "age" in c.lower()), "age")
+        filters.append({"column": age_col, "field": age_col, "op": "<", "operator": "less_than", "value": int(age_under_match.group(1))})
+
+    # 3. Categorical filters: female only, male only
+    gender_col = next((c for c in available_cols if c.lower() == "gender" or "gender" in c.lower()), "gender")
+    if re.search(r"\b(?:female|women)\b", q) and not re.search(r"\b(?:gender|male and female|both)\b", q):
+        if gender_col and gender_col not in matched_cols:
+            filters.append({"column": gender_col, "field": gender_col, "op": "==", "operator": "equals", "value": "Female"})
+    elif re.search(r"\bmale\b|\bmen\b", q) and not re.search(r"\b(?:gender|male and female|both)\b", q):
+        if gender_col and gender_col not in matched_cols:
+            filters.append({"column": gender_col, "field": gender_col, "op": "==", "operator": "equals", "value": "Male"})
+
+    # Separate filter columns from dimensions to be plotted!
+    filter_cols = {f.get("column") for f in filters if f.get("column")}
+    plot_dimensions = [c for c in categorical_matched if c not in filter_cols]
+    plot_matched_cols = [c for c in matched_cols if c not in filter_cols]
 
     # Detect measure requested (count, average, sum, min, max)
     measure_type = "count"
     measure_col = None
     if re.search(r"\b(?:average|mean|avg)\b", q):
         measure_type = "mean"
-        measure_col = numeric_matched[0] if numeric_matched else None
+        measure_col = numeric_matched[0] if numeric_matched else (range_matched[0] if range_matched else None)
     elif re.search(r"\b(?:total|sum)\b", q):
         measure_type = "sum"
         measure_col = numeric_matched[0] if numeric_matched else None
@@ -298,51 +436,42 @@ def extract_query_contract(
         measure_type = "min"
         measure_col = numeric_matched[0] if numeric_matched else None
 
+    # Detect Binning (e.g., "bins of 5", "bins of 5 years", "bin size 5")
+    bin_spec: Optional[dict[str, Any]] = None
+    bin_match = re.search(r"\b(?:bins?\s*(?:of|size)?\s*(\d+)|(\d+)\s*(?:years?|year)?\s*bins?)\b", q)
+    if bin_match:
+        size = int(bin_match.group(1) or bin_match.group(2))
+        bin_spec = {"mode": "fixed", "size": size, "bin_size": size}
+
     # Detect Intent
     intent = "categorical_comparison"
     if explicit_chart == "histogram" or re.search(r"\b(?:distribution|histogram|spread)\b", q):
         intent = "distribution"
-    elif explicit_chart == "scatter" or (len(numeric_matched) >= 2 and any(tok in q for tok in ("versus", "vs", "relationship", "correlation", "scatter", "against", "and"))):
+        if not bin_spec:
+            bin_spec = {"mode": "auto"}
+    elif explicit_chart == "scatter":
+        intent = "relationship"
+    elif len(numeric_matched) >= 2 and any(tok in q for tok in ("versus", "vs", "relationship", "correlation", "against")):
         intent = "relationship"
         if not explicit_chart:
             explicit_chart = "scatter"
-    elif len(categorical_matched) >= 2 and any(tok in q for tok in ("versus", "vs", "by", "across", "and")):
+    elif len(numeric_matched) == 1 and (len(range_matched) == 1 or len(categorical_matched) == 1) and any(tok in q for tok in ("versus", "vs", "relationship", "against")):
+        # One numerical + one categorical/range: Box plot represents distribution across brackets
+        intent = "distribution"
+        if not explicit_chart:
+            explicit_chart = "box"
+    elif len(plot_dimensions) >= 2 and any(tok in q for tok in ("versus", "vs", "by", "across", "and")):
         intent = "cross_tabulation"
+    elif filters and len(plot_dimensions) == 1:
+        intent = "filtered_categorical_distribution"
     elif explicit_chart == "pie" or re.search(r"\b(?:proportion|percentage|share|ratio)\b", q):
         intent = "proportion"
     elif re.search(r"\b(?:trend|over time|growth|over the years|monthly|yearly)\b", q):
         intent = "trend"
     elif re.search(r"\b(?:rank|ranking|top|bottom|most popular|least popular)\b", q):
         intent = "ranking"
-    elif len(matched_cols) == 0 and not is_follow_up:
+    elif len(plot_matched_cols) == 0 and not is_follow_up:
         intent = "single_metric"
-
-    # Detect Filters
-    filters: list[dict[str, Any]] = []
-    # 1. Age filters: "above 40", "> 40", "older than 40"
-    age_filter_match = re.search(r"\b(?:above|older than|greater than|>)\s*(\d+)", q)
-    if age_filter_match:
-        age_col = next((c for c in available_cols if c.lower() == "age" or "age" in c.lower()), "age")
-        filters.append({"column": age_col, "op": ">", "value": int(age_filter_match.group(1))})
-    age_under_match = re.search(r"\b(?:under|younger than|less than|<)\s*(\d+)", q)
-    if age_under_match:
-        age_col = next((c for c in available_cols if c.lower() == "age" or "age" in c.lower()), "age")
-        filters.append({"column": age_col, "op": "<", "value": int(age_under_match.group(1))})
-
-    # 2. Return percentage range: "between 30% and 40%", "30-40%"
-    return_range_match = re.search(r"(\d+)\s*(?:%|-|to|and)\s*(\d+)\s*%", q)
-    if return_range_match:
-        ret_col = next((c for c in available_cols if "return" in c.lower() or "expect" in c.lower()), "expected_return")
-        low, high = int(return_range_match.group(1)), int(return_range_match.group(2))
-        filters.append({"column": ret_col, "op": "between", "value": (low, high)})
-
-    # 3. Categorical filters: female only, male only
-    if re.search(r"\b(?:female|women)\b", q) and not re.search(r"\b(?:gender|male and female|both)\b", q):
-        if gender_col and gender_col not in matched_cols:
-            filters.append({"column": gender_col, "op": "==", "value": "Female"})
-    elif re.search(r"\bmale\b|\bmen\b", q) and not re.search(r"\b(?:gender|male and female|both)\b", q):
-        if gender_col and gender_col not in matched_cols:
-            filters.append({"column": gender_col, "op": "==", "value": "Male"})
 
     # Detect Sorting & Limits
     sorting: dict[str, Any] = {"field": None, "direction": None}
@@ -356,26 +485,29 @@ def extract_query_contract(
     if limit_match:
         limit = int(limit_match.group(1))
 
-    # Detect Binning (e.g., "bins of 5 years", "bin size 5")
-    binning: Optional[dict[str, Any]] = None
-    bin_match = re.search(r"\b(?:bins?\s*(?:of|size)?\s*(\d+)|(\d+)\s*(?:years?|year)?\s*bins?)\b", q)
-    if bin_match:
-        size = int(bin_match.group(1) or bin_match.group(2))
-        binning = {"bin_size": size}
+    vis_required = (
+        is_visualization_requested(q_raw, intent)
+        or bool(explicit_chart)
+        or intent in ("cross_tabulation", "distribution", "relationship", "filtered_categorical_distribution")
+    )
 
-    vis_required = is_visualization_requested(q_raw, intent) or bool(explicit_chart) or intent in ("cross_tabulation", "distribution", "relationship")
+    dimensions = (
+        plot_dimensions
+        if plot_dimensions
+        else ([] if intent in ("relationship", "distribution") else plot_matched_cols)
+    )
 
     return QueryContract(
         raw_question=q_raw,
-        requested_fields=matched_cols,
-        dimensions=categorical_matched if categorical_matched else ([] if intent in ("relationship", "distribution") else matched_cols),
-        measure={"type": measure_type, "column": measure_col},
+        visualization_required=vis_required,
         intent=intent,
-        explicit_chart_type=explicit_chart,
+        requested_dimensions=dimensions,
+        requested_measures=[{"type": measure_type, "column": measure_col}],
+        requested_fields=plot_matched_cols if plot_matched_cols else matched_cols,
         filters=filters,
+        bin=bin_spec,
+        requested_chart=explicit_chart,
         sorting=sorting,
         limit=limit,
-        binning=binning,
         is_follow_up=is_follow_up,
-        visualization_required=vis_required,
     )

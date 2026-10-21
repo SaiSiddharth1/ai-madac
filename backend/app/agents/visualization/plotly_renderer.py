@@ -14,7 +14,7 @@ import os
 import uuid
 import json
 import logging
-from typing import Any
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -97,8 +97,8 @@ class PlotlyRenderer:
 
         # 2. Histogram / Distribution
         elif chart_type == "histogram" and x_col and x_col in cols:
-            binning = spec.get("binning") or {}
-            bin_size = binning.get("bin_size")
+            binning = spec.get("binning") or spec.get("bins") or {}
+            bin_size = binning.get("bin_size") or binning.get("size")
             fig = px.histogram(
                 df,
                 x=x_col,
@@ -106,29 +106,57 @@ class PlotlyRenderer:
                 color_discrete_sequence=[AI_MADAC_PALETTE[0]],
             )
             if bin_size:
-                fig.update_traces(xbins=dict(size=bin_size))
+                min_v = float(df[x_col].min())
+                max_v = float(df[x_col].max())
+                start_edge = float(np.floor(min_v / bin_size) * bin_size)
+                end_edge = float(np.ceil(max_v / bin_size) * bin_size)
+                fig.update_traces(xbins=dict(start=start_edge, end=end_edge + bin_size, size=bin_size))
             fig.update_layout(
                 xaxis_title=x_col.replace("_", " ").title(),
                 yaxis_title="Number of Investors (Raw Observations)",
                 bargap=0.08,
             )
 
-        # 3. Scatter Plot
-        elif chart_type == "scatter" and x_col and y_col and x_col in cols and y_col in cols:
-            fig = px.scatter(
-                df,
-                x=x_col,
-                y=y_col,
-                title=title,
-                color_discrete_sequence=[AI_MADAC_PALETTE[5]],
-            )
-            fig.update_traces(marker=dict(size=9, opacity=0.85, line=dict(width=1, color="#1e293b")))
-            fig.update_layout(
-                xaxis_title=x_col.replace("_", " ").title(),
-                yaxis_title=y_col.replace("_", " ").title(),
-            )
+        # 3. Box Plot (e.g. numerical metric across categorical or range categories)
+        elif chart_type in ("box", "box_plot") and x_col and x_col in cols:
+            box_y = y_col if y_col in cols else next((c for c in cols if c != x_col), None)
+            if box_y:
+                fig = px.box(
+                    df,
+                    x=x_col,
+                    y=box_y,
+                    title=title,
+                    color=x_col,
+                    color_discrete_sequence=AI_MADAC_PALETTE,
+                )
+                fig.update_layout(
+                    xaxis_title=x_col.replace("_", " ").title(),
+                    yaxis_title=box_y.replace("_", " ").title(),
+                    showlegend=False,
+                )
+            else:
+                fig = px.box(df, y=x_col, title=title, color_discrete_sequence=[AI_MADAC_PALETTE[0]])
 
-        # 4. Pie / Donut
+        # 4. Scatter Plot (with transparent midpoint support)
+        elif chart_type == "scatter" and x_col and x_col in cols:
+            actual_y = y_col if (y_col and y_col in cols) else next((c for c in cols if c != x_col), None)
+            if actual_y:
+                fig = px.scatter(
+                    df,
+                    x=x_col,
+                    y=actual_y,
+                    title=title,
+                    color_discrete_sequence=[AI_MADAC_PALETTE[5]],
+                )
+                fig.update_traces(marker=dict(size=9, opacity=0.85, line=dict(width=1, color="#1e293b")))
+                fig.update_layout(
+                    xaxis_title=x_col.replace("_", " ").title(),
+                    yaxis_title=actual_y.replace("_", " ").title(),
+                )
+            else:
+                fig = go.Figure()
+
+        # 5. Pie / Donut
         elif chart_type == "pie" and x_col and x_col in cols:
             val_col = cols[1] if len(cols) > 1 else "investor_count"
             is_donut = (mode == "donut" or "donut" in str(chart.get("type", "")).lower())
@@ -244,9 +272,28 @@ class PlotlyRenderer:
             elif chart_type == "histogram" and x_col and x_col in df.columns:
                 ax.hist(df[x_col].dropna(), bins=min(20, max(5, len(df) // 2)), color="#6366F1", edgecolor="#0f172a")
                 ax.set_ylabel("Number of Investors", color="#dbeafe")
-            elif chart_type == "scatter" and x_col and y_col and x_col in df.columns and y_col in df.columns:
-                ax.scatter(df[x_col], df[y_col], color="#06B6D4", alpha=0.85, edgecolors="#1e293b")
-                ax.set_ylabel(y_col.replace("_", " ").title(), color="#dbeafe")
+            elif chart_type in ("box", "box_plot") and x_col and x_col in df.columns:
+                box_y = y_col if (y_col and y_col in df.columns) else next((c for c in df.columns if c != x_col), None)
+                if box_y:
+                    groups_data = []
+                    labels = []
+                    for grp_name, grp_df in df.groupby(x_col):
+                        labels.append(str(grp_name))
+                        groups_data.append(grp_df[box_y].dropna().values)
+                    if groups_data:
+                        bp = ax.boxplot(groups_data, tick_labels=labels, patch_artist=True)
+                        for patch in bp['boxes']:
+                            patch.set_facecolor("#6366F1")
+                            patch.set_edgecolor("#94a3b8")
+                        for median in bp['medians']:
+                            median.set_color("#EC4899")
+                            median.set_linewidth(2)
+                    ax.set_ylabel(box_y.replace("_", " ").title(), color="#dbeafe")
+            elif chart_type == "scatter" and x_col and x_col in df.columns:
+                actual_y = y_col if (y_col and y_col in df.columns) else next((c for c in df.columns if c != x_col), None)
+                if actual_y:
+                    ax.scatter(df[x_col], df[actual_y], color="#06B6D4", alpha=0.85, edgecolors="#1e293b")
+                    ax.set_ylabel(actual_y.replace("_", " ").title(), color="#dbeafe")
             elif chart_type == "pie" and x_col and x_col in df.columns:
                 val_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
                 values = df[val_col] if val_col != x_col else df[x_col].value_counts().values

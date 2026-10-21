@@ -126,7 +126,7 @@ async def visualization_validator_node(state: AgentState) -> dict[str, Any]:
     if errors:
         await workflow_event_manager.emit(query_id, "visualization_validator", "failed", f"Validation error: {errors[0]}")
     else:
-        await workflow_event_manager.emit(query_id, "visualization_validator", "completed", "Specification validated: all requested fields verified")
+        await workflow_event_manager.emit(query_id, "visualization_validator", "completed", "Specification validated: all requested fields, filters and parameters verified")
     return _record_agent_completion(state, res, "visualization_validator")
 
 

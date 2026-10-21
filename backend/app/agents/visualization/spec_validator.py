@@ -162,6 +162,11 @@ class SpecValidator:
             if not fields.get("x") or not fields.get("y"):
                 return False, "Scatter plot requires both x and y numerical fields."
 
+        # 7. Box Plot Validation:
+        if contract.explicit_chart_type in ("box", "box_plot"):
+            if chart_type not in ("box", "box_plot"):
+                return False, f"Box plot was explicitly requested, but specification returned '{chart_type}'."
+
         return True, None
 
     @staticmethod
@@ -178,8 +183,56 @@ class SpecValidator:
         explicit_chart = contract.explicit_chart_type
         intent = contract.intent
 
+        # Case 0: Explicit Box Plot (e.g. Age versus Expected Return)
+        if explicit_chart in ("box", "box_plot"):
+            # Put categorical/bracket on X, numerical on Y
+            if len(requested) >= 2:
+                d1, d2 = requested[0], requested[1]
+                if "age" in d1.lower() or "income" in d1.lower() or "salary" in d1.lower():
+                    y_col, x_col = d1, d2
+                else:
+                    y_col, x_col = d2, d1
+            else:
+                y_col = requested[0] if requested else "Age"
+                x_col = available_columns[0]
+
+            return {
+                "visualization_available": True,
+                "query_interpretation": {
+                    "intent": "distribution",
+                    "requested_fields": [y_col, x_col],
+                },
+                "fields": {
+                    "x": x_col,
+                    "y": y_col,
+                    "color": None,
+                    "facet": None,
+                },
+                "measure": {
+                    "type": "raw",
+                    "column": y_col,
+                },
+                "filters": contract.filters,
+                "sorting": contract.sorting,
+                "limit": contract.limit,
+                "binning": None,
+                "chart": {
+                    "type": "box",
+                    "orientation": "vertical",
+                },
+                "title": f"{y_col.replace('_', ' ').title()} Distribution by {x_col.replace('_', ' ').title()}",
+                "axis_labels": {
+                    "x": x_col.replace("_", " ").title(),
+                    "y": y_col.replace("_", " ").title(),
+                },
+                "legend": {
+                    "show": False,
+                    "title": None,
+                },
+            }
+
         # Case: Relationship / Scatter
-        # e.g. "Show age versus expected return"
+        # e.g. "Show age versus expected return as a scatter plot"
         if intent == "relationship" or explicit_chart == "scatter":
             x_col = requested[0] if len(requested) > 0 else "age"
             y_col = requested[1] if len(requested) > 1 else (requested[0] if len(requested) > 0 else "expected_return")
