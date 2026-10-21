@@ -290,17 +290,31 @@ class SQLAgent:
         # A multi-dimensional question must preserve every requested
         # dimension. This is a deterministic cross-tab rather than a raw
         # preview or a single-column popularity result.
-        avenue = next((name for name in names if name.lower() == "avenue"), None)
-        objective = next((name for name in names if name.lower() == "objective"), None)
+        dim_candidates = []
+        for name in names:
+            norm_name = name.lower().replace("_", " ")
+            if norm_name in q or name.lower() in q:
+                dim_candidates.append(name)
+        if any(term in q for term in ("gender", "male", "female")):
+            gender_col = next((name for name in names if name.lower() == "gender"), None)
+            if gender_col and gender_col not in dim_candidates:
+                dim_candidates.append(gender_col)
+        if any(term in q for term in ("objective", "goal")):
+            obj_col = next((name for name in names if "objective" in name.lower() or "goal" in name.lower()), None)
+            if obj_col and obj_col not in dim_candidates:
+                dim_candidates.append(obj_col)
+        if any(term in q for term in ("avenue",)):
+            ave_col = next((name for name in names if name.lower() == "avenue"), None)
+            if ave_col and ave_col not in dim_candidates:
+                dim_candidates.append(ave_col)
+
         expect = next((name for name in names if name.lower() in {"expect", "expected_return", "expected return"}), None)
         range_match = re.search(r"(\d+)\s*[-–—]\s*(\d+)\s*%", question)
-        asks_avenue = "avenue" in q
-        asks_objective = "objective" in q
-        if operation == "FREQUENCY" and asks_avenue and asks_objective and avenue and objective:
-            clauses = [f"{quoted(avenue)} IS NOT NULL", f"{quoted(objective)} IS NOT NULL"]
+
+        if len(dim_candidates) >= 2 and any(token in q for token in ("versus", "vs", "by", "across", "and")):
+            d1, d2 = dim_candidates[0], dim_candidates[1]
+            clauses = [f"{quoted(d1)} IS NOT NULL", f"{quoted(d2)} IS NOT NULL"]
             if expect and range_match:
-                # Categorical percentage bands are matched as values. A
-                # numeric expected-return column still gets an inclusive range.
                 low, high = range_match.groups()
                 expect_dtype = next((str(c.get("dtype", "")).lower() for c in columns if c.get("name") == expect), "")
                 if expect_dtype in {"int", "int64", "float", "float64", "integer", "number"}:
@@ -308,9 +322,9 @@ class SQLAgent:
                 else:
                     clauses.append(f"{quoted(expect)} = '{low}-{high}%'")
             return (
-                f"SELECT {quoted(avenue)}, {quoted(objective)}, COUNT(*) AS investor_count "
+                f"SELECT {quoted(d1)}, {quoted(d2)}, COUNT(*) AS investor_count "
                 f"FROM {quoted(table_name)} WHERE {' AND '.join(clauses)} "
-                f"GROUP BY {quoted(avenue)}, {quoted(objective)} ORDER BY investor_count DESC"
+                f"GROUP BY {quoted(d1)}, {quoted(d2)} ORDER BY investor_count DESC"
             )
         asks_visual = bool(re.search(r"\b(?:chart|plot|graph|visualize|pie|bar|bargraph|distribution|histogram)\b", q))
         numeric_metric_requested = any(word in q for word in (

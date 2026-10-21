@@ -168,21 +168,43 @@ User Question: "{question}"
 
     @staticmethod
     def _follow_up_intent(question: str, has_previous: bool) -> str | None:
-        """Reuse context only for an explicit reference, never because state exists."""
+        """Reuse context only for an explicit anaphoric reference, never because state exists."""
         if not has_previous:
             return None
         q = f" {question.lower().strip()} "
         chart_keywords = ("bar chart", "pie chart", "line chart", "scatter", "histogram", "box plot", "heatmap", "visualize", "plot", "graph", "chart")
         asks_chart = any(token in q for token in chart_keywords)
-        references_previous = any(token in q for token in (" it ", " that ", "same result", "same data", "this result", "previous result", "the results", "only the results", "where is", "where's", "where are", "show", "give me", "create", "generate")) or asks_chart
-        if not references_previous:
+
+        # Explicit filter follow-ups modifying the prior query
+        filter_refinement_phrases = (
+            "only the results", "only for ", "filter for ", "filter by ",
+            "now show only", "just the ", "just for ", "restricted to ", "for only"
+        )
+        is_filter_followup = any(token in q for token in filter_refinement_phrases)
+        if is_filter_followup:
+            return "FOLLOW_UP_FILTER"
+
+        # Explicit sort follow-ups
+        if any(token in q for token in ("sort by", "sort it", "highest to lowest", "lowest to highest", "order by")):
+            return "FOLLOW_UP_SORT"
+
+        # An explicit visualization follow-up must contain clear anaphoric reference to the previous result
+        has_anaphoric = any(token in q for token in (" it ", " that ", " this ", " same result", " same data", " same as ", " the same ", " previous result"))
+
+        # If user explicitly mentions domain entities/columns, it is an independent new query
+        explicit_entities = (
+            "gender", "male", "female", "objective", "avenue", "age", "return", "expected",
+            "income", "duration", "department", "salary", "sales", "product", "region", "country"
+        )
+        matched_entities = [token for token in explicit_entities if token in q]
+        if matched_entities and not any(phrase in q for phrase in ("same result", "same data", "the same")):
             return None
+
+        if not has_anaphoric:
+            return None
+
         if asks_chart:
             return "FOLLOW_UP_VISUALIZATION"
-        if any(token in q for token in ("sort", "highest to lowest", "lowest to highest")):
-            return "FOLLOW_UP_SORT"
-        if any(token in q for token in ("filter", "only ", "for male", "for female")):
-            return "FOLLOW_UP_FILTER"
         if any(token in q for token in ("explain", "why ", "what does")):
             return "FOLLOW_UP_EXPLANATION"
         return None

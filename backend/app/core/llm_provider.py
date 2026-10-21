@@ -53,6 +53,8 @@ def get_llm(
             model=selected_model or "gemini-1.5-flash",
             temperature=temperature,
             google_api_key=settings.GOOGLE_API_KEY,
+            max_retries=1,
+            timeout=10,
         )
 
     elif selected_provider == "anthropic":
