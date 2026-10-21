@@ -277,7 +277,7 @@ User Question: "{question}"
         # A rank of individual records ("top transactions by sales") is not
         # a grouped aggregation.  An explicit total/average by a dimension is.
         entity_rank = bool(re.search(r"\b(?:transaction|record|project)s?\b", q))
-        asks_visual = bool(re.search(r"\b(?:chart|plot|graph|visualize|pie|bar|bargraph|distribution|histogram)\b", q))
+        asks_visual = bool(re.search(r"\b(?:chart|plot|graph|visual(?:ize|ly|s)?|pie|bar|bargraph|distribution|histogram)\b", q))
         group_by_needed = bool(dimension and (
             is_frequency or is_percentage or (requested_aggregate in {"SUM", "AVG"}) or
             (is_rank and not entity_rank) or "each" in q or is_gender_both or asks_visual

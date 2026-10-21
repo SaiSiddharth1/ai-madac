@@ -139,7 +139,7 @@ class SQLAgent:
         try:
             df = pd.read_sql(sql_query, con=sync_engine)
             # Do not forward a raw preview to the Report Agent when it cannot
-            # satisfy the shared analytical intent.  One deterministic retry
+            # satisfy the shared analytical intent. One deterministic retry
             # protects against an invalid LLM/legacy fallback query.
             if not self._result_answers_intent(df.columns.tolist(), structured_intent):
                 retry_query = self._build_heuristic_query(question, schema, safe_table, structured_intent)
@@ -151,13 +151,18 @@ class SQLAgent:
                     sql_query = retry_query
                     df = pd.read_sql(sql_query, con=sync_engine)
                 if not self._result_answers_intent(df.columns.tolist(), structured_intent):
-                    return {
-                        "sql_query": sql_query,
-                        "sql_result": None,
-                        "errors": state.get("errors", []) + [
-                            "SQL result columns do not satisfy the requested analytical intent."
-                        ],
-                    }
+                    if df.empty or len(df.columns) == 0:
+                        return {
+                            "sql_query": sql_query,
+                            "sql_result": None,
+                            "errors": state.get("errors", []) + [
+                                "SQL result columns do not satisfy the requested analytical intent."
+                            ],
+                        }
+                    logger.warning(
+                        "SQL result columns %s do not strictly match intent %s, but dataframe contains %d rows. Proceeding with data.",
+                        df.columns.tolist(), structured_intent, len(df),
+                    )
             df_truncated = df.head(1000)
 
             columns = df_truncated.columns.tolist()
@@ -215,18 +220,46 @@ class SQLAgent:
     @staticmethod
     def _result_answers_intent(columns: list[str], structured_intent: dict[str, Any]) -> bool:
         """Reject result shapes that cannot answer a structured aggregation."""
+        if not columns:
+            return False
         operation = structured_intent.get("operation")
         target = structured_intent.get("target_column")
+        col_lower = [c.lower() for c in columns]
+        target_lower = target.lower() if target else ""
+        target_in_cols = target_lower in col_lower if target_lower else False
+
+        agg_keywords = (
+            "count", "total", "sum", "avg", "average", "mean",
+            "max", "maximum", "min", "minimum", "percentage", "pct",
+            "investor_count", "project_count", "total_rows"
+        )
+        has_agg_col = any(any(kw in c for kw in agg_keywords) for c in col_lower)
+
+        # Single-column results: valid for distribution / histogram or single target/aggregate extraction
+        if len(columns) == 1:
+            if target_in_cols or has_agg_col or operation in ("RETRIEVE", "AGGREGATE"):
+                return True
+
         if operation in {"FREQUENCY", "PERCENTAGE"}:
-            return bool(target and target in columns and any("count" in c.lower() or "percentage" in c.lower() or c in ("investor_count", "count") for c in columns))
+            # Distribution or histogram on a numeric/categorical column
+            if target_in_cols and (has_agg_col or len(columns) == 1):
+                return True
+            if target_in_cols and len(columns) >= 2:
+                return True
+            if has_agg_col and len(columns) >= 2:
+                return True
+            return False
+
         if operation == "AGGREGATE":
             if structured_intent.get("group_by_needed"):
-                return bool(target and target in columns and (len(columns) >= 2 or any("count" in c.lower() or "total" in c.lower() for c in columns)))
+                if target_in_cols and (len(columns) >= 2 or has_agg_col):
+                    return True
+                if has_agg_col and len(columns) >= 2:
+                    return True
+                return False
             return (
-                "investor_count" in columns
-                or "total_rows" in columns
-                or any("count" in c.lower() or "total" in c.lower() for c in columns)
-                or bool(target and target in columns)
+                has_agg_col
+                or target_in_cols
                 or len(columns) == 1
             )
         return True
@@ -259,9 +292,17 @@ class SQLAgent:
             return '"' + name.replace('"', '""') + '"'
 
         def matches_question(name: str) -> bool:
-            normalized = name.lower().replace("_", " ")
-            plural = name.lower()[:-1] + "ies" if name.lower().endswith("y") else name.lower() + "s"
-            return name.lower() in q or normalized in q or plural in q
+            clean = name.lower().replace("_", " ")
+            if re.search(r"\b" + re.escape(clean) + r"\b", q):
+                return True
+            singular = clean[:-1] if clean.endswith("s") else clean
+            plural = clean[:-1] + "ies" if clean.endswith("y") else clean + "s"
+            if re.search(r"\b" + re.escape(singular) + r"\b", q) or re.search(r"\b" + re.escape(plural) + r"\b", q):
+                return True
+            if clean in {"expect", "invest", "monitor", "save", "saving", "commit", "fund"}:
+                if re.search(r"\b" + re.escape(clean) + r"(?:ed|ing|s|ation|ment)?\b", q):
+                    return True
+            return False
 
         def asks_for_count() -> bool:
             return bool(re.search(r"\b(?:how many|number of|count)\b", q))
@@ -291,10 +332,16 @@ class SQLAgent:
         # dimension. This is a deterministic cross-tab rather than a raw
         # preview or a single-column popularity result.
         dim_candidates = []
+        if target and any(c.lower() == target.lower() for c in names):
+            matched_target = next(c for c in names if c.lower() == target.lower())
+            dim_candidates.append(matched_target)
+
         for name in names:
-            norm_name = name.lower().replace("_", " ")
-            if norm_name in q or name.lower() in q:
+            if name in dim_candidates:
+                continue
+            if matches_question(name):
                 dim_candidates.append(name)
+
         if any(term in q for term in ("gender", "male", "female")):
             gender_col = next((name for name in names if name.lower() == "gender"), None)
             if gender_col and gender_col not in dim_candidates:
@@ -308,10 +355,19 @@ class SQLAgent:
             if ave_col and ave_col not in dim_candidates:
                 dim_candidates.append(ave_col)
 
+        numeric_metric_requested = any(word in q for word in (
+            "total", "sum", "average", "mean", "highest", "lowest", "largest", "smallest",
+            "commitment", "revenue", "funding", "amount", "value", "price", "sales", "cost"
+        ))
+        is_numeric_aggregation = (
+            numeric_metric_requested
+            or (structured_intent and structured_intent.get("aggregation") in {"SUM", "AVG"})
+        )
+
         expect = next((name for name in names if name.lower() in {"expect", "expected_return", "expected return"}), None)
         range_match = re.search(r"(\d+)\s*[-–—]\s*(\d+)\s*%", question)
 
-        if len(dim_candidates) >= 2 and any(token in q for token in ("versus", "vs", "by", "across", "and")):
+        if not is_numeric_aggregation and len(dim_candidates) >= 2 and any(token in q for token in ("versus", "vs", "by", "across", "and")):
             d1, d2 = dim_candidates[0], dim_candidates[1]
             clauses = [f"{quoted(d1)} IS NOT NULL", f"{quoted(d2)} IS NOT NULL"]
             if expect and range_match:
@@ -326,15 +382,7 @@ class SQLAgent:
                 f"FROM {quoted(table_name)} WHERE {' AND '.join(clauses)} "
                 f"GROUP BY {quoted(d1)}, {quoted(d2)} ORDER BY investor_count DESC"
             )
-        asks_visual = bool(re.search(r"\b(?:chart|plot|graph|visualize|pie|bar|bargraph|distribution|histogram)\b", q))
-        numeric_metric_requested = any(word in q for word in (
-            "total", "sum", "average", "mean", "highest", "lowest", "largest", "smallest",
-            "commitment", "revenue", "funding", "amount", "value", "price", "sales", "cost"
-        ))
-        is_numeric_aggregation = (
-            numeric_metric_requested
-            or (structured_intent and structured_intent.get("aggregation") in {"SUM", "AVG"})
-        )
+        asks_visual = bool(re.search(r"\b(?:chart|plot|graph|visual(?:ize|ly|s)?|pie|bar|bargraph|distribution|histogram)\b", q))
         asks_histogram = bool(re.search(r"\b(?:histogram|distribution)\b", q))
         is_target_numeric = any(
             c.get("name") == target and str(c.get("dtype", "")).lower() in {"int", "int64", "integer", "float", "float64", "double", "number"}
