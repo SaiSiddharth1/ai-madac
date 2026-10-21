@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { apiQueryDataset, apiGetDatasetQueries } from "@/lib/api";
 import AgentStatusBadge from "./AgentStatusBadge";
 import AgentWorkflow, { WorkflowState, AgentState } from "./AgentWorkflow";
+import PlotlyChart from "./PlotlyChart";
 import type { FullQueryResponse } from "@/types";
 
 interface ChatInterfaceProps {
@@ -321,19 +322,28 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
                       people can understand the result without reading a table. */}
                   {chartPaths.length > 0 && (
                     <section style={{ margin: "16px 0" }}>
-                      <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--accent)", marginBottom: "8px" }}>
-                        📊 Visual Analysis
+                      <div style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--accent)", marginBottom: "10px", display: "flex", alignItems: "center", gap: "6px" }}>
+                        <span>📊</span> Visual Analysis & Interactive Plotly
                       </div>
-                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: "12px" }}>
-                        {chartPaths.map((path: string, chartIndex: number) => (
-                          <figure key={path} style={{ margin: 0, overflow: "hidden", border: "1px solid var(--border)", borderRadius: "12px", background: "var(--bg-input)" }}>
-                            <img
-                              src={`${chartBaseUrl}${path}`}
-                              alt={`Analysis chart ${chartIndex + 1}`}
-                              style={{ display: "block", width: "100%", height: "auto" }}
+                      <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                        {chartPaths.map((path: string, chartIndex: number) => {
+                          const vizResult = rInfo.visualization_result || (rInfo.data_used && rInfo.data_used.visualization);
+                          const params = rInfo.parameters || (rInfo.data_used && rInfo.data_used.parameters) || vizResult?.parameters;
+                          const explanation = vizResult?.explanation;
+                          const chartJson = rInfo.chart_json || (rInfo.data_used && rInfo.data_used.chart_json);
+
+                          return (
+                            <PlotlyChart
+                              key={path}
+                              chartPath={path}
+                              chartIndex={chartIndex}
+                              chartJson={chartJson}
+                              parameters={params}
+                              explanation={explanation}
+                              baseUrl={chartBaseUrl}
                             />
-                          </figure>
-                        ))}
+                          );
+                        })}
                       </div>
                     </section>
                   )}

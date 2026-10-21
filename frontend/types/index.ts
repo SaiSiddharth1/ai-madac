@@ -63,6 +63,9 @@ export interface QueryResult {
     answer: string;
     insights: string[] | null;
     chart_paths: string[] | null;
+    chart_json?: Record<string, any> | null;
+    parameters?: Record<string, any> | null;
+    visualization_result?: Record<string, any> | null;
     data_used: Record<string, any> | null;
     agents_used: string[] | null;
     created_at: string;

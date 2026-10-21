@@ -321,6 +321,14 @@ class SQLAgent:
             numeric_metric_requested
             or (structured_intent and structured_intent.get("aggregation") in {"SUM", "AVG"})
         )
+        asks_histogram = bool(re.search(r"\b(?:histogram|distribution)\b", q))
+        is_target_numeric = any(
+            c.get("name") == target and str(c.get("dtype", "")).lower() in {"int", "int64", "integer", "float", "float64", "double", "number"}
+            for c in columns
+        )
+        if asks_histogram and target and is_target_numeric:
+            return f"SELECT {quoted(target)} FROM {quoted(table_name)} WHERE {quoted(target)} IS NOT NULL"
+
         if asks_visual and target and not is_numeric_aggregation:
             limit = " LIMIT 1" if any(phrase in q for phrase in ("most popular", "most common", "least popular", "least common")) else ""
             return (

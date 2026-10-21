@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class QueryRequest(BaseModel):
@@ -42,11 +42,45 @@ class ReportResponse(BaseModel):
     answer: str
     insights: Optional[list[str]] = None
     chart_paths: Optional[list[str]] = None
+    chart_json: Optional[dict[str, Any]] = None
+    parameters: Optional[dict[str, Any]] = None
+    visualization_result: Optional[dict[str, Any]] = None
     data_used: Optional[dict[str, Any]] = None
     agents_used: Optional[list[str]] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_visualization_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            d_used = data.get("data_used") or {}
+            if isinstance(d_used, dict):
+                data.setdefault("chart_json", d_used.get("chart_json"))
+                data.setdefault("parameters", d_used.get("parameters"))
+                data.setdefault("visualization_result", d_used.get("visualization"))
+            return data
+
+        d_used = getattr(data, "data_used", None) or {}
+        if isinstance(d_used, dict):
+            chart_json = getattr(data, "chart_json", None) or d_used.get("chart_json")
+            parameters = getattr(data, "parameters", None) or d_used.get("parameters")
+            visualization_result = getattr(data, "visualization_result", None) or d_used.get("visualization")
+            return {
+                "id": getattr(data, "id", None),
+                "query_id": getattr(data, "query_id", None),
+                "answer": getattr(data, "answer", ""),
+                "insights": getattr(data, "insights", []),
+                "chart_paths": getattr(data, "chart_paths", []),
+                "chart_json": chart_json,
+                "parameters": parameters,
+                "visualization_result": visualization_result,
+                "data_used": d_used,
+                "agents_used": getattr(data, "agents_used", []),
+                "created_at": getattr(data, "created_at", None),
+            }
+        return data
 
 
 class FullQueryResponse(BaseModel):

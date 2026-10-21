@@ -124,16 +124,23 @@ class ReportAgent:
                     if viz and viz.get("key_insights")
                     else ["The chart uses the exact values from the preceding analysis; no new analysis was performed."]
                 )
+                prev_data_used = {
+                    "query": previous.get("query"),
+                    "columns": previous.get("columns_used", []),
+                    "rows": previous.get("result", []),
+                    "row_count": previous.get("row_count", 0),
+                    "visualization": viz,
+                    "parameters": viz.get("parameters"),
+                    "chart_json": viz.get("chart_json"),
+                }
                 final_report = {
-                    "answer": answer,
+                    "answer": str(answer),
                     "insights": insights,
                     "chart_paths": viz.get("chart_paths", []),
-                    "data_used": {
-                        "query": previous.get("query"),
-                        "columns": previous.get("columns_used", []),
-                        "rows": previous.get("result", []),
-                        "row_count": previous.get("row_count", 0),
-                    },
+                    "chart_json": viz.get("chart_json"),
+                    "parameters": viz.get("parameters"),
+                    "visualization_result": viz,
+                    "data_used": prev_data_used,
                     "agents_used": list(set(agents_used)),
                 }
                 return {"final_report": final_report, "agents_used": agents_used}
@@ -217,11 +224,20 @@ class ReportAgent:
                 if viz_result.get("key_insights"):
                     insights = viz_result["key_insights"]
 
+        data_used_payload = sql_result or {}
+        if isinstance(data_used_payload, dict) and viz_result:
+            data_used_payload["visualization"] = viz_result
+            data_used_payload["parameters"] = viz_result.get("parameters")
+            data_used_payload["chart_json"] = viz_result.get("chart_json")
+
         final_report = {
-            "answer": answer,
+            "answer": str(answer),
             "insights": insights,
             "chart_paths": chart_paths,
-            "data_used": sql_result,
+            "chart_json": viz_result.get("chart_json") if viz_result else None,
+            "parameters": viz_result.get("parameters") if viz_result else None,
+            "visualization_result": viz_result,
+            "data_used": data_used_payload,
             "agents_used": list(set(agents_used)),
         }
         logger.info(
