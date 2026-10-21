@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.state import AgentState
-from app.db.models import Dataset, DatasetProfile, Query, AgentRun, Report
+from app.db.models import Dataset, DatasetProfile, Query, AgentRun, Report, ConversationResult
 from app.graphs.workflow import workflow_graph
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,7 @@ async def execute_query(
     user_id: UUID,
     dataset_id: UUID,
     question: str,
+    session_id: str | None,
     db: AsyncSession,
 ) -> dict:
     """
@@ -64,16 +65,23 @@ async def execute_query(
     await db.commit()
     await db.refresh(query_record)
 
+    # Context is read by key, but it is only eligible for an explicit
+    # follow-up. Every new question still starts with empty execution fields.
+    previous = await get_previous_validated_result(db, user_id, dataset_id, session_id)
     # 4. Construct initial AgentState
     initial_state: AgentState = {
         "user_id": str(user_id),
         "dataset_id": str(dataset_id),
         "query_id": str(query_record.id),
+        "session_id": session_id or "",
         "question": question,
         "table_name": dataset.table_name,
         "schema": dataset.schema_info or {},
         "dataset_profile": profile_json,
+        "previous_validated_result": previous,
+        "validated_result": None,
         "intent": "",
+        "structured_intent": {},
         "execution_plan": [],
         "sql_query": None,
         "sql_result": None,
@@ -134,6 +142,8 @@ async def execute_query(
         agents_used=agents_invoked,
     )
     db.add(report_record)
+    if final_state.get("validated_result"):
+        await save_validated_result(db, user_id, dataset_id, session_id, final_state["validated_result"])
     await db.commit()
     await db.refresh(report_record)
 
@@ -144,3 +154,30 @@ async def execute_query(
         "report": report_record,
         "agents": agent_run_models,
     }
+
+
+async def get_previous_validated_result(db: AsyncSession, user_id: UUID, dataset_id: UUID, session_id: str | None) -> dict | None:
+    if not session_id:
+        return None
+    result = await db.execute(select(ConversationResult).where(
+        ConversationResult.user_id == user_id,
+        ConversationResult.dataset_id == dataset_id,
+        ConversationResult.session_id == session_id,
+    ).order_by(ConversationResult.updated_at.desc()))
+    row = result.scalars().first()
+    return row.result_json if row else None
+
+
+async def save_validated_result(db: AsyncSession, user_id: UUID, dataset_id: UUID, session_id: str | None, artifact: dict) -> None:
+    if not session_id:
+        return
+    result = await db.execute(select(ConversationResult).where(
+        ConversationResult.user_id == user_id,
+        ConversationResult.dataset_id == dataset_id,
+        ConversationResult.session_id == session_id,
+    ))
+    row = result.scalars().first()
+    if row:
+        row.result_json = artifact
+    else:
+        db.add(ConversationResult(user_id=user_id, dataset_id=dataset_id, session_id=session_id, result_json=artifact))

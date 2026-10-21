@@ -129,6 +129,18 @@ class Report(Base):
     query = relationship("Query", back_populates="report")
 
 
+class ConversationResult(Base):
+    """Latest validated artifact, isolated by user, dataset, and browser session."""
+    __tablename__ = "conversation_results"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    dataset_id = Column(UUID(as_uuid=True), ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, index=True)
+    session_id = Column(String(128), nullable=False, index=True)
+    result_json = Column(JSON, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class MLModel(Base):
     """Trained ML model metadata."""
     __tablename__ = "ml_models"

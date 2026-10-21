@@ -2,6 +2,8 @@
 AI MADAC — FastAPI Application Entry Point.
 """
 
+# AI MADAC Application Entry Point
+# Updated query intent routing & response rewriter
 import logging
 from contextlib import asynccontextmanager
 

@@ -25,6 +25,17 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
   const [fetchingHistory, setFetchingHistory] = useState(true);
   const [workflowState, setWorkflowState] = useState<WorkflowState | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const sessionIdRef = useRef("");
+
+  useEffect(() => {
+    const key = `madac_session_${datasetId}`;
+    let sessionId = localStorage.getItem(key);
+    if (!sessionId) {
+      sessionId = crypto.randomUUID();
+      localStorage.setItem(key, sessionId);
+    }
+    sessionIdRef.current = sessionId;
+  }, [datasetId]);
 
   const getHistoricalWorkflowState = (query: any, report: any): WorkflowState => {
     const intent = query.intent || "DATA_RETRIEVAL";
@@ -113,11 +124,16 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
           "Content-Type": "application/json",
           "Authorization": `Bearer ${token || ""}`,
         },
-        body: JSON.stringify({ question: q }),
+        body: JSON.stringify({ question: q, session_id: sessionIdRef.current }),
       });
 
       if (!response.ok) {
-        throw new Error("Failed to start workflow stream");
+        let detail = `HTTP ${response.status}`;
+        try {
+          const errBody = await response.json();
+          detail = errBody.detail || JSON.stringify(errBody);
+        } catch { /* response wasn't JSON */ }
+        throw new Error(`Failed to start workflow stream: ${detail}`);
       }
 
       const reader = response.body?.getReader();

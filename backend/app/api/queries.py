@@ -40,6 +40,7 @@ async def run_query(
         user_id=current_user.id,
         dataset_id=dataset_id,
         question=body.question,
+        session_id=body.session_id,
         db=db,
     )
 
@@ -71,6 +72,7 @@ async def run_query_stream(
     from app.core.workflow_events import workflow_event_manager
     from app.graphs.workflow import workflow_graph
     from app.db.models import Dataset, DatasetProfile, AgentRun, Report
+    from app.services.query_service import get_previous_validated_result, save_validated_result
 
     # 1. Fetch dataset & check ownership
     result = await db.execute(
@@ -101,6 +103,7 @@ async def run_query_stream(
     await db.refresh(query_record)
 
     query_id_str = str(query_record.id)
+    previous = await get_previous_validated_result(db, current_user.id, dataset_id, body.session_id)
     queue = workflow_event_manager.register(query_id_str)
 
     async def event_generator() -> AsyncGenerator[str, None]:
@@ -111,11 +114,15 @@ async def run_query_stream(
                     "user_id": str(current_user.id),
                     "dataset_id": str(dataset_id),
                     "query_id": query_id_str,
+                    "session_id": body.session_id or "",
                     "question": body.question,
                     "table_name": dataset.table_name,
                     "schema": dataset.schema_info or {},
                     "dataset_profile": profile_json,
+                    "previous_validated_result": previous,
+                    "validated_result": None,
                     "intent": "",
+                    "structured_intent": {},
                     "execution_plan": [],
                     "sql_query": None,
                     "sql_result": None,
@@ -164,6 +171,8 @@ async def run_query_stream(
                     agents_used=agents_invoked,
                 )
                 db.add(report_record)
+                if final_state.get("validated_result"):
+                    await save_validated_result(db, current_user.id, dataset_id, body.session_id, final_state["validated_result"])
                 await db.commit()
                 await db.refresh(query_record)
                 await db.refresh(report_record)

@@ -5,6 +5,7 @@ Classifies user question intent and constructs an execution plan routing to spec
 
 import json
 import logging
+import re
 from typing import Any
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -75,6 +76,22 @@ class SupervisorAgent:
 
         # First check heuristic analytical triggers for instant accuracy
         q_lower = question.lower()
+        structured_intent = self._parse_structured_intent(question, schema)
+        follow_up = self._follow_up_intent(question, bool(state.get("previous_validated_result")))
+        if follow_up:
+            prev = state.get("previous_validated_result") or {}
+            prev_rows = prev.get("result", [])
+            can_direct_visualize = bool(prev.get("validated") and (len(prev_rows) >= 2 or "result" not in prev))
+            if follow_up == "FOLLOW_UP_VISUALIZATION":
+                plan = ["visualization_agent", "report_agent"] if can_direct_visualize else ["sql_agent", "visualization_agent", "report_agent"]
+            else:
+                plan = ["sql_agent", "report_agent"]
+            return {
+                "intent": follow_up,
+                "structured_intent": {**structured_intent, "mode": follow_up},
+                "execution_plan": plan,
+                "agents_used": ["supervisor_agent"],
+            }
         analytical_keywords = [
             "affect", "impact", "influence", "relationship", "correlation",
             "associated", "related", "factors", "difference", "effect", "why"
@@ -101,6 +118,13 @@ User Question: "{question}"
             intent = data.get("intent", "DATA_RETRIEVAL")
             plan = data.get("execution_plan", ["sql_agent", "report_agent"])
 
+            # Deterministic aggregation intent takes precedence over an LLM's
+            # broad retrieval label.  It prevents a frequency question from
+            # being routed as a request for raw records.
+            if structured_intent["operation"] in {"AGGREGATE", "FREQUENCY", "PERCENTAGE", "RANK"}:
+                intent = "AGGREGATION"
+                plan = ["sql_agent", "report_agent"]
+
             # Ensure analytical queries get data_analyst_agent and bypass sql_agent
             if any(kw in q_lower for kw in analytical_keywords):
                 if intent not in ["RELATIONSHIP_ANALYSIS", "DATA_ANALYSIS", "PREDICTION"]:
@@ -120,16 +144,143 @@ User Question: "{question}"
             if self._should_visualize(question, intent) and "visualization_agent" not in plan:
                 plan.insert(plan.index("report_agent"), "visualization_agent")
 
+            if "visualization_agent" in plan and "sql_agent" not in plan and "data_analyst_agent" not in plan:
+                prev = state.get("previous_validated_result") or {}
+                if not (prev.get("validated") and len(prev.get("result", [])) >= 2):
+                    plan.insert(0, "sql_agent")
+
             logger.info(f"Supervisor intent classified: '{intent}', plan: {plan}")
             return {
                 "intent": intent,
                 "execution_plan": plan,
+                "structured_intent": structured_intent,
                 "agents_used": ["supervisor_agent"],
             }
 
         except Exception as e:
             logger.warning(f"LLM supervisor classification failed: {e}. Falling back to rule-based routing.")
-            return self._heuristic_routing(question)
+            fallback = self._heuristic_routing(question)
+            if structured_intent["operation"] in {"AGGREGATE", "FREQUENCY", "PERCENTAGE", "RANK"}:
+                fallback["intent"] = "AGGREGATION"
+                fallback["execution_plan"] = ["sql_agent", "report_agent"]
+            fallback["structured_intent"] = structured_intent
+            return fallback
+
+    @staticmethod
+    def _follow_up_intent(question: str, has_previous: bool) -> str | None:
+        """Reuse context only for an explicit reference, never because state exists."""
+        if not has_previous:
+            return None
+        q = f" {question.lower().strip()} "
+        chart_keywords = ("bar chart", "pie chart", "line chart", "scatter", "histogram", "box plot", "heatmap", "visualize", "plot", "graph", "chart")
+        asks_chart = any(token in q for token in chart_keywords)
+        references_previous = any(token in q for token in (" it ", " that ", "same result", "same data", "this result", "previous result", "the results", "only the results", "where is", "where's", "where are", "show", "give me", "create", "generate")) or asks_chart
+        if not references_previous:
+            return None
+        if asks_chart:
+            return "FOLLOW_UP_VISUALIZATION"
+        if any(token in q for token in ("sort", "highest to lowest", "lowest to highest")):
+            return "FOLLOW_UP_SORT"
+        if any(token in q for token in ("filter", "only ", "for male", "for female")):
+            return "FOLLOW_UP_FILTER"
+        if any(token in q for token in ("explain", "why ", "what does")):
+            return "FOLLOW_UP_EXPLANATION"
+        return None
+
+    @staticmethod
+    def _parse_structured_intent(question: str, schema: dict[str, Any]) -> dict[str, Any]:
+        """Extract the analytical operation without relying on an LLM.
+
+        This intentionally uses only schema names and question wording.  It is
+        shared state, so every downstream agent reasons about the same current
+        question rather than guessing from a prior result shape.
+        """
+        q = question.lower()
+        columns = [str(c.get("name", "")) for c in schema.get("columns", [])]
+
+        def score(column: str) -> int:
+            words = column.lower().replace("_", " ")
+            singular = words[:-1] if words.endswith("s") else words
+            plural = words[:-1] + "ies" if words.endswith("y") else words + "s"
+            # Exact column phrases beat partial component matches; this makes
+            # "Avenue" win over the similarly named Investment_Avenues.
+            if re.search(r"\b" + re.escape(words) + r"\b", q) or re.search(r"\b" + re.escape(singular) + r"\b", q) or re.search(r"\b" + re.escape(plural) + r"\b", q):
+                return 100 + len(words)
+            parts = [p for p in words.split() if p not in {"id", "of", "the"}]
+            return sum(1 for p in parts if re.search(r"\b" + re.escape(p) + r"(?:s|ies)?\b", q)) if parts else 0
+
+        matches = [(score(column), column) for column in columns]
+        matches = [(value, column) for value, column in matches if value]
+        matches.sort(reverse=True)
+        numeric_names = {
+            str(c.get("name", "")) for c in schema.get("columns", [])
+            if str(c.get("dtype", "")).lower() in {"int", "int64", "integer", "float", "float64", "double", "number"}
+        }
+        numeric_words = ("total", "sum", "average", "mean")
+        is_count = bool(re.search(r"\b(?:how many|count|number of)\b", q))
+        has_numeric_match = any(column in numeric_names for _, column in matches)
+        if is_count and not has_numeric_match:
+            requested_aggregate = "COUNT"
+        else:
+            requested_aggregate = next(("AVG" if word in q and word in {"average", "mean"} else "SUM"
+                                        for word in numeric_words if word in q), None)
+
+        # For a grouped numeric total, prefer the mentioned categorical/date
+        # dimension over the mentioned numeric measure.
+        dimension_matches = [(value, column) for value, column in matches if column not in numeric_names]
+        dimension = (dimension_matches[0][1] if requested_aggregate and dimension_matches
+                     else matches[0][1] if matches else None)
+        # This dataset contains both a multi-select Investment_Avenues field
+        # and the requested primary Avenue field.  Prefer the exact dimension
+        # when the user says "avenue" (or explicitly names the Avenue column).
+        avenue_column = next((column for column in columns if column.lower() == "avenue"), None)
+        if "avenue" in q and avenue_column:
+            dimension = avenue_column
+        gender_column = next((column for column in columns if column.lower() == "gender"), None)
+        has_male = bool(re.search(r"\bmales?\b", q))
+        has_female = bool(re.search(r"\bfemales?\b", q))
+        has_gender_word = bool(re.search(r"\bgenders?\b", q))
+        is_gender_both = bool(gender_column and has_male and has_female)
+        if gender_column and (is_gender_both or (has_gender_word and not dimension)):
+            dimension = gender_column
+        limit_match = re.search(r"\b(?:top|bottom)\s+(\d+)", q)
+        limit_n = int(limit_match.group(1)) if limit_match else 0
+        direction = "ASC" if any(word in q for word in ("bottom", "least", "lowest")) else "DESC"
+        is_percentage = any(word in q for word in ("percentage", "percent", "proportion", "share"))
+        is_frequency = any(phrase in q for phrase in (
+            "most popular", "most common", "frequency", "for each", "each ", "by each"
+        ))
+        is_rank = bool(re.search(r"\b(?:top|bottom|highest|lowest|most popular|least popular)\b", q))
+        # A rank of individual records ("top transactions by sales") is not
+        # a grouped aggregation.  An explicit total/average by a dimension is.
+        entity_rank = bool(re.search(r"\b(?:transaction|record|project)s?\b", q))
+        asks_visual = bool(re.search(r"\b(?:chart|plot|graph|visualize|pie|bar|bargraph|distribution|histogram)\b", q))
+        group_by_needed = bool(dimension and (
+            is_frequency or is_percentage or (requested_aggregate in {"SUM", "AVG"}) or
+            (is_rank and not entity_rank) or "each" in q or is_gender_both or asks_visual
+        ))
+
+        if is_percentage:
+            operation = "PERCENTAGE"
+        elif (is_frequency or is_gender_both or (asks_visual and dimension)) and not requested_aggregate:
+            operation = "FREQUENCY"
+        elif is_rank and not requested_aggregate:
+            operation = "RANK"
+        elif is_count or group_by_needed or requested_aggregate in {"SUM", "AVG"}:
+            operation = "AGGREGATE"
+        else:
+            operation = "RETRIEVE"
+
+        return {
+            "operation": operation,
+            "target_column": dimension,
+            "group_by_needed": group_by_needed,
+            "aggregation": requested_aggregate or ("COUNT" if operation in {"AGGREGATE", "FREQUENCY", "PERCENTAGE"} else None),
+            "sort_direction": direction,
+            "limit_n": limit_n,
+            "commonality_analysis": "common" in q or "similar" in q,
+            "entity": "transactions" if "transaction" in q else "projects" if "project" in q else "records",
+        }
 
     def _heuristic_routing(self, question: str) -> dict[str, Any]:
         """Rule-based fallback routing if LLM fails or is unconfigured."""

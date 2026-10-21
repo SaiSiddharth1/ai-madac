@@ -17,13 +17,17 @@ class AgentState(TypedDict, total=False):
     user_id: str
     dataset_id: str
     query_id: str
+    session_id: str
     question: str
     table_name: str
     schema: dict[str, Any]          # Dataset column info
     dataset_profile: dict[str, Any]  # Cached profile from Data Analyst
+    previous_validated_result: Optional[dict[str, Any]]
+    validated_result: Optional[dict[str, Any]]
 
     # --- Supervisor output ---
     intent: str                      # DATA_RETRIEVAL, DATA_ANALYSIS, PREDICTION, etc.
+    structured_intent: dict[str, Any] # Parsed operation, dimensions, filters and ranking intent
     execution_plan: list[str]        # Ordered list of agent names to invoke
 
     # --- Agent outputs ---

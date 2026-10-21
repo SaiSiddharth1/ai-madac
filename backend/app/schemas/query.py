@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 class QueryRequest(BaseModel):
     """Natural language query request."""
     question: str = Field(..., min_length=3, max_length=2000)
+    session_id: Optional[str] = Field(None, min_length=1, max_length=128)
 
 
 class QueryResponse(BaseModel):
