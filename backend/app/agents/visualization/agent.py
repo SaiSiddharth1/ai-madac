@@ -167,10 +167,8 @@ class VisualizationAgent:
             self._llm = get_llm(temperature=0.0)
         return self._llm
 
-    def run(self, state: AgentState) -> dict[str, Any]:
-        """
-        Execute the end-to-end visualization pipeline.
-        """
+    def run_spec_generation(self, state: AgentState) -> dict[str, Any]:
+        """Step 1: Extract Query Contract and formulate candidate specification."""
         question = state.get("question", "").strip()
         schema = state.get("schema") or {}
         table_name = state.get("table_name", "")
@@ -180,7 +178,6 @@ class VisualizationAgent:
 
         logger.info(f"Visualization Agent processing query: '{question}'")
 
-        # 1. Extract Available Columns from Schema or SQL Result
         available_cols = [str(c.get("name", "")) for c in schema.get("columns", []) if c.get("name")]
         if not available_cols:
             if sql_result and sql_result.get("columns"):
@@ -188,14 +185,12 @@ class VisualizationAgent:
             elif sql_result and sql_result.get("rows") and len(sql_result["rows"]) > 0:
                 available_cols = list(sql_result["rows"][0].keys())
 
-        # 2. Extract Query Contract (Intent Extraction & Semantic Column Resolution)
         contract = extract_query_contract(
             question=question,
             schema=schema if schema.get("columns") else available_cols,
             previous_result=prev_result if bool(prev_result) else None,
         )
 
-        # Unpack previous_validated_result if this is an explicit follow-up and sql_result is empty
         if contract.is_follow_up and not sql_result and prev_result and prev_result.get("validated"):
             sql_result = {
                 "rows": prev_result.get("result", []),
@@ -205,7 +200,6 @@ class VisualizationAgent:
                 "filters": prev_result.get("filters", {}),
             }
 
-        # Incorporate filters from sql_result if present
         if sql_result and sql_result.get("filters"):
             sql_filters = sql_result["filters"]
             if isinstance(sql_filters, dict):
@@ -218,66 +212,103 @@ class VisualizationAgent:
             f"dimensions={contract.dimensions}, intent={contract.intent}, is_follow_up={contract.is_follow_up}"
         )
 
-        # 3. Handle Single Value Metric (KPI) questions (Section 16)
+        df = self._load_current_dataframe(table_name, sql_result, analysis_result, contract)
+        if df is not None and not df.empty:
+            for col in df.columns:
+                if col not in available_cols:
+                    available_cols.append(col)
+
+        candidate_spec = self._get_candidate_specification(question, contract, schema, available_cols)
+
+        return {
+            "_query_contract": contract,
+            "_raw_spec": candidate_spec,
+            "_available_cols": available_cols,
+            "_query_df": df,
+            "agents_used": list(set(state.get("agents_used", []) + ["visualization_agent"])),
+        }
+
+    def run_validation(self, state: AgentState) -> dict[str, Any]:
+        """Step 2: Strict Query-to-Spec Validation & Deterministic Auto-Repair."""
+        contract = state.get("_query_contract")
+        raw_spec = state.get("_raw_spec")
+        available_cols = state.get("_available_cols", [])
+
+        if not contract:
+            question = state.get("question", "").strip()
+            schema = state.get("schema") or {}
+            contract = extract_query_contract(question, schema)
+
+        if not raw_spec:
+            validated_spec = SpecValidator.build_deterministic_spec(contract, available_cols)
+        else:
+            is_valid, _ = SpecValidator.validate(raw_spec, contract, available_cols)
+            if is_valid:
+                validated_spec = SpecValidator.normalize_spec(raw_spec)
+            else:
+                validated_spec = SpecValidator.build_deterministic_spec(contract, available_cols)
+
+        return {
+            "_validated_spec": validated_spec,
+            "agents_used": list(set(state.get("agents_used", []) + ["visualization_validator"])),
+        }
+
+    def run_rendering(self, state: AgentState) -> dict[str, Any]:
+        """Step 3: Prepare data via Pandas and render interactive Plotly figure."""
+        contract = state.get("_query_contract")
+        df = state.get("_query_df")
+        spec = state.get("_validated_spec")
+        question = state.get("question", "").strip()
+        table_name = state.get("table_name", "")
+        sql_result = state.get("sql_result")
+        analysis_result = state.get("analysis_result")
+        schema = state.get("schema") or {}
+
+        if not contract:
+            contract = extract_query_contract(question, schema)
+        if df is None or df.empty:
+            df = self._load_current_dataframe(table_name, sql_result, analysis_result, contract)
+        if not spec:
+            available_cols = state.get("_available_cols", [str(c.get("name", "")) for c in schema.get("columns", [])])
+            spec = SpecValidator.build_deterministic_spec(contract, available_cols)
+
         asks_visual_explicit = bool(re.search(r"\b(?:chart|plot|graph|pie|bar|visualize|histogram|scatter)\b", question.lower()))
         if contract.intent == "single_metric" and not asks_visual_explicit:
-            logger.info("Visualization Agent: Single value KPI result, skipping chart.")
+            empty_res = self._empty_visualization_result("Single value results are better communicated directly as a KPI rather than a chart.")
             return {
-                "visualization_result": self._empty_visualization_result(
-                    reason="Single value results are better communicated directly as a KPI rather than a chart."
-                ),
-                "agents_used": state.get("agents_used", []) + ["visualization_agent"],
+                "visualization_result": empty_res,
+                "agents_used": list(set(state.get("agents_used", []) + ["chart_renderer"])),
             }
 
-        # 4. Obtain Current DataFrame
-        df = self._load_current_dataframe(table_name, sql_result, analysis_result, contract)
         if df is None or df.empty:
-            logger.warning("Visualization Agent: No tabular data available.")
+            empty_res = self._empty_visualization_result("There is not enough data available to generate this visualization.")
             return {
-                "visualization_result": self._empty_visualization_result(
-                    reason="There is not enough data available to generate this visualization."
-                ),
-                "agents_used": state.get("agents_used", []) + ["visualization_agent"],
+                "visualization_result": empty_res,
+                "agents_used": list(set(state.get("agents_used", []) + ["chart_renderer"])),
             }
 
-        # Single value KPI check on loaded df
         is_rel_impact = bool(analysis_result and analysis_result.get("analysis_type") == "relationship_impact_analysis")
         if len(df) == 1 and not asks_visual_explicit and not is_rel_impact:
-            logger.info("Visualization Agent: Single value KPI result, skipping chart.")
+            empty_res = self._empty_visualization_result("Single value results are better communicated directly as a KPI rather than a chart.")
             return {
-                "visualization_result": self._empty_visualization_result(
-                    reason="Single value results are better communicated directly as a KPI rather than a chart."
-                ),
-                "agents_used": state.get("agents_used", []) + ["visualization_agent"],
+                "visualization_result": empty_res,
+                "agents_used": list(set(state.get("agents_used", []) + ["chart_renderer"])),
             }
 
-        # Add any runtime DataFrame columns to available_cols if not already present
-        for col in df.columns:
-            if col not in available_cols:
-                available_cols.append(col)
-
-        # 5. Gemini Specification Decision with Strict Validation & Auto-Repair
-        spec = self._get_validated_specification(question, contract, schema, available_cols)
-
-        # 6. Pandas Data Preparation & Mathematical Insights
         try:
             prepared_df, applied_params, insights = DataPreparer.prepare(df, spec)
         except Exception as e:
-            logger.error(f"Data preparation error: {e}. Falling back to deterministic spec.", exc_info=True)
-            fallback_spec = SpecValidator.build_deterministic_spec(contract, available_cols)
+            fallback_spec = SpecValidator.build_deterministic_spec(contract, list(df.columns))
             spec = fallback_spec
             prepared_df, applied_params, insights = DataPreparer.prepare(df, spec)
 
         if prepared_df.empty:
-            logger.warning("Visualization Agent: Prepared DataFrame is empty after filtering/aggregation.")
+            empty_res = self._empty_visualization_result("No records remained after applying the requested filters.")
             return {
-                "visualization_result": self._empty_visualization_result(
-                    reason="No records remained after applying the requested filters."
-                ),
-                "agents_used": state.get("agents_used", []) + ["visualization_agent"],
+                "visualization_result": empty_res,
+                "agents_used": list(set(state.get("agents_used", []) + ["chart_renderer"])),
             }
 
-        # 7. Plotly Figure Generation (Rendering Layer)
         try:
             plotly_fig, chart_title, chart_path, json_path = PlotlyRenderer.render(
                 prepared_df, spec, question
@@ -286,10 +317,9 @@ class VisualizationAgent:
             logger.error(f"Plotly rendering failed: {e}", exc_info=True)
             return {
                 "visualization_result": self._empty_visualization_result(reason=str(e)),
-                "agents_used": state.get("agents_used", []) + ["visualization_agent"],
+                "agents_used": list(set(state.get("agents_used", []) + ["chart_renderer"])),
             }
 
-        # 8. Build Structured Explanation
         chart_type_name = applied_params.get("chart_type", "Chart")
         what_shows = spec.get("title") or f"The {chart_type_name.lower()} visualizes {', '.join(contract.requested_fields)}."
         param_lines = [
@@ -304,11 +334,9 @@ class VisualizationAgent:
             "key_insights": insights,
         })
 
-        # Load figure JSON for frontend
         with open(json_path, "r", encoding="utf-8") as f:
             chart_json_dict = json.load(f)
 
-        # Build chart object with backwards compatibility parameters
         chart_obj = {
             "chart_type": spec.get("chart", {}).get("type", "bar"),
             "title": chart_title,
@@ -337,7 +365,21 @@ class VisualizationAgent:
 
         return {
             "visualization_result": viz_result,
-            "agents_used": state.get("agents_used", []) + ["visualization_agent"],
+            "agents_used": list(set(state.get("agents_used", []) + ["chart_renderer"])),
+        }
+
+    def run(self, state: AgentState) -> dict[str, Any]:
+        """
+        Execute the end-to-end visualization pipeline (composite execution).
+        """
+        s1 = self.run_spec_generation(state)
+        merged = {**state, **s1}
+        s2 = self.run_validation(merged)
+        merged = {**merged, **s2}
+        s3 = self.run_rendering(merged)
+        return {
+            "visualization_result": s3.get("visualization_result"),
+            "agents_used": list(set(state.get("agents_used", []) + ["visualization_agent"])),
         }
 
     def _load_current_dataframe(
@@ -384,6 +426,36 @@ class VisualizationAgent:
             return pd.DataFrame(sql_result["rows"])
 
         return None
+
+    def _get_candidate_specification(
+        self,
+        question: str,
+        contract: QueryContract,
+        schema: dict[str, Any],
+        available_cols: list[str],
+    ) -> dict[str, Any]:
+        """Obtain initial candidate specification from Gemini or deterministic spec."""
+        try:
+            prompt_data = {
+                "CURRENT_USER_QUERY": question,
+                "QUERY_CONTRACT": contract.to_dict(),
+                "CURRENT_DATASET_COLUMNS": available_cols,
+                "COLUMN_TYPES": {c.get("name"): c.get("dtype") for c in schema.get("columns", [])},
+            }
+            messages = [
+                SystemMessage(content=VISUALIZATION_AGENT_SYSTEM_PROMPT),
+                HumanMessage(content=json.dumps(prompt_data, indent=2)),
+            ]
+            response = self.llm.invoke(messages)
+            content = self._extract_text(response.content)
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+            candidate_spec = json.loads(content)
+            return candidate_spec
+        except Exception as e:
+            logger.warning(f"Gemini candidate spec extraction failed: {e}. Using deterministic fallback.")
+            return SpecValidator.build_deterministic_spec(contract, available_cols)
 
     def _get_validated_specification(
         self,

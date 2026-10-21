@@ -16,12 +16,68 @@ from app.agents.visualization.contract import QueryContract
 
 SUPPORTED_CHART_TYPES = {
     "bar", "horizontal_bar", "grouped_bar", "stacked_bar",
-    "line", "pie", "donut", "histogram", "scatter", "box", "heatmap", "area", "kpi"
+    "clustered_column", "clustered_bar", "stacked_column", "stacked_bar",
+    "line", "pie", "donut", "histogram", "scatter", "box", "box_plot", "heatmap", "area", "kpi", "card"
 }
 
 
 class SpecValidator:
     """Strict validator for visualization specifications."""
+
+    @staticmethod
+    def normalize_spec(spec: dict[str, Any]) -> dict[str, Any]:
+        """Normalize flat or nested specification into canonical internal format."""
+        if not isinstance(spec, dict):
+            return spec
+
+        normalized = dict(spec)
+        visual_type = spec.get("visual_type") or spec.get("chart_type")
+        chart_obj = dict(spec.get("chart") or {})
+
+        if visual_type:
+            v_lower = str(visual_type).lower().replace(" ", "_")
+            if v_lower in ("clustered_column", "grouped_column"):
+                chart_obj["type"] = "bar"
+                chart_obj["mode"] = "grouped"
+                chart_obj["orientation"] = "vertical"
+            elif v_lower in ("clustered_bar", "grouped_bar"):
+                chart_obj["type"] = "horizontal_bar"
+                chart_obj["mode"] = "grouped"
+                chart_obj["orientation"] = "horizontal"
+            elif v_lower in ("stacked_column",):
+                chart_obj["type"] = "bar"
+                chart_obj["mode"] = "stacked"
+                chart_obj["orientation"] = "vertical"
+            elif v_lower in ("stacked_bar",):
+                chart_obj["type"] = "horizontal_bar"
+                chart_obj["mode"] = "stacked"
+                chart_obj["orientation"] = "horizontal"
+            else:
+                chart_obj["type"] = v_lower
+
+        if "type" not in chart_obj:
+            chart_obj["type"] = "bar"
+        normalized["chart"] = chart_obj
+
+        fields = dict(spec.get("fields") or {})
+        if "x" in spec and "x" not in fields:
+            fields["x"] = spec["x"]
+        if "y" in spec and "y" not in fields:
+            fields["y"] = spec["y"]
+        if "legend" in spec and "color" not in fields:
+            fields["color"] = spec["legend"]
+        if "color" in spec and "color" not in fields:
+            fields["color"] = spec["color"]
+        normalized["fields"] = fields
+
+        measure = dict(spec.get("measure") or {})
+        if "aggregation" in spec and "type" not in measure:
+            measure["type"] = spec["aggregation"]
+        if "y" in spec and spec.get("aggregation") and "column" not in measure:
+            measure["column"] = spec["y"]
+        normalized["measure"] = measure
+
+        return normalized
 
     @staticmethod
     def validate(
@@ -35,6 +91,8 @@ class SpecValidator:
         """
         if not isinstance(spec, dict):
             return False, "Specification must be a JSON object."
+
+        spec = SpecValidator.normalize_spec(spec)
 
         if not spec.get("visualization_available", True):
             return True, None

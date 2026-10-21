@@ -48,6 +48,8 @@ async def supervisor_node(state: AgentState) -> dict[str, Any]:
         "data_analyst_agent": "Data Analyst Agent",
         "ml_agent": "ML Agent",
         "visualization_agent": "Visualization Agent",
+        "visualization_validator": "Visualization Validator",
+        "chart_renderer": "Chart Renderer",
         "rag_agent": "RAG Agent",
         "report_agent": "Report Agent"
     }
@@ -99,16 +101,46 @@ async def ml_node(state: AgentState) -> dict[str, Any]:
 
 
 async def visualization_node(state: AgentState) -> dict[str, Any]:
-    """Execute Visualization Agent node for chart generation."""
+    """Execute Visualization Agent node for chart spec generation."""
     query_id = state.get("query_id", "")
-    await workflow_event_manager.emit(query_id, "visualization_agent", "running", "Generating interactive chart visualization")
-    res = _record_agent_completion(state, visualization_agent.run(state), "visualization_agent")
+    await workflow_event_manager.emit(query_id, "visualization_agent", "running", "Analyzing query and formulating visualization specification")
+    plan = state.get("execution_plan", [])
+    if "visualization_validator" in plan or "chart_renderer" in plan:
+        res = visualization_agent.run_spec_generation(state)
+        await workflow_event_manager.emit(query_id, "visualization_agent", "completed", "Visualization specification created")
+        return _record_agent_completion(state, res, "visualization_agent")
+    else:
+        res = visualization_agent.run(state)
+        await workflow_event_manager.emit(query_id, "visualization_agent", "completed", "Visualization specification created")
+        await workflow_event_manager.emit(query_id, "visualization_validator", "completed", "Specification validated against Query Contract")
+        await workflow_event_manager.emit(query_id, "chart_renderer", "completed", "Interactive Plotly chart generated")
+        return _record_agent_completion(state, res, "visualization_agent")
+
+
+async def visualization_validator_node(state: AgentState) -> dict[str, Any]:
+    """Execute Visualization Validator node."""
+    query_id = state.get("query_id", "")
+    await workflow_event_manager.emit(query_id, "visualization_validator", "running", "Validating specification against Query Contract and schema")
+    res = visualization_agent.run_validation(state)
     errors = res.get("errors", [])
     if errors:
-        await workflow_event_manager.emit(query_id, "visualization_agent", "failed", f"Visualization error: {errors[0]}")
+        await workflow_event_manager.emit(query_id, "visualization_validator", "failed", f"Validation error: {errors[0]}")
     else:
-        await workflow_event_manager.emit(query_id, "visualization_agent", "completed", "Chart generated successfully")
-    return res
+        await workflow_event_manager.emit(query_id, "visualization_validator", "completed", "Specification validated: all requested fields verified")
+    return _record_agent_completion(state, res, "visualization_validator")
+
+
+async def chart_renderer_node(state: AgentState) -> dict[str, Any]:
+    """Execute Chart Renderer node."""
+    query_id = state.get("query_id", "")
+    await workflow_event_manager.emit(query_id, "chart_renderer", "running", "Preparing Pandas data and rendering interactive Plotly figure")
+    res = visualization_agent.run_rendering(state)
+    errors = res.get("errors", [])
+    if errors:
+        await workflow_event_manager.emit(query_id, "chart_renderer", "failed", f"Rendering error: {errors[0]}")
+    else:
+        await workflow_event_manager.emit(query_id, "chart_renderer", "completed", "Interactive Plotly chart generated successfully")
+    return _record_agent_completion(state, res, "chart_renderer")
 
 
 async def rag_node(state: AgentState) -> dict[str, Any]:
@@ -149,18 +181,11 @@ def route_next(state: AgentState) -> str:
 
     for agent in plan:
         if agent not in agents_used and agent != "supervisor_agent":
-            if agent == "rag_agent":
-                return "rag_agent"
-            elif agent == "sql_agent":
-                return "sql_agent"
-            elif agent == "data_analyst_agent":
-                return "data_analyst_agent"
-            elif agent == "ml_agent":
-                return "ml_agent"
-            elif agent == "visualization_agent":
-                return "visualization_agent"
-            elif agent == "report_agent":
-                return "report_agent"
+            if agent in (
+                "rag_agent", "sql_agent", "data_analyst_agent", "ml_agent",
+                "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"
+            ):
+                return agent
 
     if "report_agent" not in agents_used:
         return "report_agent"
@@ -181,13 +206,18 @@ def create_workflow() -> Any:
     builder.add_node("data_analyst_agent", data_analyst_node)
     builder.add_node("ml_agent", ml_node)
     builder.add_node("visualization_agent", visualization_node)
+    builder.add_node("visualization_validator", visualization_validator_node)
+    builder.add_node("chart_renderer", chart_renderer_node)
     builder.add_node("report_agent", report_node)
 
     # Entry point
     builder.add_edge(START, "supervisor")
 
     # Dynamic routing edges from nodes using route_next
-    for node_name in ["supervisor", "rag_agent", "sql_agent", "data_analyst_agent", "ml_agent", "visualization_agent"]:
+    for node_name in [
+        "supervisor", "rag_agent", "sql_agent", "data_analyst_agent", "ml_agent",
+        "visualization_agent", "visualization_validator", "chart_renderer"
+    ]:
         builder.add_conditional_edges(
             node_name,
             route_next,
@@ -197,6 +227,8 @@ def create_workflow() -> Any:
                 "data_analyst_agent": "data_analyst_agent",
                 "ml_agent": "ml_agent",
                 "visualization_agent": "visualization_agent",
+                "visualization_validator": "visualization_validator",
+                "chart_renderer": "chart_renderer",
                 "report_agent": "report_agent",
                 END: END,
             },
@@ -206,7 +238,7 @@ def create_workflow() -> Any:
     builder.add_edge("report_agent", END)
 
     compiled_graph = builder.compile()
-    logger.info("Complete 6-agent LangGraph workflow compiled successfully.")
+    logger.info("Complete 8-agent LangGraph workflow compiled successfully.")
     return compiled_graph
 
 

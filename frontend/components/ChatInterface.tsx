@@ -47,7 +47,11 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
     plan.forEach((agent: string) => {
       agents[agent] = { status: 'completed', message: 'Task completed successfully' };
     });
-    const allAgents = ["sql_agent", "data_analyst_agent", "ml_agent", "visualization_agent", "rag_agent", "report_agent"];
+    const allAgents = [
+      "sql_agent", "data_analyst_agent", "ml_agent",
+      "visualization_agent", "visualization_validator", "chart_renderer",
+      "rag_agent", "report_agent"
+    ];
     allAgents.forEach(a => {
       if (!plan.includes(a)) {
         agents[a] = { status: 'skipped', message: 'Not required' };
@@ -164,7 +168,11 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
               currentWorkflow.intent = eventIntent || "DATA_RETRIEVAL";
               currentWorkflow.executionPlan = execution_plan || [];
               
-              const allAgents = ["sql_agent", "data_analyst_agent", "ml_agent", "visualization_agent", "rag_agent", "report_agent"];
+              const allAgents = [
+                "sql_agent", "data_analyst_agent", "ml_agent",
+                "visualization_agent", "visualization_validator", "chart_renderer",
+                "rag_agent", "report_agent"
+              ];
               allAgents.forEach(a => {
                 if (!execution_plan.includes(a)) {
                   currentWorkflow.agents[a] = { status: 'skipped', message: 'Not required for this query' };

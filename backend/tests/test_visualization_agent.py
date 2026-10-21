@@ -299,6 +299,53 @@ class VisualizationAgentTests(unittest.TestCase):
         self.assertNotIn("age", [chart_new["parameters"].get("x_axis"), chart_new["parameters"].get("split_by")])
         self.assertNotIn("investment_avenue", [chart_new["parameters"].get("x_axis"), chart_new["parameters"].get("split_by")])
 
+    def test_show_gender_versus_investment_objective_visually_routes_to_full_pipeline(self):
+        from app.agents.supervisor.agent import SupervisorAgent
+        from app.agents.visualization.contract import is_visualization_requested
+
+        question = "Show gender versus investment objective visually"
+        self.assertTrue(is_visualization_requested(question))
+
+        schema = {
+            "columns": [
+                {"name": "gender", "dtype": "object"},
+                {"name": "objective", "dtype": "object"},
+                {"name": "age", "dtype": "int"},
+            ]
+        }
+        sup_result = SupervisorAgent().run({"question": question, "schema": schema, "dataset_profile": {}})
+        self.assertEqual(sup_result["intent"], "VISUALIZATION")
+        self.assertEqual(
+            sup_result["execution_plan"],
+            ["sql_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
+        )
+
+        sql_rows = [
+            {"gender": "Male", "objective": "Wealth Creation", "investor_count": 15},
+            {"gender": "Female", "objective": "Retirement", "investor_count": 6},
+            {"gender": "Female", "objective": "Capital Preservation", "investor_count": 5},
+            {"gender": "Female", "objective": "Wealth Creation", "investor_count": 4},
+            {"gender": "Male", "objective": "Capital Preservation", "investor_count": 4},
+            {"gender": "Male", "objective": "Retirement", "investor_count": 3},
+            {"gender": "Female", "objective": "Education", "investor_count": 1},
+            {"gender": "Female", "objective": "Income", "investor_count": 1},
+            {"gender": "Male", "objective": "Education", "investor_count": 1},
+        ]
+        state = {
+            "question": question,
+            "schema": schema,
+            "sql_result": {"rows": sql_rows, "columns": ["gender", "objective", "investor_count"]},
+            "analysis_result": None,
+        }
+        output = self.agent.run(state)
+        viz = output["visualization_result"]
+        self.assertTrue(viz["visualization_available"])
+        chart = viz["chart"]
+        self.assertEqual(chart["chart_type"], "bar")
+        self.assertIn("gender", [chart["parameters"].get("x_axis"), chart["parameters"].get("split_by")])
+        self.assertIn("objective", [chart["parameters"].get("x_axis"), chart["parameters"].get("split_by")])
+        self.assertNotIn("age", [chart["parameters"].get("x_axis"), chart["parameters"].get("split_by")])
+
 
 if __name__ == "__main__":
     unittest.main()

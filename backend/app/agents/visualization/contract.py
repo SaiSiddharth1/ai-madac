@@ -71,10 +71,12 @@ class QueryContract:
     limit: Optional[int] = None
     binning: Optional[dict[str, Any]] = None
     is_follow_up: bool = False
+    visualization_required: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "raw_question": self.raw_question,
+            "visualization_required": self.visualization_required,
             "requested_fields": self.requested_fields,
             "dimensions": self.dimensions,
             "measure": self.measure,
@@ -86,6 +88,33 @@ class QueryContract:
             "binning": self.binning,
             "is_follow_up": self.is_follow_up,
         }
+
+
+def is_visualization_requested(question: str, intent: str = "") -> bool:
+    """Return True if the query explicitly or implicitly requires a visual chart."""
+    q = question.lower().strip()
+    if intent in {"RELATIONSHIP_ANALYSIS", "VISUALIZATION"}:
+        return True
+
+    visual_terms = (
+        "visual", "visually", "visualize", "visualization", "visualizing",
+        "chart", "charts", "plot", "plots", "plotting", "graph", "graphs",
+        "graphical", "graphically", "diagram",
+        "bar chart", "pie chart", "line chart", "scatter plot", "scatter",
+        "histogram", "box plot", "donut chart", "donut", "heatmap", "area chart",
+        "clustered column", "clustered bar", "stacked column", "stacked bar",
+        "distribution", "trend", "trends"
+    )
+    if any(re.search(r"\b" + re.escape(t) + r"\b", q) for t in visual_terms):
+        return True
+
+    if re.search(r"\b(?:versus|vs\.?)\b", q):
+        return True
+
+    if any(phrase in q for phrase in ("by avenue and objective", "by gender and objective", "compared to", "breakdown by")):
+        return True
+
+    return False
 
 
 def normalize_term(term: str) -> str:
@@ -334,6 +363,8 @@ def extract_query_contract(
         size = int(bin_match.group(1) or bin_match.group(2))
         binning = {"bin_size": size}
 
+    vis_required = is_visualization_requested(q_raw, intent) or bool(explicit_chart) or intent in ("cross_tabulation", "distribution", "relationship")
+
     return QueryContract(
         raw_question=q_raw,
         requested_fields=matched_cols,
@@ -346,4 +377,5 @@ def extract_query_contract(
         limit=limit,
         binning=binning,
         is_follow_up=is_follow_up,
+        visualization_required=vis_required,
     )

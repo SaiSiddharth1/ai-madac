@@ -11,6 +11,7 @@ from typing import Any
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from app.agents.state import AgentState
+from app.agents.visualization.contract import is_visualization_requested
 from app.core.llm_provider import get_llm
 
 logger = logging.getLogger(__name__)
@@ -118,10 +119,10 @@ User Question: "{question}"
             intent = data.get("intent", "DATA_RETRIEVAL")
             plan = data.get("execution_plan", ["sql_agent", "report_agent"])
 
-            # Deterministic aggregation intent takes precedence over an LLM's
-            # broad retrieval label.  It prevents a frequency question from
-            # being routed as a request for raw records.
-            if structured_intent["operation"] in {"AGGREGATE", "FREQUENCY", "PERCENTAGE", "RANK"}:
+            if is_visualization_requested(question, intent):
+                intent = "VISUALIZATION"
+                plan = ["sql_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
+            elif structured_intent["operation"] in {"AGGREGATE", "FREQUENCY", "PERCENTAGE", "RANK"}:
                 intent = "AGGREGATION"
                 plan = ["sql_agent", "report_agent"]
 
@@ -132,17 +133,14 @@ User Question: "{question}"
                 
                 # For RELATIONSHIP_ANALYSIS, bypass SQL Agent and use Data Analyst Agent directly
                 if intent == "RELATIONSHIP_ANALYSIS":
-                    plan = ["data_analyst_agent", "visualization_agent", "report_agent"]
+                    if is_visualization_requested(question, intent):
+                        plan = ["data_analyst_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
+                    else:
+                        plan = ["data_analyst_agent", "report_agent"]
 
             # Ensure report_agent is always at the end
             if "report_agent" not in plan:
                 plan.append("report_agent")
-
-            # Visuals are valuable for comparisons and trends, but a single
-            # number (such as a unique-country count) is clearer as a direct
-            # answer and table than as a meaningless one-bar chart.
-            if self._should_visualize(question, intent) and "visualization_agent" not in plan:
-                plan.insert(plan.index("report_agent"), "visualization_agent")
 
             if "visualization_agent" in plan and "sql_agent" not in plan and "data_analyst_agent" not in plan:
                 prev = state.get("previous_validated_result") or {}
@@ -160,7 +158,10 @@ User Question: "{question}"
         except Exception as e:
             logger.warning(f"LLM supervisor classification failed: {e}. Falling back to rule-based routing.")
             fallback = self._heuristic_routing(question)
-            if structured_intent["operation"] in {"AGGREGATE", "FREQUENCY", "PERCENTAGE", "RANK"}:
+            if is_visualization_requested(question):
+                fallback["intent"] = "VISUALIZATION"
+                fallback["execution_plan"] = ["sql_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
+            elif structured_intent["operation"] in {"AGGREGATE", "FREQUENCY", "PERCENTAGE", "RANK"}:
                 fallback["intent"] = "AGGREGATION"
                 fallback["execution_plan"] = ["sql_agent", "report_agent"]
             fallback["structured_intent"] = structured_intent
@@ -311,16 +312,12 @@ User Question: "{question}"
         if any(w in q_lower for w in ["predict", "forecast", "classify", "model", "train"]):
             intent = "PREDICTION"
             plan = ["ml_agent", "report_agent"]
-        elif any(w in q_lower for w in ["chart", "plot", "graph", "visualize", "bar", "pie", "histogram"]):
+        elif is_visualization_requested(question):
             intent = "VISUALIZATION"
-            plan = ["sql_agent", "visualization_agent", "report_agent"]
+            plan = ["sql_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
         elif any(w in q_lower for w in ["affect", "impact", "influence", "relationship", "correlation", "associated", "related", "factors", "difference", "effect", "why"]):
             intent = "RELATIONSHIP_ANALYSIS"
-            plan = ["data_analyst_agent", "visualization_agent", "report_agent"]
-        elif self._should_visualize(question, "DATA_RETRIEVAL"):
-            intent = "DATA_RETRIEVAL"
-            plan = ["sql_agent", "visualization_agent", "report_agent"]
-
+            plan = ["data_analyst_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
         else:
             intent = "DATA_RETRIEVAL"
             plan = ["sql_agent", "report_agent"]
@@ -332,15 +329,8 @@ User Question: "{question}"
         }
 
     @staticmethod
-    def _should_visualize(question: str, intent: str) -> bool:
-        q = question.lower()
-        if intent in {"RELATIONSHIP_ANALYSIS", "VISUALIZATION"}:
-            return True
-        return any(word in q for word in (
-            "chart", "plot", "graph", "visualize", "trend", "distribution",
-            "by country", "by sector", "by status", "each country", "each sector",
-            "compare", "comparison", "highest", "lowest", "top ",
-        ))
+    def _should_visualize(question: str, intent: str = "") -> bool:
+        return is_visualization_requested(question, intent)
 
 
 # Singleton instance

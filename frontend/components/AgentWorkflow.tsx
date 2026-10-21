@@ -24,6 +24,8 @@ const AGENT_META: Record<string, { name: string; icon: string; color: string }> 
   data_analyst_agent: { name: "Data Analyst Agent", icon: "📊", color: "#10b981" },
   ml_agent: { name: "ML Agent", icon: "🤖", color: "#8b5cf6" },
   visualization_agent: { name: "Visualization Agent", icon: "📈", color: "#f59e0b" },
+  visualization_validator: { name: "Visualization Validator", icon: "🛡️", color: "#10b981" },
+  chart_renderer: { name: "Chart Renderer", icon: "🎨", color: "#6366f1" },
   rag_agent: { name: "RAG Agent", icon: "📚", color: "#ec4899" },
   report_agent: { name: "Report Agent", icon: "📝", color: "#06b6d4" },
 };
