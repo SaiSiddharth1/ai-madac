@@ -369,12 +369,24 @@ class SQLAgent:
                 agg_select = f"ROUND(SUM({expr}), 2) AS total_{alias_name}"
                 order_col = f"total_{alias_name}"
 
-            # Ordering
-            direction = "DESC"
-            if contract.sort:
-                direction = contract.sort.direction.upper()
+            # Ordering: time-series queries must be chronological ASC, while category rankings are DESC
+            is_time_series = (
+                contract.intent == "TIME_SERIES"
+                or contract.suggested_chart_type == "line"
+                or any("date" in g.lower() or "time" in g.lower() or "year" in g.lower() or "month" in g.lower() for g in contract.group_by)
+            )
+            if is_time_series:
+                order_col = group_cols[0]
+                direction = "ASC"
+                if contract.sort:
+                    direction = contract.sort.direction.upper()
+                limit_sql = f" LIMIT {contract.limit}" if contract.limit else " LIMIT 500"
+            else:
+                direction = "DESC"
+                if contract.sort:
+                    direction = contract.sort.direction.upper()
+                limit_sql = f" LIMIT {contract.limit}" if contract.limit else " LIMIT 10"
 
-            limit_sql = f" LIMIT {contract.limit}" if contract.limit else " LIMIT 10"
             return (
                 f'SELECT {group_sql}, {agg_select} FROM "{safe_table}"'
                 f'{where_sql} GROUP BY {group_sql} ORDER BY {order_col} {direction}{limit_sql}'

@@ -43,3 +43,10 @@ class AgentState(TypedDict, total=False):
     final_report: Optional[dict[str, Any]]
     errors: list[str]
     agents_used: list[str]
+
+    # --- Intermediate Visualization Workflow state ---
+    _query_contract: Optional[Any]
+    _raw_spec: Optional[dict[str, Any]]
+    _validated_spec: Optional[dict[str, Any]]
+    _available_cols: Optional[list[str]]
+    _query_df: Optional[Any]

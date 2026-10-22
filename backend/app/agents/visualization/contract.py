@@ -385,35 +385,56 @@ def extract_query_contract(
     # 1. Return percentage range / category: "between 30% and 40%", "30-40%"
     return_range_match = re.search(r"(\d+)\s*(?:%|-|–|—|to|and)\s*(\d+)\s*%", q)
     if return_range_match:
-        ret_col = next((c for c in available_cols if "expect" in c.lower() or "return" in c.lower()), "Expect")
-        low, high = int(return_range_match.group(1)), int(return_range_match.group(2))
-        filters.append({
-            "column": ret_col,
-            "field": ret_col,
-            "op": "==",
-            "operator": "equals",
-            "value": f"{low}-{high}%",
-            "range_val": (low, high),
-        })
+        ret_col = next((c for c in available_cols if "expect" in c.lower() or "return" in c.lower()), None)
+        if ret_col:
+            low, high = int(return_range_match.group(1)), int(return_range_match.group(2))
+            filters.append({
+                "column": ret_col,
+                "field": ret_col,
+                "op": "==",
+                "operator": "equals",
+                "value": f"{low}-{high}%",
+                "range_val": (low, high),
+            })
 
-    # 2. Age filters: "above 40", "> 40", "older than 40"
-    age_filter_match = re.search(r"\b(?:above|older than|greater than|>)\s*(\d+)", q)
-    if age_filter_match:
-        age_col = next((c for c in available_cols if c.lower() == "age" or "age" in c.lower()), "age")
-        filters.append({"column": age_col, "field": age_col, "op": ">", "operator": "greater_than", "value": int(age_filter_match.group(1))})
-    age_under_match = re.search(r"\b(?:under|younger than|less than|<)\s*(\d+)", q)
-    if age_under_match:
-        age_col = next((c for c in available_cols if c.lower() == "age" or "age" in c.lower()), "age")
-        filters.append({"column": age_col, "field": age_col, "op": "<", "operator": "less_than", "value": int(age_under_match.group(1))})
+    # 2. Numeric comparison filters: "above 40", "> 40", "under 20", etc.
+    # Associate comparison with the relevant numeric column ONLY if it exists in available_cols
+    comp_match = re.search(r"\b(?:above|older than|greater than|>)\s*(\d+(?:\.\d+)?)", q)
+    if comp_match:
+        target_num_col = None
+        # Check if "age" or another column is explicitly mentioned
+        if "age" in q.lower():
+            target_num_col = next((c for c in available_cols if c.lower() == "age" or "age" in c.lower()), None)
+        elif numeric_matched:
+            target_num_col = numeric_matched[0]
+        elif matched_cols:
+            target_num_col = next((c for c in matched_cols if c in available_cols), None)
+        if target_num_col:
+            val_num = float(comp_match.group(1)) if "." in comp_match.group(1) else int(comp_match.group(1))
+            filters.append({"column": target_num_col, "field": target_num_col, "op": ">", "operator": "greater_than", "value": val_num})
 
-    # 3. Categorical filters: female only, male only
-    gender_col = next((c for c in available_cols if c.lower() == "gender" or "gender" in c.lower()), "gender")
-    if re.search(r"\b(?:female|women)\b", q) and not re.search(r"\b(?:gender|male and female|both)\b", q):
-        if gender_col and gender_col not in matched_cols:
-            filters.append({"column": gender_col, "field": gender_col, "op": "==", "operator": "equals", "value": "Female"})
-    elif re.search(r"\bmale\b|\bmen\b", q) and not re.search(r"\b(?:gender|male and female|both)\b", q):
-        if gender_col and gender_col not in matched_cols:
-            filters.append({"column": gender_col, "field": gender_col, "op": "==", "operator": "equals", "value": "Male"})
+    comp_under_match = re.search(r"\b(?:under|younger than|less than|<)\s*(\d+(?:\.\d+)?)", q)
+    if comp_under_match:
+        target_num_col = None
+        if "age" in q.lower():
+            target_num_col = next((c for c in available_cols if c.lower() == "age" or "age" in c.lower()), None)
+        elif numeric_matched:
+            target_num_col = numeric_matched[0]
+        elif matched_cols:
+            target_num_col = next((c for c in matched_cols if c in available_cols), None)
+        if target_num_col:
+            val_num = float(comp_under_match.group(1)) if "." in comp_under_match.group(1) else int(comp_under_match.group(1))
+            filters.append({"column": target_num_col, "field": target_num_col, "op": "<", "operator": "less_than", "value": val_num})
+
+    # 3. Categorical filters: female only, male only (ONLY if gender column exists in available_cols!)
+    gender_col = next((c for c in available_cols if c.lower() == "gender" or "gender" in c.lower() or c.lower() == "sex"), None)
+    if gender_col:
+        if re.search(r"\b(?:female|women)\b", q) and not re.search(r"\b(?:gender|male and female|both)\b", q):
+            if gender_col not in matched_cols:
+                filters.append({"column": gender_col, "field": gender_col, "op": "==", "operator": "equals", "value": "Female"})
+        elif re.search(r"\bmale\b|\bmen\b", q) and not re.search(r"\b(?:gender|male and female|both)\b", q):
+            if gender_col not in matched_cols:
+                filters.append({"column": gender_col, "field": gender_col, "op": "==", "operator": "equals", "value": "Male"})
 
     # Separate filter columns from dimensions to be plotted!
     filter_cols = {f.get("column") for f in filters if f.get("column")}

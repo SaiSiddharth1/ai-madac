@@ -57,5 +57,7 @@ class QueryContract(BaseModel):
     color_by: Optional[str] = None
     chart_title: Optional[str] = None
     bin_width: Optional[float] = None
+    time_column: Optional[str] = None
+    time_granularity: Optional[str] = None
 
     is_follow_up: bool = False

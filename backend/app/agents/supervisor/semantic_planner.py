@@ -155,7 +155,8 @@ USER QUESTION:
 
         except Exception as e:
             logger.error("Gemini semantic planning failed: %s. Using heuristic fallback.", e, exc_info=True)
-            return self._heuristic_contract_fallback(question, schema, dataset_id, query_id)
+            fallback = self._heuristic_contract_fallback(question, schema, dataset_id, query_id)
+            return self._validate_and_sanitize_contract(fallback, schema)
 
     def _build_contract_from_data(
         self,
@@ -270,21 +271,27 @@ USER QUESTION:
         if not contract.is_related_to_dataset:
             return contract
 
-        # 1. Prevent unwanted grouping:
-        # If the user did NOT request grouping (e.g. "by", "per", "across", "for each", "breakdown by"),
-        # and answer_type was set to SCALAR or question asks for a single total:
-        asks_grouping = bool(re.search(r"\b(?:by|per|across|for each|each|breakdown by)\b", q_lower))
+        # 1. Prevent unwanted grouping, EXCEPT for time-series / temporal queries:
+        is_temporal = bool(re.search(
+            r"\b(?:over time|changed over time|change over time|trend|trend over time|historical trend|daily|weekly|monthly|quarterly|yearly|annually|month by month|day by day|year by year|sales trend|revenue trend|quantity trend)\b",
+            q_lower
+        ))
+        is_explicit_line = bool(re.search(r"\b(?:line chart|line graph|plot as a line|in line chart|as a line chart|as line)\b", q_lower))
+
+        asks_grouping = bool(re.search(r"\b(?:by|per|across|for each|each|breakdown by)\b", q_lower)) or is_temporal
         asks_ranking = bool(re.search(r"\b(?:top|bottom|highest|lowest)\s+\d*\b", q_lower))
-        if not asks_grouping and not asks_ranking:
+        if not asks_grouping and not asks_ranking and not is_temporal:
             if any(term in q_lower for term in ("total revenue", "total units", "total quantity", "average unit price", "average age", "unique customers", "total sales")):
                 contract.group_by = []
                 contract.answer_type = "SCALAR"
                 contract.should_visualize = contract.requested_visualization  # only visualize if user explicitly asked
 
         # 2. Prevent Measure Swapping:
-        # If question asks about "units", "quantity", or "units sold":
-        is_units_question = bool(re.search(r"\b(?:units?|quantity|items?|units? sold|items? sold)\b", q_lower))
-        is_price_question = bool(re.search(r"\b(?:unit\s*price|price per unit|unitprice)\b", q_lower))
+        is_price_question = bool(re.search(r"\b(?:unit\s*price|price per unit|unitprice|price|cost|rate)\b", q_lower))
+        is_units_question = (
+            bool(re.search(r"\b(?:quantity|items?|units?\s+sold|items?\s+sold)\b", q_lower))
+            or (bool(re.search(r"\bunits?\b", q_lower)) and not is_price_question)
+        )
         is_revenue_question = bool(re.search(r"\b(?:revenue|turnover|total sales)\b", q_lower))
 
         if is_units_question and not is_price_question and not is_revenue_question:
@@ -297,7 +304,7 @@ USER QUESTION:
                     contract.measure_expression = true_qty
                     contract.measure = "Quantity"
 
-        if is_price_question and not is_units_question and not is_revenue_question:
+        if is_price_question and not is_revenue_question:
             # Measure MUST NOT be Quantity!
             if contract.measure_column and any(q in contract.measure_column.lower() for q in ("quantity", "qty", "units")):
                 true_price = next((real for low, real in cols.items() if any(k in low for k in ("unitprice", "price", "unit_price", "rate"))), None)
@@ -322,7 +329,7 @@ USER QUESTION:
                         contract.aggregation = "SUM"
 
         # 4. Handle Scatter / Relationship:
-        if bool(re.search(r"\b(?:relationship|versus|vs\.?|against|correlation)\b", q_lower)):
+        if bool(re.search(r"\b(?:relationship|versus|vs\.?|against|correlation|scatter)\b", q_lower)):
             numeric_cols = [
                 real for low, real in cols.items()
                 if any(k in low for k in ("quantity", "price", "unitprice", "age", "income", "amount", "return", "sales"))
@@ -353,6 +360,23 @@ USER QUESTION:
         # 6. Distinct counting:
         if bool(re.search(r"\b(?:unique|distinct)\b", q_lower)):
             contract.aggregation = "COUNT_DISTINCT"
+
+        # 7. Handle Time Series / Trend / Line Chart:
+        if is_temporal or is_explicit_line:
+            # Generic time column resolution from dataset schema
+            time_col = next((
+                real for low, real in cols.items()
+                if any(k in low for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day", "created_at", "saledate", "purchasedate"))
+            ), None)
+            if time_col:
+                contract.intent = "TIME_SERIES"
+                contract.answer_type = "GROUPED"
+                contract.time_column = time_col
+                contract.group_by = [time_col]
+                contract.should_visualize = True
+                contract.suggested_chart_type = "line"
+                contract.x_axis = time_col
+                contract.sort = SortSpec(field=time_col, direction="asc")
 
         return contract
 
@@ -445,7 +469,10 @@ USER QUESTION:
             )
 
         # 3. TIME-BASED TREND
-        is_trend = bool(re.search(r"\b(?:trend|over time|time-based|timeline|trajectory)\b", q_lower))
+        is_trend = bool(re.search(
+            r"\b(?:over time|changed over time|change over time|trend|trend over time|historical trend|daily|weekly|monthly|quarterly|yearly|annually|month by month|day by day|year by year|sales trend|revenue trend|quantity trend|timeline|trajectory)\b",
+            q_lower
+        ))
         if is_trend and (date_col or group_by):
             trend_dim = date_col or (group_by[0] if group_by else None)
             expr = f'"{qty_col}" * "{price_col}"' if (qty_col and price_col and "revenue" in q_lower) else (qty_col or "metric")
@@ -453,17 +480,19 @@ USER QUESTION:
                 query_id=query_id,
                 dataset_id=dataset_id,
                 original_query=question,
-                intent="AGGREGATION",
+                intent="TIME_SERIES",
                 answer_type="GROUPED",
-                measure="revenue" if "revenue" in q_lower else "value",
+                measure="revenue" if "revenue" in q_lower else "Quantity",
                 measure_column=f"{qty_col} * {price_col}" if (qty_col and price_col and "revenue" in q_lower) else qty_col,
                 measure_expression=expr,
                 aggregation="SUM",
+                time_column=trend_dim,
                 group_by=[trend_dim] if trend_dim else [],
                 should_visualize=True,
                 suggested_chart_type="line",
                 x_axis=trend_dim,
-                y_axis="total_revenue" if "revenue" in q_lower else "total_value",
+                y_axis="total_revenue" if "revenue" in q_lower else "total_quantity",
+                sort=SortSpec(field=trend_dim, direction="asc") if trend_dim else None,
             )
 
         # 4. REVENUE
@@ -510,9 +539,31 @@ USER QUESTION:
                 suggested_chart_type="bar" if group_by else None,
             )
 
-        # 6. UNITS / QUANTITY
-        is_units = bool(re.search(r"\b(?:units?|quantity|items?|units? sold)\b", q_lower))
+        # 6. PRICE
+        is_price = bool(re.search(r"\b(?:unit\s*price|price per unit|unitprice|price)\b", q_lower))
         is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
+        if is_price and price_col and not is_revenue:
+            agg = "AVG" if is_avg else "SUM"
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="AGGREGATION",
+                answer_type="GROUPED" if group_by else "SCALAR",
+                measure="UnitPrice",
+                measure_column=price_col,
+                measure_expression=price_col,
+                aggregation=agg,
+                group_by=group_by,
+                limit=limit_val,
+                should_visualize=bool(group_by),
+            )
+
+        # 7. UNITS / QUANTITY
+        is_units = (
+            bool(re.search(r"\b(?:quantity|items?|units?\s+sold|items?\s+sold)\b", q_lower))
+            or (bool(re.search(r"\bunits?\b", q_lower)) and not is_price)
+        )
         if is_units and qty_col:
             agg = "AVG" if is_avg else "SUM"
             return QueryContract(
@@ -529,25 +580,6 @@ USER QUESTION:
                 limit=limit_val,
                 should_visualize=bool(group_by),
                 suggested_chart_type="bar" if group_by else None,
-            )
-
-        # 7. PRICE
-        is_price = bool(re.search(r"\b(?:unit\s*price|price per unit|unitprice)\b", q_lower))
-        if is_price and price_col:
-            agg = "AVG" if is_avg else "SUM"
-            return QueryContract(
-                query_id=query_id,
-                dataset_id=dataset_id,
-                original_query=question,
-                intent="AGGREGATION",
-                answer_type="GROUPED" if group_by else "SCALAR",
-                measure="UnitPrice",
-                measure_column=price_col,
-                measure_expression=price_col,
-                aggregation=agg,
-                group_by=group_by,
-                limit=limit_val,
-                should_visualize=bool(group_by),
             )
 
         # 8. UNIQUE CUSTOMERS

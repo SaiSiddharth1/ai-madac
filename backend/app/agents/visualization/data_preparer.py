@@ -329,7 +329,54 @@ class DataPreparer:
             }
             return prepared_df, applied_params, insights
 
-        # Case E: Categorical Aggregation (Bar or Pie)
+        # Case E: Line Chart / Time Series
+        if (chart_type in ("line", "trend") or "time" in chart_type) and x_col and x_col in work_df.columns:
+            other_cols = [c for c in work_df.columns if c != x_col]
+            val_col = y_col if (y_col and y_col in work_df.columns) else (other_cols[0] if other_cols else x_col)
+
+            if val_col in work_df.columns and len(work_df.columns) >= 2:
+                prepared_df = work_df[[x_col, val_col]].dropna().copy()
+            else:
+                prepared_df = work_df.groupby(x_col).size().reset_index(name="count")
+                val_col = "count"
+
+            # Chronological ascending sort
+            try:
+                sort_key = pd.to_datetime(prepared_df[x_col], errors="coerce")
+                if sort_key.notna().mean() >= 0.5:
+                    prepared_df["_sort_key"] = sort_key
+                    prepared_df = prepared_df.sort_values(by="_sort_key", ascending=True).drop(columns=["_sort_key"])
+                else:
+                    prepared_df = prepared_df.sort_values(by=x_col, ascending=True)
+            except Exception:
+                prepared_df = prepared_df.sort_values(by=x_col, ascending=True)
+
+            parameters_used.append(f"Time Dimension (X-Axis): {x_col}")
+            parameters_used.append(f"Metric (Y-Axis): {val_col}")
+            parameters_used.append("Sort: Chronological Ascending")
+
+            if not prepared_df.empty:
+                first_pt = prepared_df.iloc[0]
+                last_pt = prepared_df.iloc[-1]
+                v_first = first_pt[val_col]
+                v_last = last_pt[val_col]
+                vf_str = f"{v_first:,.2f}" if isinstance(v_first, (int, float)) else str(v_first)
+                vl_str = f"{v_last:,.2f}" if isinstance(v_last, (int, float)) else str(v_last)
+                insights.append(
+                    f"{val_col.replace('_', ' ').title()} trajectory from {first_pt[x_col]} ({vf_str}) to {last_pt[x_col]} ({vl_str}) across {len(prepared_df)} time points."
+                )
+
+            applied_params = {
+                "chart_type": "Line Chart (Time Series)",
+                "x_axis": x_col,
+                "y_axis": val_col,
+                "data_points": len(prepared_df),
+                "sorting": "Chronological Ascending",
+                "filters": [f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters],
+            }
+            return prepared_df, applied_params, insights
+
+        # Case F: Categorical Aggregation (Bar or Pie)
         if x_col and x_col in work_df.columns:
             other_cols = [c for c in work_df.columns if c != x_col]
             is_pre_aggregated = (

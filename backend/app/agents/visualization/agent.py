@@ -273,11 +273,18 @@ class VisualizationAgent:
         """Step 2: Strict Query-to-Spec Validation & Deterministic Auto-Repair."""
         contract = state.get("_query_contract")
         raw_spec = state.get("_raw_spec")
-        available_cols = state.get("_available_cols", [])
+        available_cols = state.get("_available_cols") or []
+        schema = state.get("schema") or {}
+        sql_result = state.get("sql_result") or {}
+        if not available_cols:
+            available_cols = [str(c.get("name", "")) for c in schema.get("columns", []) if c.get("name")]
+        if not available_cols and sql_result.get("columns"):
+            available_cols = [str(c) for c in sql_result["columns"]]
+        if not available_cols and sql_result.get("rows") and len(sql_result["rows"]) > 0:
+            available_cols = list(sql_result["rows"][0].keys())
 
         if not contract:
             question = state.get("question", "").strip()
-            schema = state.get("schema") or {}
             contract = extract_query_contract(question, schema)
 
         if not raw_spec:
@@ -291,6 +298,8 @@ class VisualizationAgent:
 
         return {
             "_validated_spec": validated_spec,
+            "_available_cols": available_cols,
+            "_query_contract": contract,
             "agents_used": list(set(state.get("agents_used", []) + ["visualization_validator"])),
         }
 

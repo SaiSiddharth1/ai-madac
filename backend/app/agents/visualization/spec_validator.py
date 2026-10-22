@@ -177,24 +177,166 @@ class SpecValidator:
         """
         Build an infallible, mathematically correct visualization specification
         directly from the QueryContract. Used as auto-repair fallback.
+        Works generically for any dataset schema without hardcoded column names.
         """
-        requested = contract.requested_fields
-        dims = contract.dimensions
-        explicit_chart = contract.explicit_chart_type
-        intent = contract.intent
+        requested = [str(f) for f in contract.requested_fields if f]
+        dims = [str(d) for d in contract.dimensions if d]
+        explicit_chart = str(contract.explicit_chart_type or "").lower()
+        intent = str(contract.intent or "").lower()
+        avail = [str(c) for c in available_columns if c]
 
-        # Case 0: Explicit Box Plot (e.g. Age versus Expected Return)
+        # Case 0: Time Series / Line Chart
+        # e.g. "Show me the total revenue over time", "How has quantity sold changed over time in line chart"
+        is_time_series = (
+            explicit_chart in ("line", "trend")
+            or intent in ("trend", "time_series")
+            or any("date" in str(f).lower() or "time" in str(f).lower() or "year" in str(f).lower() for f in requested + dims)
+        )
+        if is_time_series:
+            # Detect temporal column for X
+            time_col = next((
+                c for c in dims + requested + avail
+                if any(k in c.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day", "created_at", "saledate"))
+            ), (dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Date"))))
+
+            # Detect measure column for Y
+            meas_col = contract.measure.get("column") if isinstance(contract.measure, dict) else None
+            if not meas_col:
+                meas_col = next((
+                    c for c in requested + avail
+                    if c != time_col and any(k in c.lower() for k in ("revenue", "total", "quantity", "price", "amount", "sales", "value", "unitprice"))
+                ), (requested[0] if requested and requested[0] != time_col else (avail[1] if len(avail) > 1 else "Value")))
+
+            meas_type = contract.measure.get("type", "sum") if isinstance(contract.measure, dict) else "sum"
+            meas_label = str(meas_col).replace("_", " ").title()
+
+            return {
+                "visualization_available": True,
+                "query_interpretation": {
+                    "intent": "time_series",
+                    "requested_fields": [time_col, meas_col],
+                },
+                "fields": {
+                    "x": time_col,
+                    "y": meas_col,
+                    "color": None,
+                    "facet": None,
+                },
+                "measure": {
+                    "type": meas_type,
+                    "column": meas_col,
+                },
+                "filters": contract.filters,
+                "sorting": {"field": time_col, "direction": "asc"},
+                "limit": contract.limit,
+                "binning": None,
+                "chart": {
+                    "type": "line",
+                    "orientation": "vertical",
+                    "mode": "lines+markers",
+                },
+                "title": f"{meas_label} Over Time",
+                "axis_labels": {
+                    "x": str(time_col).replace("_", " ").title(),
+                    "y": meas_label,
+                },
+                "legend": {
+                    "show": False,
+                    "title": None,
+                },
+            }
+
+        # Case 1: Relationship / Scatter Plot (raw observations between two numeric columns)
+        if intent == "relationship" or explicit_chart == "scatter":
+            num_cols = [
+                c for c in requested + avail
+                if any(k in c.lower() for k in ("quantity", "price", "unitprice", "age", "income", "amount", "sales", "cost", "value", "return", "midpoint"))
+            ]
+            x_col = num_cols[0] if len(num_cols) > 0 else (requested[0] if requested else (avail[0] if avail else "X"))
+            y_col = num_cols[1] if len(num_cols) > 1 else (requested[1] if len(requested) > 1 else (avail[1] if len(avail) > 1 else x_col))
+
+            return {
+                "visualization_available": True,
+                "query_interpretation": {
+                    "intent": "relationship",
+                    "requested_fields": [x_col, y_col],
+                },
+                "fields": {
+                    "x": x_col,
+                    "y": y_col,
+                    "color": None,
+                    "facet": None,
+                },
+                "measure": {
+                    "type": "raw",
+                    "column": y_col,
+                },
+                "filters": contract.filters,
+                "sorting": contract.sorting,
+                "limit": contract.limit or 5000,
+                "binning": None,
+                "chart": {
+                    "type": "scatter",
+                    "orientation": "vertical",
+                    "mode": "markers",
+                },
+                "title": f"{str(y_col).replace('_', ' ').title()} vs {str(x_col).replace('_', ' ').title()}",
+                "axis_labels": {
+                    "x": str(x_col).replace("_", " ").title(),
+                    "y": str(y_col).replace("_", " ").title(),
+                },
+                "legend": {
+                    "show": False,
+                    "title": None,
+                },
+            }
+
+        # Case 2: Distribution / Histogram (raw observations of one numeric column)
+        if intent == "distribution" or explicit_chart == "histogram":
+            target_col = requested[0] if requested else (dims[0] if dims else (avail[0] if avail else "Value"))
+            return {
+                "visualization_available": True,
+                "query_interpretation": {
+                    "intent": "distribution",
+                    "requested_fields": [target_col],
+                },
+                "fields": {
+                    "x": target_col,
+                    "y": None,
+                    "color": None,
+                    "facet": None,
+                },
+                "measure": {
+                    "type": "raw",
+                    "column": target_col,
+                },
+                "filters": contract.filters,
+                "sorting": contract.sorting,
+                "limit": contract.limit or 5000,
+                "binning": contract.binning,
+                "chart": {
+                    "type": "histogram",
+                    "orientation": "vertical",
+                    "mode": "overlay",
+                },
+                "title": f"Distribution of {str(target_col).replace('_', ' ').title()}",
+                "axis_labels": {
+                    "x": str(target_col).replace("_", " ").title(),
+                    "y": "Count of Observations",
+                },
+                "legend": {
+                    "show": False,
+                    "title": None,
+                },
+            }
+
+        # Case 3: Box Plot
         if explicit_chart in ("box", "box_plot"):
-            # Put categorical/bracket on X, numerical on Y
             if len(requested) >= 2:
-                d1, d2 = requested[0], requested[1]
-                if "age" in d1.lower() or "income" in d1.lower() or "salary" in d1.lower():
-                    y_col, x_col = d1, d2
-                else:
-                    y_col, x_col = d2, d1
+                x_col, y_col = requested[0], requested[1]
             else:
-                y_col = requested[0] if requested else "Age"
-                x_col = available_columns[0]
+                x_col = dims[0] if dims else (avail[0] if avail else "Category")
+                y_col = requested[0] if requested else (avail[1] if len(avail) > 1 else x_col)
 
             return {
                 "visualization_available": True,
@@ -220,10 +362,10 @@ class SpecValidator:
                     "type": "box",
                     "orientation": "vertical",
                 },
-                "title": f"{y_col.replace('_', ' ').title()} Distribution by {x_col.replace('_', ' ').title()}",
+                "title": f"{str(y_col).replace('_', ' ').title()} by {str(x_col).replace('_', ' ').title()}",
                 "axis_labels": {
-                    "x": x_col.replace("_", " ").title(),
-                    "y": y_col.replace("_", " ").title(),
+                    "x": str(x_col).replace("_", " ").title(),
+                    "y": str(y_col).replace("_", " ").title(),
                 },
                 "legend": {
                     "show": False,
@@ -231,56 +373,51 @@ class SpecValidator:
                 },
             }
 
-        # Case: Relationship / Scatter
-        # e.g. "Show age versus expected return as a scatter plot"
-        if intent == "relationship" or explicit_chart == "scatter":
-            x_col = requested[0] if len(requested) > 0 else "age"
-            y_col = requested[1] if len(requested) > 1 else (requested[0] if len(requested) > 0 else "expected_return")
+        # Case 4: Proportion / Pie chart
+        if explicit_chart in ("pie", "donut") or intent == "proportion":
+            x_col = dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Category"))
+            meas_col = contract.measure.get("column") if isinstance(contract.measure, dict) else None
             return {
                 "visualization_available": True,
                 "query_interpretation": {
-                    "intent": "relationship",
-                    "requested_fields": [x_col, y_col],
+                    "intent": "proportion",
+                    "requested_fields": [x_col],
                 },
                 "fields": {
                     "x": x_col,
-                    "y": y_col,
+                    "y": meas_col,
                     "color": None,
                     "facet": None,
                 },
                 "measure": {
-                    "type": "raw",
-                    "column": None,
+                    "type": "count",
+                    "column": meas_col,
                 },
                 "filters": contract.filters,
                 "sorting": contract.sorting,
                 "limit": contract.limit,
                 "binning": None,
                 "chart": {
-                    "type": "scatter",
+                    "type": "pie",
                     "orientation": "vertical",
-                    "mode": "markers",
+                    "mode": "donut" if explicit_chart == "donut" else "pie",
                 },
-                "title": f"{y_col.replace('_', ' ').title()} vs {x_col.replace('_', ' ').title()}",
+                "title": f"Distribution by {str(x_col).replace('_', ' ').title()}",
                 "axis_labels": {
-                    "x": x_col.replace("_", " ").title(),
-                    "y": y_col.replace("_", " ").title(),
+                    "x": str(x_col).replace("_", " ").title(),
+                    "y": "Share",
                 },
                 "legend": {
-                    "show": False,
-                    "title": None,
+                    "show": True,
+                    "title": str(x_col).replace("_", " ").title(),
                 },
             }
 
-        # Case 1: Cross-tabulation / 2 categorical dimensions
-        # e.g. "Show gender versus investment objective."
-        if (intent == "cross_tabulation" or len(dims) >= 2) and intent != "relationship":
-            # Prefer broader category on X (e.g. objective/avenue) and binary/smaller on color (e.g. gender)
-            d1, d2 = dims[0], dims[1]
-            if d1.lower() in ("gender", "sex") and d2.lower() not in ("gender", "sex"):
-                x_col, color_col = d2, d1
-            else:
-                x_col, color_col = d1, d2
+        # Case 5: Cross-tabulation / 2 categorical dimensions
+        if (intent == "cross_tabulation" or len(dims) >= 2) and intent not in ("relationship", "distribution", "time_series"):
+            d1 = dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Category"))
+            d2 = dims[1] if len(dims) > 1 else (requested[1] if len(requested) > 1 else (avail[1] if len(avail) > 1 else "Group"))
+            x_col, color_col = d1, d2
 
             return {
                 "visualization_available": True,
@@ -307,143 +444,25 @@ class SpecValidator:
                     "orientation": "vertical",
                     "mode": "grouped",
                 },
-                "title": f"Investors by {color_col.replace('_', ' ').title()} and {x_col.replace('_', ' ').title()}",
+                "title": f"Breakdown by {str(color_col).replace('_', ' ').title()} and {str(x_col).replace('_', ' ').title()}",
                 "axis_labels": {
-                    "x": x_col.replace("_", " ").title(),
-                    "y": "Number of Investors",
+                    "x": str(x_col).replace("_", " ").title(),
+                    "y": "Count",
                 },
                 "legend": {
                     "show": True,
-                    "title": color_col.replace("_", " ").title(),
+                    "title": str(color_col).replace("_", " ").title(),
                 },
             }
 
-        # Case 2: Distribution / Histogram
-        # e.g. "Show the age distribution"
-        if intent == "distribution" or explicit_chart == "histogram":
-            x_col = requested[0] if requested else (dims[0] if dims else "age")
-            return {
-                "visualization_available": True,
-                "query_interpretation": {
-                    "intent": "distribution",
-                    "requested_fields": [x_col],
-                },
-                "fields": {
-                    "x": x_col,
-                    "y": None,
-                    "color": None,
-                    "facet": None,
-                },
-                "measure": {
-                    "type": "count",
-                    "column": None,
-                },
-                "filters": contract.filters,
-                "sorting": contract.sorting,
-                "limit": contract.limit,
-                "binning": contract.binning,
-                "chart": {
-                    "type": "histogram",
-                    "orientation": "vertical",
-                    "mode": "overlay",
-                },
-                "title": f"Distribution of {x_col.replace('_', ' ').title()}",
-                "axis_labels": {
-                    "x": x_col.replace("_", " ").title(),
-                    "y": "Number of Investors",
-                },
-                "legend": {
-                    "show": False,
-                    "title": None,
-                },
-            }
+        # Case 6: Single category aggregation / Ranking Bar chart (Generic Default)
+        x_col = dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Category"))
+        meas_type = contract.measure.get("type", "count") if isinstance(contract.measure, dict) else "count"
+        meas_col = (
+            contract.measure.get("column") if isinstance(contract.measure, dict) else None
+        ) or next((c for c in avail if c != x_col), None)
 
-        # Case 3: Relationship / Scatter
-        # e.g. "Show age versus expected return"
-        if intent == "relationship" or explicit_chart == "scatter":
-            x_col = requested[0] if len(requested) > 0 else "age"
-            y_col = requested[1] if len(requested) > 1 else (requested[0] if len(requested) > 0 else "expected_return")
-            return {
-                "visualization_available": True,
-                "query_interpretation": {
-                    "intent": "relationship",
-                    "requested_fields": [x_col, y_col],
-                },
-                "fields": {
-                    "x": x_col,
-                    "y": y_col,
-                    "color": None,
-                    "facet": None,
-                },
-                "measure": {
-                    "type": "raw",
-                    "column": None,
-                },
-                "filters": contract.filters,
-                "sorting": contract.sorting,
-                "limit": contract.limit,
-                "binning": None,
-                "chart": {
-                    "type": "scatter",
-                    "orientation": "vertical",
-                    "mode": "markers",
-                },
-                "title": f"{y_col.replace('_', ' ').title()} vs {x_col.replace('_', ' ').title()}",
-                "axis_labels": {
-                    "x": x_col.replace("_", " ").title(),
-                    "y": y_col.replace("_", " ").title(),
-                },
-                "legend": {
-                    "show": False,
-                    "title": None,
-                },
-            }
-
-        # Case 4: Proportion / Pie chart
-        # e.g. "Show gender distribution in a pie chart"
-        if explicit_chart in ("pie", "donut") or intent == "proportion":
-            x_col = dims[0] if dims else (requested[0] if requested else "gender")
-            return {
-                "visualization_available": True,
-                "query_interpretation": {
-                    "intent": "proportion",
-                    "requested_fields": [x_col],
-                },
-                "fields": {
-                    "x": x_col,
-                    "y": None,
-                    "color": None,
-                    "facet": None,
-                },
-                "measure": {
-                    "type": "count",
-                    "column": None,
-                },
-                "filters": contract.filters,
-                "sorting": contract.sorting,
-                "limit": contract.limit,
-                "binning": None,
-                "chart": {
-                    "type": "pie",
-                    "orientation": "vertical",
-                    "mode": "donut" if explicit_chart == "donut" else "pie",
-                },
-                "title": f"Distribution: {x_col}",
-                "axis_labels": {
-                    "x": x_col.replace("_", " ").title(),
-                    "y": "Share",
-                },
-                "legend": {
-                    "show": True,
-                    "title": x_col.replace("_", " ").title(),
-                },
-            }
-
-        # Case 5: Single category aggregation / Ranking Bar chart
-        # e.g. "Rank investment avenues by number of investors", "Show investment avenues for female investors"
-        x_col = dims[0] if dims else (requested[0] if requested else available_columns[0])
-        meas_type = contract.measure.get("type", "count")
-        meas_col = contract.measure.get("column")
+        y_label = f"Total {str(meas_col).replace('_', ' ').title()}" if (meas_col and meas_type != "count") else "Count"
 
         return {
             "visualization_available": True,
@@ -470,10 +489,10 @@ class SpecValidator:
                 "orientation": "vertical",
                 "mode": "standard",
             },
-            "title": f"Investors by {x_col.replace('_', ' ').title()}",
+            "title": f"{y_label} by {str(x_col).replace('_', ' ').title()}",
             "axis_labels": {
-                "x": x_col.replace("_", " ").title(),
-                "y": f"Average {meas_col.replace('_', ' ').title()}" if meas_type == "mean" else "Number of Investors",
+                "x": str(x_col).replace("_", " ").title(),
+                "y": y_label,
             },
             "legend": {
                 "show": False,
