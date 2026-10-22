@@ -49,12 +49,15 @@ def get_llm(
         if not settings.GOOGLE_API_KEY:
             logger.warning("GOOGLE_API_KEY is not configured.")
         from langchain_google_genai import ChatGoogleGenerativeAI
+        target_model = selected_model or "gemini-2.5-flash"
+        if target_model in ("gemini-1.5-flash", "gemini-3.8-flash"):
+            target_model = "gemini-2.5-flash"
         return ChatGoogleGenerativeAI(
-            model=selected_model or "gemini-1.5-flash",
+            model=target_model,
             temperature=temperature,
             google_api_key=settings.GOOGLE_API_KEY,
-            max_retries=1,
-            timeout=10,
+            max_retries=2,
+            timeout=15,
         )
 
     elif selected_provider == "anthropic":

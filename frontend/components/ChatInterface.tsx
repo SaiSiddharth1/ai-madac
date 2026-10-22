@@ -5,6 +5,8 @@ import { apiQueryDataset, apiGetDatasetQueries } from "@/lib/api";
 import AgentStatusBadge from "./AgentStatusBadge";
 import AgentWorkflow, { WorkflowState, AgentState } from "./AgentWorkflow";
 import PlotlyChart from "./PlotlyChart";
+import KpiCard from "./KpiCard";
+import InteractiveTable from "./InteractiveTable";
 import type { FullQueryResponse } from "@/types";
 
 interface ChatInterfaceProps {
@@ -29,6 +31,7 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
   const [loading, setLoading] = useState(false);
   const [fetchingHistory, setFetchingHistory] = useState(true);
   const [workflowState, setWorkflowState] = useState<WorkflowState | null>(null);
+  const [activeViews, setActiveViews] = useState<Record<string, "chart" | "table">>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const sessionIdRef = useRef("");
 
@@ -329,100 +332,162 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
                   {/* Agent execution badges */}
                   <AgentStatusBadge agents={rInfo.agents_used || []} />
 
-                  {/* Main Answer */}
-                  <div style={{ fontSize: "0.95rem", fontWeight: 500, lineHeight: 1.6, color: "var(--text-primary)", margin: "12px 0" }}>
-                    {rInfo.answer || "Analysis complete."}
-                  </div>
+                  {(() => {
+                    const msgKey = String(qInfo.id || idx);
+                    const isUnrelated = (
+                      rInfo.response_type === "UNRELATED"
+                      || rInfo.answer?.toLowerCase().includes("not related to the currently loaded dataset")
+                    );
+                    const isScalar = (
+                      rInfo.response_type === "SCALAR"
+                      || Boolean(rInfo.kpi)
+                      || (rInfo.data_used?.rows?.length === 1 && rInfo.data_used?.columns?.length === 1)
+                    );
+                    const hasTableData = Boolean(rInfo.data_used?.rows && rInfo.data_used.rows.length > 0);
+                    const hasChart = chartPaths.length > 0;
+                    const currentView = activeViews[msgKey] || (hasChart ? "chart" : "table");
 
-                  {/* Visual analysis is intentionally shown before raw data so
-                      people can understand the result without reading a table. */}
-                  {chartPaths.length > 0 && (
-                    <section style={{ margin: "16px 0" }}>
-                      <div style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--accent)", marginBottom: "10px", display: "flex", alignItems: "center", gap: "6px" }}>
-                        <span>📊</span> Visual Analysis & Interactive Plotly
-                      </div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
-                        {chartPaths.map((path: string, chartIndex: number) => {
-                          const vizResult = rInfo.visualization_result || (rInfo.data_used && rInfo.data_used.visualization);
-                          const params = rInfo.parameters || (rInfo.data_used && rInfo.data_used.parameters) || vizResult?.parameters;
-                          const explanation = vizResult?.explanation;
-                          const chartJson = rInfo.chart_json || (rInfo.data_used && rInfo.data_used.chart_json);
-
-                          return (
-                            <PlotlyChart
-                              key={path}
-                              chartPath={path}
-                              chartIndex={chartIndex}
-                              chartJson={chartJson}
-                              parameters={params}
-                              explanation={explanation}
-                              baseUrl={chartBaseUrl}
-                            />
-                          );
-                        })}
-                      </div>
-                    </section>
-                  )}
-
-                  {/* Key Insights */}
-                  {rInfo.insights && rInfo.insights.length > 0 && (
-                    <div style={{ background: "var(--bg-input)", padding: "12px 16px", borderRadius: "10px", margin: "12px 0", border: "1px solid var(--border)" }}>
-                      <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--accent)", marginBottom: "6px" }}>
-                        📌 Key Insights
-                      </div>
-                      <ul style={{ paddingLeft: "20px", fontSize: "0.85rem", color: "var(--text-secondary)" }}>
-                        {rInfo.insights.map((ins: string, i: number) => (
-                          <li key={i} style={{ marginBottom: "4px" }}>{ins}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-
-                  {/* SQL Query & Data Table Preview */}
-                  {rInfo.data_used && (
-                    <div style={{ marginTop: "16px" }}>
-                      {/* Executed SQL query disclosure */}
-                      {rInfo.data_used.query && (
-                        <details style={{ marginBottom: "12px", fontSize: "0.8rem" }}>
-                          <summary style={{ cursor: "pointer", color: "var(--text-muted)", fontWeight: 500 }}>
-                            🔍 View Executed SQL Query
-                          </summary>
-                          <pre style={{ background: "#0b0b18", padding: "10px 14px", borderRadius: "8px", color: "var(--accent-light)", marginTop: "6px", overflowX: "auto" }}>
-                            {rInfo.data_used.query}
-                          </pre>
-                        </details>
-                      )}
-
-                      {/* Data Table */}
-                      {rInfo.data_used.rows && rInfo.data_used.rows.length > 0 && (
-                        <div style={{ overflowX: "auto", marginTop: "8px" }}>
-                          <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginBottom: "6px" }}>
-                            Showing {rInfo.data_used.rows.length} of {rInfo.data_used.row_count} record(s):
+                    if (isUnrelated) {
+                      return (
+                        <div
+                          style={{
+                            background: "rgba(245, 158, 11, 0.12)",
+                            border: "1px solid rgba(245, 158, 11, 0.3)",
+                            borderRadius: "14px",
+                            padding: "18px 22px",
+                            margin: "12px 0",
+                          }}
+                        >
+                          <div
+                            style={{
+                              fontSize: "0.95rem",
+                              fontWeight: 700,
+                              color: "#fcd34d",
+                              marginBottom: "8px",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "8px",
+                            }}
+                          >
+                            <span>⚠️</span> Question Not Related to Dataset
                           </div>
-                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.8rem" }}>
-                            <thead>
-                              <tr>
-                                {rInfo.data_used.columns.map((col: string, i: number) => (
-                                  <th key={i} style={{ textAlign: "left", padding: "6px 10px", background: "var(--bg-input)", color: "var(--primary-light)", borderBottom: "1px solid var(--border)" }}>
-                                    {col}
-                                  </th>
-                                ))}
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {rInfo.data_used.rows.slice(0, 10).map((row: any, rIdx: number) => (
-                                <tr key={rIdx}>
-                                  {rInfo.data_used.columns.map((col: string, cIdx: number) => (
-                                    <td key={cIdx} style={{ padding: "6px 10px", borderBottom: "1px solid rgba(45, 45, 94, 0.4)", color: "var(--text-secondary)" }}>
-                                      {String(row[col] ?? "")}
-                                    </td>
-                                  ))}
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
+                          <div style={{ color: "#fef3c7", fontSize: "0.9rem", lineHeight: 1.6 }}>
+                            {rInfo.answer}
+                          </div>
+                          <div style={{ color: "#fde68a", fontSize: "0.8rem", marginTop: "10px" }}>
+                            Please ask a question related to columns and records in &quot;{datasetName}&quot;.
+                          </div>
                         </div>
-                      )}
+                      );
+                    }
+
+                    if (isScalar) {
+                      return (
+                        <KpiCard
+                          label={rInfo.kpi?.label || rInfo.data_used?.columns?.[0] || "Total Result"}
+                          value={rInfo.kpi?.value ?? (rInfo.data_used?.rows?.[0]?.[rInfo.data_used?.columns?.[0]] ?? rInfo.answer)}
+                          explanation={rInfo.explanation}
+                          insights={rInfo.insights || []}
+                        />
+                      );
+                    }
+
+                    return (
+                      <div>
+                        {/* Main Answer Header */}
+                        <div style={{ fontSize: "0.95rem", fontWeight: 500, lineHeight: 1.6, color: "var(--text-primary)", margin: "12px 0" }}>
+                          {rInfo.answer || "Analysis complete."}
+                        </div>
+
+                        {/* Chart View */}
+                        {hasChart && currentView === "chart" && (
+                          <section style={{ margin: "16px 0" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                              <div style={{ fontSize: "0.85rem", fontWeight: 700, color: "var(--accent)", display: "flex", alignItems: "center", gap: "6px" }}>
+                                <span>📊</span> Visual Analysis & Interactive Plotly
+                              </div>
+                              {hasTableData && (
+                                <button
+                                  onClick={() => setActiveViews((prev) => ({ ...prev, [msgKey]: "table" }))}
+                                  style={{
+                                    padding: "5px 12px",
+                                    borderRadius: "8px",
+                                    background: "rgba(255, 255, 255, 0.06)",
+                                    border: "1px solid rgba(255, 255, 255, 0.12)",
+                                    color: "var(--primary-light)",
+                                    fontSize: "0.78rem",
+                                    fontWeight: 600,
+                                    cursor: "pointer",
+                                  }}
+                                >
+                                  📋 View as Table
+                                </button>
+                              )}
+                            </div>
+                            <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                              {chartPaths.map((path: string, chartIndex: number) => {
+                                const vizResult = rInfo.visualization_result || (rInfo.data_used && rInfo.data_used.visualization);
+                                const params = rInfo.parameters || (rInfo.data_used && rInfo.data_used.parameters) || vizResult?.parameters;
+                                const explanation = vizResult?.explanation || rInfo.explanation;
+                                const chartJson = rInfo.chart_json || (rInfo.data_used && rInfo.data_used.chart_json);
+
+                                return (
+                                  <PlotlyChart
+                                    key={path}
+                                    chartPath={path}
+                                    chartIndex={chartIndex}
+                                    chartJson={chartJson}
+                                    parameters={params}
+                                    explanation={explanation}
+                                    baseUrl={chartBaseUrl}
+                                  />
+                                );
+                              })}
+                            </div>
+                          </section>
+                        )}
+
+                        {/* Table View */}
+                        {hasTableData && (currentView === "table" || !hasChart) && (
+                          <InteractiveTable
+                            columns={rInfo.data_used.columns || []}
+                            rows={rInfo.data_used.rows || []}
+                            totalRowCount={rInfo.data_used.row_count}
+                            explanation={rInfo.explanation}
+                            isChartViewAvailable={hasChart}
+                            isChartViewActive={currentView === "chart"}
+                            onToggleView={() => setActiveViews((prev) => ({ ...prev, [msgKey]: "chart" }))}
+                          />
+                        )}
+
+                        {/* Key Insights (when not shown inside chart) */}
+                        {rInfo.insights && rInfo.insights.length > 0 && !hasChart && (
+                          <div style={{ background: "var(--bg-input)", padding: "12px 16px", borderRadius: "10px", margin: "12px 0", border: "1px solid var(--border)" }}>
+                            <div style={{ fontSize: "0.8rem", fontWeight: 700, color: "var(--accent)", marginBottom: "6px" }}>
+                              📌 Key Insights
+                            </div>
+                            <ul style={{ paddingLeft: "20px", fontSize: "0.85rem", color: "var(--text-secondary)" }}>
+                              {rInfo.insights.map((ins: string, i: number) => (
+                                <li key={i} style={{ marginBottom: "4px" }}>{ins}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {/* SQL Query Disclosure */}
+                  {rInfo.data_used && rInfo.data_used.query && (
+                    <div style={{ marginTop: "14px" }}>
+                      <details style={{ fontSize: "0.8rem" }}>
+                        <summary style={{ cursor: "pointer", color: "var(--text-muted)", fontWeight: 500 }}>
+                          🔍 View Executed SQL Query
+                        </summary>
+                        <pre style={{ background: "#0b0b18", padding: "10px 14px", borderRadius: "8px", color: "var(--accent-light)", marginTop: "6px", overflowX: "auto" }}>
+                          {rInfo.data_used.query}
+                        </pre>
+                      </details>
                     </div>
                   )}
                 </div>

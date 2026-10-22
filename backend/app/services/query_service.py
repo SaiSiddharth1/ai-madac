@@ -81,6 +81,7 @@ async def execute_query(
         "previous_validated_result": previous,
         "validated_result": None,
         "intent": "",
+        "query_contract": None,
         "structured_intent": {},
         "execution_plan": [],
         "sql_query": None,

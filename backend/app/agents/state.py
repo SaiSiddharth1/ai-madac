@@ -27,6 +27,7 @@ class AgentState(TypedDict, total=False):
 
     # --- Supervisor output ---
     intent: str                      # DATA_RETRIEVAL, DATA_ANALYSIS, PREDICTION, etc.
+    query_contract: Optional[dict[str, Any]] # Fresh structured semantic Query Contract
     structured_intent: dict[str, Any] # Parsed operation, dimensions, filters and ranking intent
     execution_plan: list[str]        # Ordered list of agent names to invoke
 

@@ -191,6 +191,16 @@ class VisualizationAgent:
 
         logger.info(f"Visualization Agent processing query: '{question}'")
 
+        query_contract_dict = state.get("query_contract")
+        if query_contract_dict and not query_contract_dict.get("is_related_to_dataset"):
+            return {
+                "visualization_result": self._empty_visualization_result(
+                    query_contract_dict.get("unrelated_reason")
+                    or "I can't generate a chart for this question because it is not related to the currently loaded dataset."
+                ),
+                "agents_used": list(set(state.get("agents_used", []) + ["visualization_agent"])),
+            }
+
         available_cols = [str(c.get("name", "")) for c in schema.get("columns", []) if c.get("name")]
         if not available_cols:
             if sql_result and sql_result.get("columns"):
@@ -203,6 +213,15 @@ class VisualizationAgent:
             schema=schema if schema.get("columns") else available_cols,
             previous_result=prev_result if bool(prev_result) else None,
         )
+
+        # Merge fields from state query_contract if present
+        if query_contract_dict:
+            if query_contract_dict.get("suggested_chart_type"):
+                contract.requested_chart = query_contract_dict["suggested_chart_type"]
+            if query_contract_dict.get("bin_width"):
+                contract.bin = {"mode": "fixed", "size": query_contract_dict["bin_width"]}
+            if query_contract_dict.get("group_by"):
+                contract.requested_dimensions = query_contract_dict["group_by"]
 
         if contract.is_follow_up and not sql_result and prev_result and prev_result.get("validated"):
             sql_result = {
@@ -232,6 +251,15 @@ class VisualizationAgent:
                     available_cols.append(col)
 
         candidate_spec = self._get_candidate_specification(question, contract, schema, available_cols)
+        if query_contract_dict:
+            if query_contract_dict.get("suggested_chart_type"):
+                candidate_spec.setdefault("chart", {})["type"] = query_contract_dict["suggested_chart_type"]
+            if query_contract_dict.get("x_axis"):
+                candidate_spec.setdefault("fields", {})["x"] = query_contract_dict["x_axis"]
+            if query_contract_dict.get("y_axis"):
+                candidate_spec.setdefault("fields", {})["y"] = query_contract_dict["y_axis"]
+            if query_contract_dict.get("bin_width"):
+                candidate_spec["bin_width"] = query_contract_dict["bin_width"]
 
         return {
             "_query_contract": contract,
@@ -405,25 +433,17 @@ class VisualizationAgent:
         """
         Load the current DataFrame with all required columns.
         Priority:
-        1. If table_name is available and query requires raw observations or cross-tabulation:
-           read directly from the database table.
+        1. If sql_result contains rows with required columns: use sql_result rows.
         2. If analysis_result contains relationship findings: format as comparative DataFrame.
-        3. If sql_result contains rows with required columns: use sql_result rows.
+        3. If table_name is available and query requires raw observations: query table with LIMIT.
         """
-        # If database table is available, query it directly to guarantee access to raw observations
-        # and all requested dimensions (e.g. for cross-tabulation or histograms)
-        if table_name:
-            try:
-                safe_table = table_name.replace('"', '""')
-                df = pd.read_sql(f'SELECT * FROM "{safe_table}"', con=sync_engine)
-                if not df.empty:
-                    # Check if all requested fields are in this DataFrame
-                    if all(col in df.columns for col in contract.requested_fields):
-                        return df
-            except Exception as e:
-                logger.warning(f"Failed to read table '{table_name}' from sync_engine: {e}")
+        # 1. Use SQL result rows if available
+        if sql_result and sql_result.get("rows"):
+            df = pd.DataFrame(sql_result["rows"])
+            if not df.empty:
+                return df
 
-        # Support relationship analysis from Data Analyst Agent
+        # 2. Support relationship analysis from Data Analyst Agent
         if analysis_result and analysis_result.get("analysis_type") == "relationship_impact_analysis":
             with_grp = analysis_result.get("group_with_event", {})
             without_grp = analysis_result.get("group_without_event", {})
@@ -434,9 +454,20 @@ class VisualizationAgent:
                 {"Group": f"Without {pred_col}", f"Average {target_col}": without_grp.get("mean_target", 0)},
             ])
 
-        # Use SQL result rows if available
-        if sql_result and sql_result.get("rows"):
-            return pd.DataFrame(sql_result["rows"])
+        # 3. If database table is available, query only the required columns with safe LIMIT
+        if table_name:
+            try:
+                safe_table = table_name.replace('"', '""')
+                if contract.requested_fields:
+                    quoted_cols = [f'"{f}"' for f in contract.requested_fields]
+                    col_sql = ", ".join(quoted_cols)
+                    df = pd.read_sql(f'SELECT {col_sql} FROM "{safe_table}" LIMIT 5000', con=sync_engine)
+                else:
+                    df = pd.read_sql(f'SELECT * FROM "{safe_table}" LIMIT 5000', con=sync_engine)
+                if not df.empty:
+                    return df
+            except Exception as e:
+                logger.warning(f"Failed to read table '{table_name}' from sync_engine: {e}")
 
         return None
 

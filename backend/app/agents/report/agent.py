@@ -172,13 +172,78 @@ class ReportAgent:
 
         context_str = "\n\n".join(context_parts) if context_parts else "No tabular data returned."
 
-        # Aggregations already contain the exact answer.  Rendering them
-        # deterministically prevents an LLM from substituting unrelated
-        # columns or stale generic language for the current result.
-        if sql_result and structured_intent.get("operation") in {"AGGREGATE", "FREQUENCY", "PERCENTAGE"}:
+        # Check if question is unrelated to dataset
+        is_unrelated = (
+            structured_intent.get("is_related_to_dataset") is False
+            or state.get("intent") == "UNRELATED"
+            or (sql_result and sql_result.get("response_type") == "UNRELATED")
+        )
+
+        if is_unrelated:
+            unrelated_msg = (
+                structured_intent.get("unrelated_reason")
+                or "I can't generate an answer or chart for this question because it is not related to the currently loaded dataset. The current dataset does not contain this information."
+            )
+            final_report = {
+                "answer": unrelated_msg,
+                "insights": ["The question does not match any columns or concepts in the current dataset schema."],
+                "chart_paths": [],
+                "chart_json": None,
+                "parameters": None,
+                "visualization_result": None,
+                "response_type": "UNRELATED",
+                "data_used": {"response_type": "UNRELATED", "message": unrelated_msg},
+                "agents_used": list(set(agents_used)),
+            }
+            return {"final_report": final_report, "agents_used": list(set(agents_used))}
+
+        # Handle SCALAR results
+        is_scalar = (
+            (sql_result and sql_result.get("response_type") == "SCALAR")
+            or structured_intent.get("answer_type") == "SCALAR"
+            or (sql_result and len(sql_result.get("rows", [])) == 1 and len(sql_result.get("columns", [])) == 1)
+        )
+
+        kpi_data = None
+        explanation_data = None
+
+        if is_scalar and sql_result and sql_result.get("rows"):
+            metric_name = sql_result.get("metric_name") or sql_result.get("columns", ["Total"])[0].replace("_", " ").title()
+            scalar_val = sql_result.get("formatted_value") or str(sql_result.get("scalar_value") if sql_result.get("scalar_value") is not None else sql_result["rows"][0].get(sql_result["columns"][0]))
+            raw_val = sql_result.get("scalar_value") if sql_result.get("scalar_value") is not None else sql_result["rows"][0].get(sql_result["columns"][0])
+
+            answer = f"The {metric_name.lower()} is {scalar_val}."
+            insights = [
+                f"Calculated from verified dataset records using {structured_intent.get('aggregation', 'SUM')} of {structured_intent.get('measure', metric_name)}.",
+                "No categorical grouping was applied, representing the global total.",
+            ]
+            kpi_data = {
+                "label": metric_name,
+                "value": scalar_val,
+                "raw_value": raw_val,
+            }
+            explanation_data = {
+                "what_this_shows": f"Global {metric_name.lower()} across the entire dataset.",
+                "parameters_used": [
+                    f"Measure: {structured_intent.get('measure') or metric_name}",
+                    f"Aggregation: {structured_intent.get('aggregation') or 'SUM'}",
+                    "Grouping: None (Single Scalar Total)",
+                ],
+                "key_insights": insights,
+            }
+        elif sql_result and structured_intent.get("operation") in {"AGGREGATE", "FREQUENCY", "PERCENTAGE"}:
             answer, insights = self._deterministic_fallback_report(
                 question, analysis_result, sql_result, structured_intent
             )
+            explanation_data = {
+                "what_this_shows": f"Breakdown of {structured_intent.get('measure', 'records')} by {', '.join(structured_intent.get('group_by', ['category']))}.",
+                "parameters_used": [
+                    f"Measure: {structured_intent.get('measure', 'records')}",
+                    f"Aggregation: {structured_intent.get('aggregation') or 'COUNT'}",
+                    f"Grouping: {', '.join(structured_intent.get('group_by', []))}",
+                ],
+                "key_insights": insights,
+            }
         else:
             try:
                 response = self.llm.invoke([
@@ -211,25 +276,17 @@ class ReportAgent:
         chart_paths = []
         if viz_result:
             chart_paths = viz_result.get("chart_paths", [])
-            # Backwards compatibility for previously generated single-chart
-            # visualization results.
             if not chart_paths and viz_result.get("chart_path"):
                 chart_paths = [viz_result["chart_path"]]
 
-        # Rewrite the final answer into simple, clear, natural, conversational response for non-aggregation outputs
-        if structured_intent.get("operation") not in {"AGGREGATE", "FREQUENCY", "PERCENTAGE"}:
-            answer = self._rewrite_response(question, answer)
-
-        # When a visualization was explicitly requested, use the visualization explanation and insights
-        if viz_result:
-            if viz_result.get("visualization_available") is False and not chart_paths:
-                if any(w in question.lower() for w in ("chart", "plot", "pie", "graph", "visualiz")):
-                    answer = viz_result.get("explanation", answer)
-                    insights = viz_result.get("key_insights", insights)
-            elif viz_result.get("explanation") and any(w in question.lower() for w in ("chart", "plot", "pie", "graph", "visualiz")):
+        # When a visualization was explicitly requested, use visualization explanation
+        if viz_result and viz_result.get("explanation"):
+            if any(w in question.lower() for w in ("chart", "plot", "pie", "graph", "visualiz")):
                 answer = viz_result["explanation"]
                 if viz_result.get("key_insights"):
                     insights = viz_result["key_insights"]
+                if isinstance(viz_result.get("explanation"), dict):
+                    explanation_data = dict(viz_result["explanation"])
 
         data_used_payload = sql_result or {}
         if isinstance(data_used_payload, dict) and viz_result:
@@ -237,19 +294,30 @@ class ReportAgent:
             data_used_payload["parameters"] = viz_result.get("parameters")
             data_used_payload["chart_json"] = viz_result.get("chart_json")
 
+        final_response_type = (
+            "UNRELATED" if is_unrelated
+            else "SCALAR" if is_scalar
+            else "VISUALIZATION" if chart_paths
+            else "GROUPED" if (structured_intent.get("group_by_needed") or (sql_result and len(sql_result.get("columns", [])) >= 2))
+            else "TABLE"
+        )
+
         final_report = {
             "answer": str(answer),
             "insights": insights,
             "chart_paths": chart_paths,
             "chart_json": viz_result.get("chart_json") if viz_result else None,
-            "parameters": viz_result.get("parameters") if viz_result else None,
+            "parameters": viz_result.get("parameters") if viz_result else (sql_result.get("parameters") if sql_result else None),
             "visualization_result": viz_result,
+            "response_type": final_response_type,
+            "kpi": kpi_data,
+            "explanation": explanation_data,
             "data_used": data_used_payload,
             "agents_used": list(set(agents_used)),
         }
         logger.info(
             "========== AI-MADAC DEBUG ==========\nFINAL RESPONSE:\n%s\n====================================",
-            json.dumps({"answer": answer, "insights": insights}, default=str),
+            json.dumps({"answer": answer, "insights": insights, "response_type": final_response_type}, default=str),
         )
 
         return {

@@ -45,6 +45,9 @@ class ReportResponse(BaseModel):
     chart_json: Optional[dict[str, Any]] = None
     parameters: Optional[dict[str, Any]] = None
     visualization_result: Optional[dict[str, Any]] = None
+    response_type: Optional[str] = None
+    kpi: Optional[dict[str, Any]] = None
+    explanation: Optional[dict[str, Any]] = None
     data_used: Optional[dict[str, Any]] = None
     agents_used: Optional[list[str]] = None
     created_at: datetime
@@ -60,6 +63,9 @@ class ReportResponse(BaseModel):
                 data.setdefault("chart_json", d_used.get("chart_json"))
                 data.setdefault("parameters", d_used.get("parameters"))
                 data.setdefault("visualization_result", d_used.get("visualization"))
+                data.setdefault("response_type", d_used.get("response_type"))
+                data.setdefault("kpi", d_used.get("kpi"))
+                data.setdefault("explanation", d_used.get("explanation"))
             return data
 
         d_used = getattr(data, "data_used", None) or {}
@@ -67,6 +73,9 @@ class ReportResponse(BaseModel):
             chart_json = getattr(data, "chart_json", None) or d_used.get("chart_json")
             parameters = getattr(data, "parameters", None) or d_used.get("parameters")
             visualization_result = getattr(data, "visualization_result", None) or d_used.get("visualization")
+            response_type = getattr(data, "response_type", None) or d_used.get("response_type")
+            kpi = getattr(data, "kpi", None) or d_used.get("kpi")
+            explanation = getattr(data, "explanation", None) or d_used.get("explanation")
             return {
                 "id": getattr(data, "id", None),
                 "query_id": getattr(data, "query_id", None),
@@ -76,6 +85,9 @@ class ReportResponse(BaseModel):
                 "chart_json": chart_json,
                 "parameters": parameters,
                 "visualization_result": visualization_result,
+                "response_type": response_type,
+                "kpi": kpi,
+                "explanation": explanation,
                 "data_used": d_used,
                 "agents_used": getattr(data, "agents_used", []),
                 "created_at": getattr(data, "created_at", None),

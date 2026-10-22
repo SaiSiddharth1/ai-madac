@@ -67,17 +67,18 @@ class SupervisorAgent:
 
     def run(self, state: AgentState) -> dict[str, Any]:
         """
-        Classify query intent and determine agent execution plan.
+        Classify query intent and determine agent execution plan using Gemini Semantic Planner.
         """
         question = state.get("question", "")
         schema = state.get("schema", {})
         profile = state.get("dataset_profile", {})
+        query_id = state.get("query_id", "")
+        dataset_id = state.get("dataset_id", "")
 
         logger.info(f"Supervisor Agent processing query: '{question}'")
 
-        # First check heuristic analytical triggers for instant accuracy
-        q_lower = question.lower()
-        structured_intent = self._parse_structured_intent(question, schema)
+        # Check explicit follow up ONLY if question refers directly to previous result
+        # without introducing fresh domain queries
         follow_up = self._follow_up_intent(question, bool(state.get("previous_validated_result")))
         if follow_up:
             prev = state.get("previous_validated_result") or {}
@@ -89,83 +90,72 @@ class SupervisorAgent:
                 plan = ["sql_agent", "report_agent"]
             return {
                 "intent": follow_up,
-                "structured_intent": {**structured_intent, "mode": follow_up},
+                "structured_intent": {"mode": follow_up},
                 "execution_plan": plan,
                 "agents_used": ["supervisor_agent"],
             }
-        analytical_keywords = [
-            "affect", "impact", "influence", "relationship", "correlation",
-            "associated", "related", "factors", "difference", "effect", "why"
-        ]
 
-        # Try LLM classification first
-        try:
-            prompt = f"""Dataset Schema Columns: {json.dumps([c.get('name') for c in schema.get('columns', [])])}
-Dataset Profile Summary: {json.dumps(profile.get('summary', {}))}
+        # Produce rigorous Query Contract using Gemini
+        from app.agents.supervisor.semantic_planner import semantic_planner
+        contract = semantic_planner.plan_query(
+            question=question,
+            schema=schema,
+            dataset_id=dataset_id,
+            query_id=query_id,
+            dataset_profile=profile,
+        )
 
-User Question: "{question}"
-"""
-            messages = [
-                SystemMessage(content=SUPERVISOR_PROMPT),
-                HumanMessage(content=prompt),
-            ]
-            response = self.llm.invoke(messages)
-            content = response.content.strip()
+        contract_dict = contract.model_dump()
+        intent = contract.intent
 
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        # Determine routing plan based on Query Contract
+        if not contract.is_related_to_dataset or intent == "UNRELATED":
+            # Unrelated question: do NOT invoke SQL or Visualization (no fake charts!)
+            plan = ["report_agent"]
+            intent = "UNRELATED"
+        elif intent == "PREDICTION":
+            plan = ["ml_agent", "report_agent"]
+        elif intent == "RELATIONSHIP_ANALYSIS":
+            if contract.should_visualize:
+                plan = ["data_analyst_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
+            else:
+                plan = ["data_analyst_agent", "report_agent"]
+        elif contract.should_visualize or contract.requested_visualization:
+            plan = ["sql_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
+        else:
+            plan = ["sql_agent", "report_agent"]
 
-            data = json.loads(content)
-            intent = data.get("intent", "DATA_RETRIEVAL")
-            plan = data.get("execution_plan", ["sql_agent", "report_agent"])
+        # Ensure report_agent is always at the end
+        if "report_agent" not in plan:
+            plan.append("report_agent")
 
-            if is_visualization_requested(question, intent):
-                intent = "VISUALIZATION"
-                plan = ["sql_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
-            elif structured_intent["operation"] in {"AGGREGATE", "FREQUENCY", "PERCENTAGE", "RANK"}:
-                intent = "AGGREGATION"
-                plan = ["sql_agent", "report_agent"]
+        structured_intent = {
+            "operation": "AGGREGATE" if intent == "AGGREGATION" else intent,
+            "target_column": contract.measure_column,
+            "measure": contract.measure,
+            "measure_expression": contract.measure_expression,
+            "aggregation": contract.aggregation,
+            "group_by_needed": bool(contract.group_by),
+            "group_by": contract.group_by,
+            "dimensions": contract.dimensions,
+            "answer_type": contract.answer_type,
+            "should_visualize": contract.should_visualize,
+            "suggested_chart_type": contract.suggested_chart_type,
+            "is_related_to_dataset": contract.is_related_to_dataset,
+            "unrelated_reason": contract.unrelated_reason,
+            "bin_width": contract.bin_width,
+            "limit": contract.limit,
+            "sort": contract.sort.model_dump() if contract.sort else None,
+        }
 
-            # Ensure analytical queries get data_analyst_agent and bypass sql_agent
-            if any(kw in q_lower for kw in analytical_keywords):
-                if intent not in ["RELATIONSHIP_ANALYSIS", "DATA_ANALYSIS", "PREDICTION"]:
-                    intent = "RELATIONSHIP_ANALYSIS"
-                
-                # For RELATIONSHIP_ANALYSIS, bypass SQL Agent and use Data Analyst Agent directly
-                if intent == "RELATIONSHIP_ANALYSIS":
-                    if is_visualization_requested(question, intent):
-                        plan = ["data_analyst_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
-                    else:
-                        plan = ["data_analyst_agent", "report_agent"]
-
-            # Ensure report_agent is always at the end
-            if "report_agent" not in plan:
-                plan.append("report_agent")
-
-            if "visualization_agent" in plan and "sql_agent" not in plan and "data_analyst_agent" not in plan:
-                prev = state.get("previous_validated_result") or {}
-                if not (prev.get("validated") and len(prev.get("result", [])) >= 2):
-                    plan.insert(0, "sql_agent")
-
-            logger.info(f"Supervisor intent classified: '{intent}', plan: {plan}")
-            return {
-                "intent": intent,
-                "execution_plan": plan,
-                "structured_intent": structured_intent,
-                "agents_used": ["supervisor_agent"],
-            }
-
-        except Exception as e:
-            logger.warning(f"LLM supervisor classification failed: {e}. Falling back to rule-based routing.")
-            fallback = self._heuristic_routing(question)
-            if is_visualization_requested(question):
-                fallback["intent"] = "VISUALIZATION"
-                fallback["execution_plan"] = ["sql_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
-            elif structured_intent["operation"] in {"AGGREGATE", "FREQUENCY", "PERCENTAGE", "RANK"}:
-                fallback["intent"] = "AGGREGATION"
-                fallback["execution_plan"] = ["sql_agent", "report_agent"]
-            fallback["structured_intent"] = structured_intent
-            return fallback
+        logger.info(f"Supervisor intent classified: '{intent}', plan: {plan}")
+        return {
+            "intent": intent,
+            "query_contract": contract_dict,
+            "execution_plan": plan,
+            "structured_intent": structured_intent,
+            "agents_used": ["supervisor_agent"],
+        }
 
     @staticmethod
     def _follow_up_intent(question: str, has_previous: bool) -> str | None:

@@ -25,18 +25,20 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 # Centralized AI-MADAC Theme Constants
-AI_MADAC_PALETTE = [
-    "#6366F1",  # Indigo (Primary Brand)
+POWER_BI_PALETTE = [
+    "#6366F1",  # Indigo
     "#8B5CF6",  # Purple
+    "#06B6D4",  # Cyan
     "#10B981",  # Emerald Green
     "#F59E0B",  # Amber
     "#EF4444",  # Coral Red
-    "#06B6D4",  # Cyan
     "#EC4899",  # Pink
     "#14B8A6",  # Teal
     "#3B82F6",  # Blue
-    "#F97316",  # Orange
+    "#84CC16",  # Lime Green
 ]
+
+AI_MADAC_PALETTE = POWER_BI_PALETTE
 
 # Consistent categorical mappings
 STABLE_CATEGORY_COLORS = {
@@ -64,156 +66,205 @@ class PlotlyRenderer:
         """
         settings.ensure_directories()
         chart = spec.get("chart") or {}
-        chart_type = chart.get("type", "bar")
+        chart_type = chart.get("type") or spec.get("suggested_chart_type") or "bar"
         mode = chart.get("mode")
         orientation = chart.get("orientation", "vertical")
         fields = spec.get("fields") or {}
-        x_col = fields.get("x")
-        y_col = fields.get("y")
-        color_col = fields.get("color")
-        title = spec.get("title") or f"Analysis for: {question}"
+        x_col = fields.get("x") or spec.get("x_axis")
+        y_col = fields.get("y") or spec.get("y_axis")
+        color_col = fields.get("color") or spec.get("color_by")
+        title = spec.get("title") or spec.get("chart_title") or f"Analysis for: {question}"
 
-        # Select columns in DataFrame
         cols = df.columns.tolist()
 
-        # 1. Grouped / Stacked Bar Chart
-        if color_col and color_col in cols and x_col and x_col in cols and "count" in cols:
+        # If x_col or y_col is missing from cols, resolve case-insensitively
+        col_map = {c.lower(): c for c in cols}
+        if x_col and x_col.lower() in col_map:
+            x_col = col_map[x_col.lower()]
+        if y_col and y_col.lower() in col_map:
+            y_col = col_map[y_col.lower()]
+        if color_col and color_col.lower() in col_map:
+            color_col = col_map[color_col.lower()]
+
+        # 1. Grouped / Stacked Bar Chart with explicit color column
+        if color_col and color_col in cols and x_col and x_col in cols and len(cols) >= 3:
+            val_col = next((c for c in cols if c not in (x_col, color_col)), "count")
             barmode = "stack" if mode == "stacked" else "group"
             fig = px.bar(
                 df,
                 x=x_col,
-                y="count",
+                y=val_col,
                 color=color_col,
                 barmode=barmode,
                 color_discrete_map=STABLE_CATEGORY_COLORS,
-                color_discrete_sequence=AI_MADAC_PALETTE,
+                color_discrete_sequence=POWER_BI_PALETTE,
                 title=title,
             )
             fig.update_layout(
                 xaxis_title=x_col.replace("_", " ").title(),
-                yaxis_title="Number of Investors",
+                yaxis_title=val_col.replace("_", " ").title(),
                 legend_title_text=color_col.replace("_", " ").title(),
             )
 
-        # 2. Histogram / Distribution
-        elif chart_type == "histogram" and x_col and x_col in cols:
-            binning = spec.get("binning") or spec.get("bins") or {}
-            bin_size = binning.get("bin_size") or binning.get("size")
+        # 2. Histogram / Distribution (Raw observations)
+        elif chart_type in ("histogram", "distribution") and (x_col in cols or len(cols) >= 1):
+            target_x = x_col if x_col in cols else cols[0]
+            bin_size = (
+                spec.get("bin_width")
+                or (spec.get("binning") or {}).get("bin_size")
+                or (spec.get("binning") or {}).get("size")
+                or (spec.get("bins") or {}).get("size")
+            )
             fig = px.histogram(
                 df,
-                x=x_col,
+                x=target_x,
                 title=title,
-                color_discrete_sequence=[AI_MADAC_PALETTE[0]],
+                color_discrete_sequence=[POWER_BI_PALETTE[0]],
             )
             if bin_size:
-                min_v = float(df[x_col].min())
-                max_v = float(df[x_col].max())
-                start_edge = float(np.floor(min_v / bin_size) * bin_size)
-                end_edge = float(np.ceil(max_v / bin_size) * bin_size)
-                fig.update_traces(xbins=dict(start=start_edge, end=end_edge + bin_size, size=bin_size))
+                try:
+                    min_v = float(df[target_x].min())
+                    max_v = float(df[target_x].max())
+                    start_edge = float(np.floor(min_v / bin_size) * bin_size)
+                    end_edge = float(np.ceil(max_v / bin_size) * bin_size)
+                    fig.update_traces(xbins=dict(start=start_edge, end=end_edge + bin_size, size=bin_size))
+                except Exception:
+                    pass
             fig.update_layout(
-                xaxis_title=x_col.replace("_", " ").title(),
-                yaxis_title="Number of Investors (Raw Observations)",
+                xaxis_title=target_x.replace("_", " ").title(),
+                yaxis_title="Count of Observations",
                 bargap=0.08,
             )
 
-        # 3. Box Plot (e.g. numerical metric across categorical or range categories)
-        elif chart_type in ("box", "box_plot") and x_col and x_col in cols:
-            box_y = y_col if y_col in cols else next((c for c in cols if c != x_col), None)
-            if box_y:
-                fig = px.box(
-                    df,
-                    x=x_col,
-                    y=box_y,
-                    title=title,
-                    color=x_col,
-                    color_discrete_sequence=AI_MADAC_PALETTE,
-                )
-                fig.update_layout(
-                    xaxis_title=x_col.replace("_", " ").title(),
-                    yaxis_title=box_y.replace("_", " ").title(),
-                    showlegend=False,
-                )
-            else:
-                fig = px.box(df, y=x_col, title=title, color_discrete_sequence=[AI_MADAC_PALETTE[0]])
-
-        # 4. Scatter Plot (with transparent midpoint support)
-        elif chart_type == "scatter" and x_col and x_col in cols:
-            actual_y = y_col if (y_col and y_col in cols) else next((c for c in cols if c != x_col), None)
-            if actual_y:
+        # 3. Scatter Plot (Raw observations of two numerical columns)
+        elif chart_type in ("scatter", "relationship"):
+            scatter_x = x_col if x_col in cols else (cols[0] if len(cols) >= 1 else None)
+            scatter_y = y_col if y_col in cols else (cols[1] if len(cols) >= 2 else None)
+            if scatter_x and scatter_y:
                 fig = px.scatter(
                     df,
-                    x=x_col,
-                    y=actual_y,
+                    x=scatter_x,
+                    y=scatter_y,
                     title=title,
-                    color_discrete_sequence=[AI_MADAC_PALETTE[5]],
+                    color_discrete_sequence=[POWER_BI_PALETTE[2]],
                 )
-                fig.update_traces(marker=dict(size=9, opacity=0.85, line=dict(width=1, color="#1e293b")))
+                fig.update_traces(
+                    marker=dict(size=8, opacity=0.8, line=dict(width=1, color="#1e293b")),
+                    hovertemplate=f"<b>{scatter_x}</b>: %{{x}}<br><b>{scatter_y}</b>: %{{y}}<extra></extra>",
+                )
                 fig.update_layout(
-                    xaxis_title=x_col.replace("_", " ").title(),
-                    yaxis_title=actual_y.replace("_", " ").title(),
+                    xaxis_title=scatter_x.replace("_", " ").title(),
+                    yaxis_title=scatter_y.replace("_", " ").title(),
                 )
             else:
                 fig = go.Figure()
 
-        # 5. Pie / Donut
-        elif chart_type == "pie" and x_col and x_col in cols:
-            val_col = cols[1] if len(cols) > 1 else "investor_count"
-            is_donut = (mode == "donut" or "donut" in str(chart.get("type", "")).lower())
+        # 4. Line Chart (e.g. Trend over time)
+        elif chart_type in ("line", "trend") and len(cols) >= 2:
+            line_x = x_col if x_col in cols else cols[0]
+            line_y = y_col if y_col in cols else cols[1]
+            fig = px.line(
+                df,
+                x=line_x,
+                y=line_y,
+                title=title,
+                markers=True,
+                color_discrete_sequence=[POWER_BI_PALETTE[0]],
+            )
+            fig.update_traces(line=dict(width=3))
+            fig.update_layout(
+                xaxis_title=line_x.replace("_", " ").title(),
+                yaxis_title=line_y.replace("_", " ").title(),
+            )
+
+        # 5. Box Plot
+        elif chart_type in ("box", "box_plot") and (x_col in cols or len(cols) >= 1):
+            target_x = x_col if x_col in cols else cols[0]
+            box_y = y_col if y_col in cols else (cols[1] if len(cols) > 1 else None)
+            if box_y:
+                fig = px.box(
+                    df,
+                    x=target_x,
+                    y=box_y,
+                    title=title,
+                    color=target_x,
+                    color_discrete_sequence=POWER_BI_PALETTE,
+                )
+                fig.update_layout(
+                    xaxis_title=target_x.replace("_", " ").title(),
+                    yaxis_title=box_y.replace("_", " ").title(),
+                    showlegend=False,
+                )
+            else:
+                fig = px.box(df, y=target_x, title=title, color_discrete_sequence=[POWER_BI_PALETTE[0]])
+
+        # 6. Pie / Donut
+        elif chart_type in ("pie", "donut") and len(cols) >= 1:
+            cat_col = x_col if x_col in cols else cols[0]
+            val_col = y_col if y_col in cols else (cols[1] if len(cols) > 1 else None)
+            is_donut = (mode == "donut" or "donut" in str(chart_type).lower())
             fig = px.pie(
                 df,
-                names=x_col,
-                values=val_col if val_col in df.columns else None,
+                names=cat_col,
+                values=val_col,
                 title=title,
                 hole=0.4 if is_donut else 0.0,
                 color_discrete_map=STABLE_CATEGORY_COLORS,
-                color_discrete_sequence=AI_MADAC_PALETTE,
+                color_discrete_sequence=POWER_BI_PALETTE,
             )
             fig.update_traces(textposition="inside", textinfo="percent+label")
 
-        # 5. Standard Bar (Vertical or Horizontal)
-        elif x_col and x_col in cols:
-            val_col = cols[1] if len(cols) > 1 else cols[0]
-            # Auto switch to horizontal if many categories
-            if len(df) > 7 or orientation == "horizontal":
+        # 7. Standard Bar Chart (with deterministic Power BI category colors)
+        elif len(cols) >= 2 or (x_col and x_col in cols):
+            cat_col = x_col if x_col in cols else cols[0]
+            val_col = y_col if y_col in cols else (cols[1] if len(cols) > 1 else cols[0])
+
+            # Auto switch to horizontal if many categories or explicit horizontal requested
+            is_horizontal = (len(df) > 8 or orientation == "horizontal" or chart_type == "horizontal_bar")
+            if is_horizontal:
                 fig = px.bar(
                     df,
                     x=val_col,
-                    y=x_col,
+                    y=cat_col,
                     orientation="h",
                     title=title,
-                    color_discrete_sequence=[AI_MADAC_PALETTE[0]],
+                    color=cat_col,
+                    color_discrete_sequence=POWER_BI_PALETTE,
                 )
                 fig.update_layout(
                     xaxis_title=val_col.replace("_", " ").title(),
-                    yaxis_title=x_col.replace("_", " ").title(),
+                    yaxis_title=cat_col.replace("_", " ").title(),
+                    showlegend=False,
                 )
             else:
                 fig = px.bar(
                     df,
-                    x=x_col,
+                    x=cat_col,
                     y=val_col,
                     title=title,
-                    color_discrete_sequence=[AI_MADAC_PALETTE[0]],
+                    color=cat_col,
+                    color_discrete_sequence=POWER_BI_PALETTE,
                 )
                 fig.update_layout(
-                    xaxis_title=x_col.replace("_", " ").title(),
+                    xaxis_title=cat_col.replace("_", " ").title(),
                     yaxis_title=val_col.replace("_", " ").title(),
+                    showlegend=False,
                 )
 
-        # 6. Fallback
+        # Fallback
         else:
             fig = go.Figure()
             fig.update_layout(title=title)
 
-        # Centralized AI-MADAC Theme Polish
+        # Centralized AI-MADAC Theme Polish (Power BI Dark Style)
         fig.update_layout(
             template="plotly_dark",
             paper_bgcolor="#101426",
             plot_bgcolor="#101426",
+            hovermode="closest",
             font=dict(color="#f1f5f9", family="Inter, system-ui, sans-serif", size=12),
             title_font=dict(size=15, color="#f8fafc", family="Inter, system-ui, sans-serif"),
-            margin=dict(l=40, r=40, t=55, b=45),
+            margin=dict(l=45, r=40, t=55, b=45),
             xaxis=dict(
                 gridcolor="#1e293b",
                 zerolinecolor="#334155",
