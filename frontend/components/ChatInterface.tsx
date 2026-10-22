@@ -13,10 +13,14 @@ interface ChatInterfaceProps {
 }
 
 const SAMPLE_QUESTIONS = [
-  "How many total investors are in this dataset?",
-  "Which investment avenue is most preferred?",
-  "What is the average age of investors by objective?",
-  "Show the count of investors by duration and monitor frequency",
+  "How many rows are in this dataset?",
+  "How many columns are in this dataset?",
+  "What are the column names?",
+  "Show a summary of this dataset.",
+  "Which columns contain missing values?",
+  "Show the first 10 records.",
+  "Show basic statistics for the numerical columns.",
+  "What are the unique values in the categorical columns?",
 ];
 
 export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceProps) {
@@ -247,12 +251,16 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
             <h3 style={{ fontSize: "1.1rem", fontWeight: 700, marginBottom: "8px" }}>
               Ask anything about &quot;{datasetName}&quot;
             </h3>
-            <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginBottom: "24px", maxWidth: "500px", margin: "0 auto 24px" }}>
-              The Autonomous Supervisor will analyze your question and route it to specialized SQL, Data Analyst, ML, or Visualization agents.
+            <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginBottom: "20px", maxWidth: "500px", margin: "0 auto 20px" }}>
+              The Autonomous Supervisor will analyze your question and route it to the appropriate agent.
             </p>
 
+            <div style={{ fontSize: "0.85rem", fontWeight: 600, color: "var(--text-secondary)", marginBottom: "12px" }}>
+              Suggested questions:
+            </div>
+
             {/* Quick Sample Questions */}
-            <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: "8px" }}>
+            <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: "8px", maxWidth: "680px", margin: "0 auto" }}>
               {SAMPLE_QUESTIONS.map((sq, i) => (
                 <button
                   key={i}

@@ -32,7 +32,8 @@ CRITICAL RULES:
 7. Apply filters before aggregation. Exclude NULL grouping values and NULL numeric measures from grouped calculations unless the user asks otherwise.
 8. Use descriptive aliases such as total_commitment, average_commitment, maximum_commitment, minimum_commitment, and project_count.
 9. If the question asks about impact, relationship, effect, or comparison (e.g. "Did events affect stock impact?"), write an AGGREGATED query using GROUP BY or conditional averages/counts (e.g. grouping by whether event is NULL or event categories) to compute exact comparison metrics.
-10. Output ONLY the raw SQL query. Do NOT include markdown code blocks (```sql ... ```) or explanation.
+10. If the question asks for revenue and the table does not contain a 'revenue' column, but contains quantity and price columns (e.g. 'Quantity' and 'UnitPrice'), calculate revenue as SUM("Quantity" * "UnitPrice") grouped by the dimension.
+11. Output ONLY the raw SQL query. Do NOT include markdown code blocks (```sql ... ```) or explanation.
 
 Schema details for table "{table_name}":
 {schema_description}
@@ -89,6 +90,64 @@ class SQLAgent:
             }
 
         logger.info(f"SQL Agent generating query for table '{safe_table}', question: '{question}'")
+
+        q_clean = question.lower().strip()
+        schema_cols = schema.get("columns", [])
+        if re.search(r"\b(?:how many|number of|count of)\s+columns\b", q_clean):
+            col_count = len(schema_cols)
+            return {
+                "sql_query": f"-- Schema inspection\nSELECT {col_count} AS total_columns",
+                "sql_result": {
+                    "query": f"SELECT {col_count} AS total_columns",
+                    "source_question": question,
+                    "analysis_plan": {"operation": "METADATA", "target": "columns"},
+                    "columns": ["total_columns"],
+                    "rows": [{"total_columns": col_count}],
+                    "row_count": 1,
+                    "displayed_row_count": 1,
+                },
+                "validated_result": {
+                    "question_id": state.get("query_id"),
+                    "dataset_id": state.get("dataset_id"),
+                    "operation": "AGGREGATE",
+                    "columns_used": ["total_columns"],
+                    "filters": {},
+                    "group_by": [],
+                    "result": [{"total_columns": col_count}],
+                    "row_count": 1,
+                    "validated": True,
+                    "query": f"SELECT {col_count} AS total_columns",
+                },
+                "agents_used": state.get("agents_used", []) + ["sql_agent"],
+            }
+
+        if re.search(r"\b(?:what are the column names|column names|list (?:the )?columns|what columns)\b", q_clean):
+            rows = [{"column_name": c.get("name"), "data_type": str(c.get("dtype"))} for c in schema_cols]
+            return {
+                "sql_query": "-- Schema inspection\nSELECT column_name, data_type FROM schema",
+                "sql_result": {
+                    "query": "SELECT column_name, data_type FROM schema",
+                    "source_question": question,
+                    "analysis_plan": {"operation": "METADATA", "target": "column_names"},
+                    "columns": ["column_name", "data_type"],
+                    "rows": rows,
+                    "row_count": len(rows),
+                    "displayed_row_count": len(rows),
+                },
+                "validated_result": {
+                    "question_id": state.get("query_id"),
+                    "dataset_id": state.get("dataset_id"),
+                    "operation": "RETRIEVE",
+                    "columns_used": ["column_name", "data_type"],
+                    "filters": {},
+                    "group_by": [],
+                    "result": rows,
+                    "row_count": len(rows),
+                    "validated": True,
+                    "query": "SELECT column_name, data_type FROM schema",
+                },
+                "agents_used": state.get("agents_used", []) + ["sql_agent"],
+            }
 
         # Format column details
         columns_info = []
@@ -406,6 +465,30 @@ class SQLAgent:
                 f"{group_where} GROUP BY {quoted(target)} ORDER BY investor_count DESC{limit}"
             )
         if operation == "RANK":
+            # Check if revenue calculation is needed from quantity * price
+            revenue_requested = any(word in q for word in ("revenue", "turnover", "total sales"))
+            qty_col = next((n for n in names if any(t in n.lower() for t in ("quantity", "qty", "units"))), None)
+            price_col = next((n for n in names if any(t in n.lower() for t in ("unitprice", "unit_price", "price"))), None)
+            has_direct_revenue = any("revenue" in n.lower() for n in names)
+
+            if revenue_requested and not has_direct_revenue and qty_col and price_col:
+                order = "ASC" if any(word in q for word in ("lowest", "smallest", "bottom")) else "DESC"
+                top_match = re.search(r"\b(?:top|bottom)\s+(\d+)", q)
+                limit = f" LIMIT {top_match.group(1)}" if top_match else " LIMIT 10"
+                category = target or next((n for n in names if any(t in n.lower() for t in ("country", "region", "customer", "product", "item", "category", "sector"))), None)
+                if category:
+                    return (
+                        f"SELECT {quoted(category)}, ROUND(SUM({quoted(qty_col)} * {quoted(price_col)}), 2) AS total_revenue "
+                        f"FROM {quoted(table_name)} WHERE {quoted(category)} IS NOT NULL "
+                        f"AND {quoted(qty_col)} IS NOT NULL AND {quoted(price_col)} IS NOT NULL "
+                        f"GROUP BY {quoted(category)} ORDER BY total_revenue {order}{limit}"
+                    )
+                else:
+                    return (
+                        f"SELECT ROUND(SUM({quoted(qty_col)} * {quoted(price_col)}), 2) AS total_revenue "
+                        f"FROM {quoted(table_name)} WHERE {quoted(qty_col)} IS NOT NULL AND {quoted(price_col)} IS NOT NULL"
+                    )
+
             measure = next((name for name in names if str(name).lower().replace("_", " ") in q), None)
             # Use the final matching numeric-ish column for phrases such as
             # "transactions by sales amount".
@@ -421,6 +504,12 @@ class SQLAgent:
                         return (f"SELECT {quoted(project_column)}, {quoted(measure)} FROM {quoted(table_name)} "
                                 f"WHERE {quoted(project_column)} IS NOT NULL AND {quoted(measure)} IS NOT NULL "
                                 f"ORDER BY {quoted(measure)} {order}{limit}")
+                if target and target != measure:
+                    return (
+                        f"SELECT {quoted(target)}, ROUND(SUM({quoted(measure)}), 2) AS {quoted('total_' + measure)} "
+                        f"FROM {quoted(table_name)} WHERE {quoted(target)} IS NOT NULL AND {quoted(measure)} IS NOT NULL "
+                        f"GROUP BY {quoted(target)} ORDER BY {quoted('total_' + measure)} {order}{limit}"
+                    )
                 return f"SELECT * FROM {quoted(table_name)} WHERE {quoted(measure)} IS NOT NULL ORDER BY {quoted(measure)} {order}{limit}"
         if operation == "AGGREGATE" and structured_intent.get("aggregation") in {"SUM", "AVG"} and target:
             measure = next((name for name in names if any(token in name.lower() for token in ("amount", "sales", "value", "commitment", "revenue", "price"))), None)
@@ -472,6 +561,29 @@ class SQLAgent:
             "total", "sum", "average", "mean", "highest", "lowest", "largest", "smallest",
             "commitment", "revenue", "funding", "amount", "value",
         ))
+
+        # Check if revenue calculation is needed from quantity * price
+        revenue_requested = any(word in q for word in ("revenue", "turnover", "total sales"))
+        qty_col = next((n for n in names if any(t in n.lower() for t in ("quantity", "qty", "units"))), None)
+        price_col = next((n for n in names if any(t in n.lower() for t in ("unitprice", "unit_price", "price"))), None)
+        has_direct_revenue = any("revenue" in n.lower() for n in names)
+
+        if revenue_requested and not has_direct_revenue and qty_col and price_col:
+            order = "ASC" if any(word in q for word in ("lowest", "smallest", "bottom")) else "DESC"
+            top_match = re.search(r"\b(?:top|bottom)\s+(\d+)", q)
+            limit = f" LIMIT {top_match.group(1)}" if top_match else " LIMIT 10"
+            if category:
+                return (
+                    f"SELECT {quoted(category)}, ROUND(SUM({quoted(qty_col)} * {quoted(price_col)}), 2) AS total_revenue "
+                    f"FROM {quoted(table_name)} WHERE {quoted(category)} IS NOT NULL "
+                    f"AND {quoted(qty_col)} IS NOT NULL AND {quoted(price_col)} IS NOT NULL "
+                    f"GROUP BY {quoted(category)} ORDER BY total_revenue {order}{limit}"
+                )
+            else:
+                return (
+                    f"SELECT ROUND(SUM({quoted(qty_col)} * {quoted(price_col)}), 2) AS total_revenue "
+                    f"FROM {quoted(table_name)} WHERE {quoted(qty_col)} IS NOT NULL AND {quoted(price_col)} IS NOT NULL"
+                )
 
         # A top-project ranking orders project records by their numeric measure.
         if category and "project" in category.lower() and requested_categories and measure and any(word in q for word in ("top", "bottom")):

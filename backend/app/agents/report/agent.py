@@ -186,12 +186,19 @@ class ReportAgent:
                     HumanMessage(content=f"User Question: '{question}'\n\nAgent Analysis & Data Findings:\n{context_str}"),
                 ])
 
-                content = response.content.strip()
+                raw_content = response.content
+                if isinstance(raw_content, list):
+                    content = "".join(str(p.get("text", p) if isinstance(p, dict) else p) for p in raw_content).strip()
+                else:
+                    content = str(raw_content).strip()
+
                 if content.startswith("```"):
                     content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
                 parsed = json.loads(content)
                 answer = parsed.get("answer", "Data analysis completed.")
+                if isinstance(answer, list):
+                    answer = ", ".join(str(x) for x in answer)
                 insights = parsed.get("insights", [])
 
             except Exception as e:
@@ -255,8 +262,13 @@ class ReportAgent:
         """
         Rewrite raw agent response using the Final Response Rewriter into a natural conversational reply.
         """
-        if not answer or not answer.strip():
-            return answer
+        if not answer:
+            return ""
+        if isinstance(answer, list):
+            answer = ", ".join(str(x) for x in answer)
+        answer = str(answer).strip()
+        if not answer:
+            return ""
         try:
             prompt = f"User Question: '{question}'\n\nAgent Response:\n{answer}"
             messages = [
@@ -264,7 +276,11 @@ class ReportAgent:
                 HumanMessage(content=prompt),
             ]
             response = self.llm.invoke(messages)
-            rewritten = response.content.strip()
+            raw_content = response.content
+            if isinstance(raw_content, list):
+                rewritten = "".join(str(p.get("text", p) if isinstance(p, dict) else p) for p in raw_content).strip()
+            else:
+                rewritten = str(raw_content).strip()
             if rewritten and len(rewritten) > 2:
                 if (rewritten.startswith('"') and rewritten.endswith('"')) or (rewritten.startswith("'") and rewritten.endswith("'")):
                     rewritten = rewritten[1:-1].strip()
@@ -312,8 +328,13 @@ class ReportAgent:
             columns = sql_result.get("columns", [])
             intent = structured_intent or {}
 
-            # SQL fallback rules return compact, meaningful result sets. Turn
-            # those into an answer rather than reporting only that data exists.
+            # Handle schema metadata queries (columns list and column count)
+            if columns == ["column_name", "data_type"]:
+                col_names = [r.get("column_name") for r in rows if r.get("column_name")]
+                ans = f"The dataset contains {len(col_names)} columns: {', '.join(col_names)}."
+                insights = [f"{r.get('column_name')} ({r.get('data_type')})" for r in rows[:10]]
+                return ans, insights
+
             if len(rows) == 1 and len(columns) == 1:
                 metric = columns[0].replace("_", " ")
                 value = rows[0].get(columns[0])
@@ -349,10 +370,11 @@ class ReportAgent:
                     insights = [f"{r.get(group_column)} has {r.get(metric_column)} records." for r in rows]
                     return ans, insights
 
+                record_noun = "investors" if any(w in question.lower() for w in ("investor", "invest", "investment")) else "records"
                 if "popular" in question.lower() or intent.get("operation") == "FREQUENCY":
                     ans = (
                         f"The most popular {group_label} is {highest.get(group_column)} "
-                        f"with {highest.get(metric_column)} investors."
+                        f"with {highest.get(metric_column)} {record_noun}."
                     )
                 else:
                     ans = (

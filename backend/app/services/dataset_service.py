@@ -37,11 +37,11 @@ def _generate_table_name() -> str:
 
 
 def _sanitize_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Sanitize column names: lowercase, replace spaces/special chars with underscores."""
+    """Sanitize column names: replace spaces/special chars with underscores while preserving casing."""
     new_columns = {}
     for col in df.columns:
         clean = re.sub(r"[^a-zA-Z0-9_]", "_", str(col).strip())
-        clean = re.sub(r"_+", "_", clean).strip("_").lower()
+        clean = re.sub(r"_+", "_", clean).strip("_")
         if not clean:
             clean = f"col_{df.columns.get_loc(col)}"
         new_columns[col] = clean
@@ -64,15 +64,13 @@ def _extract_schema_info(df: pd.DataFrame) -> dict[str, Any]:
     return schema
 
 
+from app.services.dataset_loader import load_dataset
+
+
 def _read_csv_with_recovery(content: bytes) -> tuple[pd.DataFrame, str]:
-    """Read common CSV encodings instead of assuming UTF-8 only."""
-    last_error: Exception | None = None
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "iso-8859-1"):
-        try:
-            return pd.read_csv(BytesIO(content), encoding=encoding, on_bad_lines="skip"), encoding
-        except (UnicodeDecodeError, pd.errors.ParserError) as exc:
-            last_error = exc
-    raise ValueError("The CSV could not be decoded with a supported text encoding.") from last_error
+    """Compatibility wrapper around central dataset loader."""
+    df, meta = load_dataset(content=content, filename="dataset.csv")
+    return df, meta.get("detected_encoding") or "utf-8"
 
 
 def _clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -83,9 +81,17 @@ def _clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
 
     for column in df.select_dtypes(include=["object", "string"]).columns:
         cleaned = df[column].astype("string").str.strip()
-        df[column] = cleaned.replace({"": pd.NA, "N/A": pd.NA, "NA": pd.NA, "null": pd.NA, "None": pd.NA})
+        df[column] = cleaned.replace({
+            "": pd.NA,
+            "N/A": pd.NA,
+            "NA": pd.NA,
+            "null": pd.NA,
+            "None": pd.NA,
+            "NULL": pd.NA,
+            "nan": pd.NA,
+        })
 
-    # Source exports often include blank separator rows and a publisher footer.
+    # Remove completely blank rows
     df = df.dropna(how="all")
     if len(df.columns) > 1:
         first_column = df.columns[0]
@@ -95,22 +101,6 @@ def _clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
         )
         df = df.loc[~footer_mask]
 
-    converted_columns: list[str] = []
-    for column in df.select_dtypes(include=["object", "string"]).columns:
-        values = df[column].dropna().astype(str)
-        if values.empty:
-            continue
-        normalized = values.str.replace(r"[,$]", "", regex=True).str.replace(" ", "", regex=False)
-        numeric = pd.to_numeric(normalized, errors="coerce")
-        if numeric.notna().mean() >= 0.95 and ("amount" in column.lower() or "commitment" in column.lower() or "value" in column.lower()):
-            df[column] = pd.to_numeric(df[column].astype("string").str.replace(r"[,$]", "", regex=True), errors="coerce")
-            converted_columns.append(column)
-        elif "date" in column.lower():
-            parsed_dates = pd.to_datetime(values, errors="coerce", dayfirst=False)
-            if parsed_dates.notna().mean() >= 0.8:
-                df[column] = pd.to_datetime(df[column], errors="coerce").dt.strftime("%Y-%m-%d")
-                converted_columns.append(column)
-
     before_duplicates = len(df)
     df = df.drop_duplicates().reset_index(drop=True)
     return df, {
@@ -118,7 +108,7 @@ def _clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
         "clean_rows": len(df),
         "removed_blank_or_footer_rows": original_rows - before_duplicates,
         "removed_duplicate_rows": before_duplicates - len(df),
-        "converted_columns": converted_columns,
+        "converted_columns": [],
     }
 
 
@@ -133,9 +123,9 @@ async def process_upload(
 
     Steps:
     1. Validate file extension and size
-    2. Read into Pandas DataFrame
+    2. Read into Pandas DataFrame using central dataset loader
     3. Sanitize column names
-    4. Create a PostgreSQL table and insert data
+    4. Create a database table and insert data
     5. Create Dataset metadata record
 
     Returns the created Dataset ORM object.
@@ -165,25 +155,20 @@ async def process_upload(
             detail=f"File exceeds maximum size of {settings.MAX_UPLOAD_SIZE_MB}MB.",
         )
 
-    # --- Parse and clean into a DataFrame ---
+    # --- Parse and clean into a DataFrame using central dataset_loader ---
     try:
-        if extension == ".csv":
-            df, detected_encoding = _read_csv_with_recovery(content)
-        else:  # .xlsx
-            df = pd.read_excel(BytesIO(content))
-            detected_encoding = None
+        df, loader_metadata = load_dataset(content=content, filename=file_name)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to parse uploaded file: {e}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unable to process this file. Ensure it contains valid tabular data.",
+            detail=f"Unable to process this file: {e}",
         )
 
-    if df.empty or len(df.columns) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The file contains no readable tabular data.",
-        )
+    detected_encoding = loader_metadata.get("detected_encoding")
+    detected_delimiter = loader_metadata.get("detected_delimiter")
 
     df, cleaning_summary = _clean_dataframe(df)
     if df.empty:
@@ -206,10 +191,11 @@ async def process_upload(
     schema_info["cleaning"] = {
         **cleaning_summary,
         "source_encoding": detected_encoding,
+        "detected_delimiter": detected_delimiter,
         "cleaned_file_name": cleaned_file_name,
     }
 
-    # --- Store data in PostgreSQL ---
+    # --- Store data in database ---
     try:
         df.to_sql(
             name=table_name,
@@ -217,7 +203,7 @@ async def process_upload(
             if_exists="replace",
             index=False,
             method="multi",
-            chunksize=500,
+            chunksize=2000,
         )
         logger.info(f"Dataset stored in table '{table_name}' ({len(df)} rows, {len(df.columns)} cols)")
     except Exception as e:
