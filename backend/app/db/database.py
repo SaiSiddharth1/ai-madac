@@ -4,7 +4,7 @@ Supports both SQLite and PostgreSQL backends seamlessly.
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase
 
 from app.config import settings
@@ -15,7 +15,8 @@ async_kwargs = {}
 sync_kwargs = {}
 
 if is_sqlite:
-    sync_kwargs["connect_args"] = {"check_same_thread": False}
+    sync_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 60}
+    async_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 60}
 else:
     async_kwargs.update({"pool_size": 10, "max_overflow": 20, "pool_pre_ping": True})
     sync_kwargs.update({"pool_size": 5, "max_overflow": 10, "pool_pre_ping": True})
@@ -40,6 +41,29 @@ sync_engine = create_engine(
     echo=False,
     **sync_kwargs,
 )
+
+if is_sqlite:
+    @event.listens_for(sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=60000")
+            cursor.close()
+        except Exception:
+            pass
+
+    @event.listens_for(async_engine.sync_engine, "connect")
+    def set_async_sqlite_pragma(dbapi_connection, connection_record):
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=60000")
+            cursor.close()
+        except Exception:
+            pass
 
 
 class Base(DeclarativeBase):

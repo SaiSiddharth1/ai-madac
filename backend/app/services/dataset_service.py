@@ -2,8 +2,10 @@
 Dataset service — handles file upload, validation, and storage in PostgreSQL.
 """
 
+import json
 import logging
 import re
+import time
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -31,21 +33,31 @@ ALLOWED_MIME_TYPES = {
 
 
 def _generate_table_name() -> str:
-    """Generate a safe, unique PostgreSQL table name for the dataset."""
+    """Generate a safe, unique PostgreSQL/SQLite table name for the dataset."""
     short_id = uuid.uuid4().hex[:10]
     return f"dataset_{short_id}"
 
 
 def _sanitize_column_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Sanitize column names: replace spaces/special chars with underscores while preserving casing."""
-    new_columns = {}
-    for col in df.columns:
+    """Sanitize column names: replace spaces/special chars with underscores, ensure uniqueness, and preserve casing."""
+    sanitized = []
+    seen = {}
+    for i, col in enumerate(df.columns):
         clean = re.sub(r"[^a-zA-Z0-9_]", "_", str(col).strip())
         clean = re.sub(r"_+", "_", clean).strip("_")
         if not clean:
-            clean = f"col_{df.columns.get_loc(col)}"
-        new_columns[col] = clean
-    df = df.rename(columns=new_columns)
+            clean = f"col_{i + 1}"
+
+        lower_clean = clean.lower()
+        if lower_clean in seen:
+            seen[lower_clean] += 1
+            clean = f"{clean}_{seen[lower_clean]}"
+        else:
+            seen[lower_clean] = 0
+
+        sanitized.append(clean)
+
+    df.columns = sanitized
     return df
 
 
@@ -196,21 +208,72 @@ async def process_upload(
     }
 
     # --- Store data in database ---
-    try:
-        df.to_sql(
-            name=table_name,
-            con=sync_engine,
-            if_exists="replace",
-            index=False,
-            method="multi",
-            chunksize=2000,
-        )
-        logger.info(f"Dataset stored in table '{table_name}' ({len(df)} rows, {len(df.columns)} cols)")
-    except Exception as e:
-        logger.error(f"Failed to store dataset in PostgreSQL: {e}")
+    # Ensure nested objects (e.g. lists, dicts) are stringified to prevent SQL serialization errors
+    for col in df.columns:
+        if df[col].dtype == "object":
+            sample = df[col].dropna().head(20)
+            if any(isinstance(v, (list, dict, set, tuple)) for v in sample):
+                df[col] = df[col].apply(
+                    lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (list, dict, set, tuple)) else (str(x) if pd.notna(x) else None)
+                )
+
+    is_sqlite = sync_engine.dialect.name == "sqlite"
+    num_cols = max(len(df.columns), 1)
+
+    # In SQLite, parameter limit is 999 (old) or 32766 (new).
+    # method="multi" creates (chunksize * num_cols) parameters per statement.
+    # To avoid "sqlite3.OperationalError: too many SQL variables":
+    # For SQLite, use method=None (native executemany, robust for any number of columns and rows).
+    # For PostgreSQL, use method="multi" with chunksize=2000.
+    if is_sqlite:
+        insert_method = None
+        chunk_size = 1000
+    else:
+        insert_method = "multi"
+        chunk_size = 2000
+
+    max_retries = 3
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            df.to_sql(
+                name=table_name,
+                con=sync_engine,
+                if_exists="replace",
+                index=False,
+                method=insert_method,
+                chunksize=chunk_size,
+            )
+            logger.info(f"Dataset stored in table '{table_name}' ({len(df)} rows, {len(df.columns)} cols)")
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Attempt {attempt + 1}/{max_retries} to store dataset in database failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1.0 * (attempt + 1))
+            else:
+                # Fallback: try smaller chunk size without method
+                try:
+                    df.to_sql(
+                        name=table_name,
+                        con=sync_engine,
+                        if_exists="replace",
+                        index=False,
+                        method=None,
+                        chunksize=250,
+                    )
+                    logger.info(f"Fallback insert succeeded for table '{table_name}'")
+                    last_err = None
+                    break
+                except Exception as final_e:
+                    last_err = final_e
+
+    if last_err is not None:
+        logger.error(f"Failed to store dataset in database: {last_err}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to store dataset in database.",
+            detail=f"Failed to store dataset in database: {str(last_err)}",
         )
 
     # --- Create Dataset metadata ---
