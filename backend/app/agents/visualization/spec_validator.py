@@ -108,10 +108,18 @@ class SpecValidator:
             val = fields.get(k)
             if val and isinstance(val, str):
                 spec_cols.add(val)
+            elif val and isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str):
+                        spec_cols.add(item)
 
         measure_col = (spec.get("measure") or {}).get("column")
         if measure_col and isinstance(measure_col, str):
             spec_cols.add(measure_col)
+        elif measure_col and isinstance(measure_col, list):
+            for item in measure_col:
+                if isinstance(item, str):
+                    spec_cols.add(item)
 
         # 1. Verify all spec columns exist in dataset schema (no hallucinated columns)
         MEASURE_ALIASES = {"count", "investor_count", "frequency", "percentage", "share", "records", "total_investors", "value"}
@@ -133,9 +141,12 @@ class SpecValidator:
             if col.lower() in MEASURE_ALIASES:
                 continue
             is_requested = col in contract.requested_fields
-            is_filter_col = any(f.get("column") == col for f in contract.filters)
-            is_measure_col = contract.measure.get("column") == col
-            if not (is_requested or is_filter_col or is_measure_col):
+            is_filter_col = any(((f.get("column") or f.get("field")) if isinstance(f, dict) else getattr(f, "column", None)) == col for f in contract.filters)
+            meas_col_val = contract.measure.get("column") if isinstance(contract.measure, dict) else (getattr(contract, "measure_column", None) or getattr(contract, "measure", None))
+            is_measure_col = (meas_col_val == col)
+            is_series_col = (col == getattr(contract, "series_dimension", None)) or (col == getattr(contract, "color_by", None))
+            is_sec_meas_col = (col == getattr(contract, "secondary_measure_column", None)) or (col == getattr(contract, "secondary_measure", None))
+            if not (is_requested or is_filter_col or is_measure_col or is_series_col or is_sec_meas_col):
                 return False, f"Column '{col}' was not requested in user query and cannot replace requested fields."
 
         # 4. Critical Cross-Tabulation Validation:
@@ -185,11 +196,11 @@ class SpecValidator:
         intent = str(contract.intent or "").lower()
         avail = [str(c) for c in available_columns if c]
 
-        # Case 0: Time Series / Line Chart
-        # e.g. "Show me the total revenue over time", "How has quantity sold changed over time in line chart"
+        # Case 0: Time Series / Line Chart (Single or Multi-Series)
         is_time_series = (
             explicit_chart in ("line", "trend")
             or intent in ("trend", "time_series")
+            or bool(contract.time_granularity)
             or any("date" in str(f).lower() or "time" in str(f).lower() or "year" in str(f).lower() for f in requested + dims)
         )
         if is_time_series:
@@ -204,22 +215,29 @@ class SpecValidator:
             if not meas_col:
                 meas_col = next((
                     c for c in requested + avail
-                    if c != time_col and any(k in c.lower() for k in ("revenue", "total", "quantity", "price", "amount", "sales", "value", "unitprice"))
+                    if c != time_col and any(k in c.lower() for k in ("revenue", "total", "quantity", "price", "amount", "sales", "profit", "value", "unitprice"))
                 ), (requested[0] if requested and requested[0] != time_col else (avail[1] if len(avail) > 1 else "Value")))
 
             meas_type = contract.measure.get("type", "sum") if isinstance(contract.measure, dict) else "sum"
             meas_label = str(meas_col).replace("_", " ").title()
 
+            # Multi-series line chart check
+            series_dim = getattr(contract, "series_dimension", None)
+            if not series_dim and len(dims) > 1:
+                series_dim = next((d for d in dims if d != time_col), None)
+
+            chart_title = f"{meas_label} by {str(series_dim).replace('_', ' ').title()} Over Time" if series_dim else f"{meas_label} Over Time"
+
             return {
                 "visualization_available": True,
                 "query_interpretation": {
                     "intent": "time_series",
-                    "requested_fields": [time_col, meas_col],
+                    "requested_fields": [time_col, meas_col] + ([series_dim] if series_dim else []),
                 },
                 "fields": {
                     "x": time_col,
                     "y": meas_col,
-                    "color": None,
+                    "color": series_dim,
                     "facet": None,
                 },
                 "measure": {
@@ -230,19 +248,20 @@ class SpecValidator:
                 "sorting": {"field": time_col, "direction": "asc"},
                 "limit": contract.limit,
                 "binning": None,
+                "time_granularity": getattr(contract, "time_granularity", None) or "month",
                 "chart": {
                     "type": "line",
                     "orientation": "vertical",
                     "mode": "lines+markers",
                 },
-                "title": f"{meas_label} Over Time",
+                "title": chart_title,
                 "axis_labels": {
                     "x": str(time_col).replace("_", " ").title(),
                     "y": meas_label,
                 },
                 "legend": {
-                    "show": False,
-                    "title": None,
+                    "show": bool(series_dim),
+                    "title": str(series_dim).replace("_", " ").title() if series_dim else None,
                 },
             }
 
@@ -250,21 +269,29 @@ class SpecValidator:
         if intent == "relationship" or explicit_chart == "scatter":
             num_cols = [
                 c for c in requested + avail
-                if any(k in c.lower() for k in ("quantity", "price", "unitprice", "age", "income", "amount", "sales", "cost", "value", "return", "midpoint"))
+                if any(k in c.lower() for k in ("quantity", "price", "unitprice", "age", "income", "amount", "sales", "profit", "cost", "value", "return", "midpoint"))
             ]
             x_col = num_cols[0] if len(num_cols) > 0 else (requested[0] if requested else (avail[0] if avail else "X"))
             y_col = num_cols[1] if len(num_cols) > 1 else (requested[1] if len(requested) > 1 else (avail[1] if len(avail) > 1 else x_col))
+
+            color_col = getattr(contract, "color_by", None)
+            if not color_col and len(dims) > 0 and dims[0] not in (x_col, y_col):
+                color_col = dims[0]
+
+            title_text = f"{str(y_col).replace('_', ' ').title()} vs {str(x_col).replace('_', ' ').title()}"
+            if color_col:
+                title_text += f" by {str(color_col).replace('_', ' ').title()}"
 
             return {
                 "visualization_available": True,
                 "query_interpretation": {
                     "intent": "relationship",
-                    "requested_fields": [x_col, y_col],
+                    "requested_fields": [x_col, y_col] + ([color_col] if color_col else []),
                 },
                 "fields": {
                     "x": x_col,
                     "y": y_col,
-                    "color": None,
+                    "color": color_col,
                     "facet": None,
                 },
                 "measure": {
@@ -280,14 +307,14 @@ class SpecValidator:
                     "orientation": "vertical",
                     "mode": "markers",
                 },
-                "title": f"{str(y_col).replace('_', ' ').title()} vs {str(x_col).replace('_', ' ').title()}",
+                "title": title_text,
                 "axis_labels": {
                     "x": str(x_col).replace("_", " ").title(),
                     "y": str(y_col).replace("_", " ").title(),
                 },
                 "legend": {
-                    "show": False,
-                    "title": None,
+                    "show": bool(color_col),
+                    "title": str(color_col).replace("_", " ").title() if color_col else None,
                 },
             }
 
@@ -377,11 +404,19 @@ class SpecValidator:
         if explicit_chart in ("pie", "donut") or intent == "proportion":
             x_col = dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Category"))
             meas_col = contract.measure.get("column") if isinstance(contract.measure, dict) else None
+            if not meas_col:
+                meas_candidates = [f for f in requested if f != x_col]
+                if meas_candidates:
+                    meas_col = meas_candidates[0]
+            meas_type = contract.measure.get("type", "sum") if isinstance(contract.measure, dict) else "sum"
+            meas_title = f"{str(meas_col).replace('_', ' ').title()} " if (meas_col and meas_type != 'count') else ""
+            title_text = f"Distribution: {x_col}" if not meas_title else f"{meas_title}Contribution by {str(x_col).replace('_', ' ').title()}"
+
             return {
                 "visualization_available": True,
                 "query_interpretation": {
                     "intent": "proportion",
-                    "requested_fields": [x_col],
+                    "requested_fields": [x_col] + ([meas_col] if meas_col else []),
                 },
                 "fields": {
                     "x": x_col,
@@ -390,7 +425,7 @@ class SpecValidator:
                     "facet": None,
                 },
                 "measure": {
-                    "type": "count",
+                    "type": meas_type,
                     "column": meas_col,
                 },
                 "filters": contract.filters,
@@ -402,7 +437,7 @@ class SpecValidator:
                     "orientation": "vertical",
                     "mode": "donut" if explicit_chart == "donut" else "pie",
                 },
-                "title": f"Distribution by {str(x_col).replace('_', ' ').title()}",
+                "title": title_text,
                 "axis_labels": {
                     "x": str(x_col).replace("_", " ").title(),
                     "y": "Share",
@@ -413,7 +448,52 @@ class SpecValidator:
                 },
             }
 
-        # Case 5: Cross-tabulation / 2 categorical dimensions
+        # Case 5: Multi-measure comparison (e.g. Sales and Profit by Category)
+        sec_meas = getattr(contract, "secondary_measure_column", None) or getattr(contract, "secondary_measure", None)
+        if sec_meas:
+            x_col = dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Category"))
+            meas_col = contract.measure.get("column") if isinstance(contract.measure, dict) else None
+            if not meas_col:
+                meas_col = next((f for f in requested + avail if f not in (x_col, sec_meas)), "Sales")
+            meas_label = str(meas_col).replace("_", " ").title()
+            sec_label = str(sec_meas).replace("_", " ").title()
+            return {
+                "visualization_available": True,
+                "query_interpretation": {
+                    "intent": "multi_measure_comparison",
+                    "requested_fields": [x_col, meas_col, sec_meas],
+                },
+                "fields": {
+                    "x": x_col,
+                    "y": [meas_col, sec_meas],
+                    "color": None,
+                    "facet": None,
+                },
+                "measure": {
+                    "type": "sum",
+                    "column": meas_col,
+                },
+                "filters": contract.filters,
+                "sorting": contract.sorting,
+                "limit": contract.limit,
+                "binning": None,
+                "chart": {
+                    "type": "bar",
+                    "orientation": "vertical",
+                    "mode": "grouped",
+                },
+                "title": f"{meas_label} and {sec_label} by {str(x_col).replace('_', ' ').title()}",
+                "axis_labels": {
+                    "x": str(x_col).replace("_", " ").title(),
+                    "y": "Values",
+                },
+                "legend": {
+                    "show": True,
+                    "title": "Measures",
+                },
+            }
+
+        # Case 6: Cross-tabulation / 2 categorical dimensions
         if (intent == "cross_tabulation" or len(dims) >= 2) and intent not in ("relationship", "distribution", "time_series"):
             d1 = dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Category"))
             d2 = dims[1] if len(dims) > 1 else (requested[1] if len(requested) > 1 else (avail[1] if len(avail) > 1 else "Group"))
@@ -455,7 +535,7 @@ class SpecValidator:
                 },
             }
 
-        # Case 6: Single category aggregation / Ranking Bar chart (Generic Default)
+        # Case 7: Single category aggregation / Ranking Bar chart (Generic Default)
         x_col = dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Category"))
         meas_type = contract.measure.get("type", "count") if isinstance(contract.measure, dict) else "count"
         meas_col = (
@@ -463,6 +543,13 @@ class SpecValidator:
         ) or next((c for c in avail if c != x_col), None)
 
         y_label = f"Total {str(meas_col).replace('_', ' ').title()}" if (meas_col and meas_type != "count") else "Count"
+
+        # Determine orientation: Ranking / Top-N queries use horizontal bar for readability
+        is_horizontal = (
+            intent == "ranking"
+            or explicit_chart in ("horizontal_bar", "bar_horizontal")
+            or (contract.limit is not None and contract.limit <= 15)
+        )
 
         return {
             "visualization_available": True,
@@ -486,13 +573,13 @@ class SpecValidator:
             "binning": None,
             "chart": {
                 "type": "bar",
-                "orientation": "vertical",
+                "orientation": "horizontal" if is_horizontal else "vertical",
                 "mode": "standard",
             },
             "title": f"{y_label} by {str(x_col).replace('_', ' ').title()}",
             "axis_labels": {
-                "x": str(x_col).replace("_", " ").title(),
-                "y": y_label,
+                "x": str(x_col).replace("_", " ").title() if not is_horizontal else y_label,
+                "y": y_label if not is_horizontal else str(x_col).replace("_", " ").title(),
             },
             "legend": {
                 "show": False,

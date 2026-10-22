@@ -138,6 +138,10 @@ class QueryContract:
     requested_chart: Optional[str] = None
     sorting: dict[str, Any] = field(default_factory=lambda: {"field": None, "direction": None})
     limit: Optional[int] = None
+    time_granularity: Optional[str] = None
+    series_dimension: Optional[str] = None
+    secondary_measure: Optional[str] = None
+    color_by: Optional[str] = None
     is_follow_up: bool = False
 
     # Backward compatibility properties
@@ -175,6 +179,14 @@ class QueryContract:
     def explicit_chart_type(self, val: Optional[str]):
         self.requested_chart = val
 
+    @property
+    def suggested_chart_type(self) -> Optional[str]:
+        return self.requested_chart
+
+    @suggested_chart_type.setter
+    def suggested_chart_type(self, val: Optional[str]):
+        self.requested_chart = val
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "raw_question": self.raw_question,
@@ -190,6 +202,9 @@ class QueryContract:
             "explicit_chart_type": self.requested_chart,
             "sorting": self.sorting,
             "limit": self.limit,
+            "time_granularity": self.time_granularity,
+            "series_dimension": self.series_dimension,
+            "secondary_measure": self.secondary_measure,
             "is_follow_up": self.is_follow_up,
             # Legacy field aliases
             "dimensions": self.requested_dimensions,
@@ -369,10 +384,13 @@ def extract_query_contract(
     numeric_matched = []
     range_matched = []
     categorical_matched = []
+    datetime_matched = []
 
     for c in matched_cols:
         col_type = dtypes_map.get(c, "")
-        if any(nt in col_type for nt in ("int", "float", "double", "number")) or "age" in c.lower() or "income" in c.lower() or "salary" in c.lower():
+        if any(dt in col_type for dt in ("date", "time", "timestamp")) or any(k in c.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day")):
+            datetime_matched.append(c)
+        elif any(nt in col_type for nt in ("int", "float", "double", "number", "real", "numeric", "decimal")) or "age" in c.lower() or "income" in c.lower() or "salary" in c.lower() or "sales" in c.lower() or "profit" in c.lower() or "revenue" in c.lower() or "quantity" in c.lower() or "price" in c.lower():
             numeric_matched.append(c)
         elif any(rt in c.lower() for rt in ("expect", "return", "range", "bracket")) and not any(nt in col_type for nt in ("int", "float", "double")):
             range_matched.append(c)
@@ -456,6 +474,9 @@ def extract_query_contract(
     elif re.search(r"\b(?:lowest|minimum|min)\b", q) and not re.search(r"\b(?:least popular|lowest count)\b", q):
         measure_type = "min"
         measure_col = numeric_matched[0] if numeric_matched else None
+    elif numeric_matched:
+        measure_type = "sum"
+        measure_col = numeric_matched[0]
 
     # Detect Binning (e.g., "bins of 5", "bins of 5 years", "bin size 5")
     bin_spec: Optional[dict[str, Any]] = None
@@ -485,14 +506,59 @@ def extract_query_contract(
         intent = "cross_tabulation"
     elif filters and len(plot_dimensions) == 1:
         intent = "filtered_categorical_distribution"
-    elif explicit_chart == "pie" or re.search(r"\b(?:proportion|percentage|share|ratio)\b", q):
+    elif explicit_chart in ("pie", "donut") or re.search(r"\b(?:proportion|percentage|share|ratio|contribution|contributions)\b", q):
         intent = "proportion"
+        explicit_chart = "pie"
     elif re.search(r"\b(?:trend|over time|growth|over the years|monthly|yearly)\b", q):
         intent = "trend"
     elif re.search(r"\b(?:rank|ranking|top|bottom|most popular|least popular)\b", q):
         intent = "ranking"
     elif len(plot_matched_cols) == 0 and not is_follow_up:
         intent = "single_metric"
+
+    # Detect time granularity and series dimension
+    time_grain = None
+    series_dim = None
+    sec_measure = None
+
+    is_temporal = bool(re.search(r"\b(?:trend|over time|growth|over the years|monthly|yearly|annually|daily|weekly|quarterly|timeline|trajectory)\b", q)) or (datetime_matched and len(datetime_matched) > 0)
+    if is_temporal:
+        intent = "trend"
+        explicit_chart = explicit_chart or "line"
+        if any(w in q for w in ("monthly", "month by month", "per month")):
+            time_grain = "month"
+        elif any(w in q for w in ("yearly", "year by year", "annually", "annual")):
+            time_grain = "year"
+        elif any(w in q for w in ("quarterly", "per quarter")):
+            time_grain = "quarter"
+        elif any(w in q for w in ("weekly", "per week")):
+            time_grain = "week"
+        elif any(w in q for w in ("daily", "day by day", "per day")):
+            time_grain = "day"
+        else:
+            time_grain = "month"
+
+        # Check for multi-series line chart (e.g. monthly sales by category)
+        if plot_dimensions:
+            series_dim = plot_dimensions[0]
+
+    # Check for scatter vs multi-measure bar chart
+    color_by_col = None
+    is_scatter = (
+        explicit_chart == "scatter"
+        or (len(numeric_matched) >= 2 and bool(re.search(r"\b(?:versus|vs\.?|relationship|against|correlation)\b", q)))
+    )
+    if is_scatter:
+        intent = "relationship"
+        explicit_chart = "scatter"
+        if plot_dimensions:
+            color_by_col = plot_dimensions[0]
+            series_dim = plot_dimensions[0]
+    elif len(numeric_matched) >= 2 and len(plot_dimensions) == 1 and not is_temporal:
+        measure_col = numeric_matched[0]
+        sec_measure = numeric_matched[1]
+        measure_type = "sum"
+        explicit_chart = explicit_chart or "clustered_bar"
 
     # Detect Sorting & Limits
     sorting: dict[str, Any] = {"field": None, "direction": None}
@@ -505,11 +571,13 @@ def extract_query_contract(
     limit_match = re.search(r"\b(?:top|bottom|first|last|highest|lowest)\s+(\d+)\b", q)
     if limit_match:
         limit = int(limit_match.group(1))
+        if sorting.get("direction") == "desc" and not explicit_chart:
+            explicit_chart = "horizontal_bar"
 
     vis_required = (
         is_visualization_requested(q_raw, intent)
         or bool(explicit_chart)
-        or intent in ("cross_tabulation", "distribution", "relationship", "filtered_categorical_distribution")
+        or intent in ("cross_tabulation", "distribution", "relationship", "filtered_categorical_distribution", "trend", "proportion")
     )
 
     dimensions = (
@@ -530,5 +598,9 @@ def extract_query_contract(
         requested_chart=explicit_chart,
         sorting=sorting,
         limit=limit,
+        time_granularity=time_grain,
+        series_dimension=series_dim,
+        secondary_measure=sec_measure,
+        color_by=color_by_col,
         is_follow_up=is_follow_up,
     )

@@ -262,7 +262,11 @@ class SQLAgent:
         """
         Build exact deterministic SQL matching the Query Contract without guessing or unwanted grouping.
         """
-        cols_map = {str(c.get("name", "")).lower(): str(c.get("name", "")) for c in schema.get("columns", [])}
+        cols_map = {}
+        for c in (schema.get("columns", []) if isinstance(schema, dict) else schema or []):
+            name = c.get("name", "") if isinstance(c, dict) else str(c)
+            if name:
+                cols_map[name.lower()] = name
 
         def quote_col(col_name: str) -> str:
             # Check if column is in schema
@@ -369,6 +373,11 @@ class SQLAgent:
                 agg_select = f"ROUND(SUM({expr}), 2) AS total_{alias_name}"
                 order_col = f"total_{alias_name}"
 
+            if contract.secondary_measure_column:
+                sec_expr = quote_expr(contract.secondary_measure_column)
+                sec_alias = self._sanitize_alias(contract.secondary_measure or "secondary_metric")
+                agg_select += f', ROUND(SUM({sec_expr}), 2) AS total_{sec_alias}'
+
             # Ordering: time-series queries must be chronological ASC, while category rankings are DESC
             is_time_series = (
                 contract.intent == "TIME_SERIES"
@@ -376,21 +385,43 @@ class SQLAgent:
                 or any("date" in g.lower() or "time" in g.lower() or "year" in g.lower() or "month" in g.lower() for g in contract.group_by)
             )
             if is_time_series:
-                order_col = group_cols[0]
+                time_col = next((g for g in contract.group_by if any(k in g.lower() for k in ("date", "time", "year", "month", "invoicedate"))), contract.group_by[0] if contract.group_by else "Date")
+                grain = contract.time_granularity or "month"
+                if grain == "year":
+                    time_sql_expr = f"COALESCE(strftime('%Y', {quote_col(time_col)}), SUBSTR({quote_col(time_col)}, 1, 4))"
+                elif grain == "day":
+                    time_sql_expr = f"COALESCE(strftime('%Y-%m-%d', {quote_col(time_col)}), SUBSTR({quote_col(time_col)}, 1, 10))"
+                else:  # month default
+                    time_sql_expr = f"COALESCE(strftime('%Y-%m', {quote_col(time_col)}), SUBSTR({quote_col(time_col)}, 1, 7))"
+
+                other_group_cols = [quote_col(g) for g in contract.group_by if g != time_col]
+                if other_group_cols:
+                    group_select_sql = f'{time_sql_expr} AS {quote_col(time_col)}, {", ".join(other_group_cols)}'
+                    group_clause_sql = f'{time_sql_expr}, {", ".join(other_group_cols)}'
+                else:
+                    group_select_sql = f'{time_sql_expr} AS {quote_col(time_col)}'
+                    group_clause_sql = time_sql_expr
+
+                order_col = time_sql_expr
                 direction = "ASC"
                 if contract.sort:
                     direction = contract.sort.direction.upper()
                 limit_sql = f" LIMIT {contract.limit}" if contract.limit else " LIMIT 500"
+
+                return (
+                    f'SELECT {group_select_sql}, {agg_select} FROM "{safe_table}"'
+                    f'{where_sql} GROUP BY {group_clause_sql} ORDER BY {order_col} {direction}{limit_sql}'
+                )
             else:
                 direction = "DESC"
                 if contract.sort:
                     direction = contract.sort.direction.upper()
                 limit_sql = f" LIMIT {contract.limit}" if contract.limit else " LIMIT 10"
 
-            return (
-                f'SELECT {group_sql}, {agg_select} FROM "{safe_table}"'
-                f'{where_sql} GROUP BY {group_sql} ORDER BY {order_col} {direction}{limit_sql}'
-            )
+                return (
+                    f'SELECT {group_sql}, {agg_select} FROM "{safe_table}"'
+                    f'{where_sql} GROUP BY {group_sql} ORDER BY {order_col} {direction}{limit_sql}'
+                )
 
         # 3. DISTRIBUTION / HISTOGRAM (Raw observations)
         if contract.answer_type == "DISTRIBUTION":
@@ -404,8 +435,14 @@ class SQLAgent:
             x_col = contract.x_axis or "Quantity"
             y_col = contract.y_axis or "UnitPrice"
             x_q, y_q = quote_col(x_col), quote_col(y_col)
-            where_sql = f" WHERE {x_q} IS NOT NULL AND {y_q} IS NOT NULL"
-            return f'SELECT {x_q}, {y_q} FROM "{safe_table}"{where_sql} LIMIT 5000'
+            where_conds = [f"{x_q} IS NOT NULL", f"{y_q} IS NOT NULL"]
+            select_cols = [x_q, y_q]
+            if contract.color_by and contract.color_by.lower() in cols_map:
+                color_q = quote_col(cols_map[contract.color_by.lower()])
+                select_cols.append(color_q)
+                where_conds.append(f"{color_q} IS NOT NULL")
+            where_sql = f" WHERE {' AND '.join(where_conds)}"
+            return f'SELECT {", ".join(select_cols)} FROM "{safe_table}"{where_sql} LIMIT 5000'
 
         # 5. DATA_RETRIEVAL / RECORDS (Raw preview)
         limit_sql = f" LIMIT {contract.limit or 50}"

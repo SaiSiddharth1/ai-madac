@@ -58,6 +58,37 @@ class QueryContract(BaseModel):
     chart_title: Optional[str] = None
     bin_width: Optional[float] = None
     time_column: Optional[str] = None
-    time_granularity: Optional[str] = None
+    time_granularity: Optional[str] = None  # year, quarter, month, week, day, hour
+    series_dimension: Optional[str] = None  # Category dimension for multi-series line/bar
+    secondary_measure: Optional[str] = None  # Secondary measure for clustered multi-metric bar
+    secondary_measure_column: Optional[str] = None
 
     is_follow_up: bool = False
+
+    @property
+    def explicit_chart_type(self) -> Optional[str]:
+        return self.suggested_chart_type
+
+    @property
+    def requested_fields(self) -> list[str]:
+        fields = list(self.dimensions)
+        if self.measure_column and self.measure_column not in fields:
+            fields.append(self.measure_column)
+        if self.x_axis and self.x_axis not in fields:
+            fields.append(self.x_axis)
+        if self.y_axis and self.y_axis not in fields:
+            fields.append(self.y_axis)
+        return fields
+
+
+    @property
+    def sorting(self) -> dict[str, Any]:
+        if self.sort:
+            return {"field": self.sort.field, "direction": self.sort.direction}
+        return {"field": None, "direction": None}
+
+    @property
+    def binning(self) -> Optional[dict[str, Any]]:
+        if self.bin_width:
+            return {"mode": "fixed", "size": self.bin_width, "bin_size": self.bin_width}
+        return None

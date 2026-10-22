@@ -108,6 +108,12 @@ class SupervisorAgent:
         contract_dict = contract.model_dump()
         intent = contract.intent
 
+        # Check if user explicitly asked for a visualization
+        asks_visual = bool(re.search(r"\b(?:visually|visualize|chart|plot|graph|pie|bar|histogram|scatter|line)\b", question.lower()))
+        if asks_visual:
+            contract.requested_visualization = True
+            contract.should_visualize = True
+
         # Determine routing plan based on Query Contract
         if not contract.is_related_to_dataset or intent == "UNRELATED":
             # Unrelated question: do NOT invoke SQL or Visualization (no fake charts!)
@@ -122,6 +128,8 @@ class SupervisorAgent:
                 plan = ["data_analyst_agent", "report_agent"]
         elif contract.should_visualize or contract.requested_visualization:
             plan = ["sql_agent", "visualization_agent", "visualization_validator", "chart_renderer", "report_agent"]
+            if contract.requested_visualization or any(tok in question.lower() for tok in ("visually", "chart", "plot", "graph", "histogram", "scatter")):
+                intent = "VISUALIZATION"
         else:
             plan = ["sql_agent", "report_agent"]
 

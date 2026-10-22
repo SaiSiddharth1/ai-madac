@@ -151,7 +151,7 @@ class DataPreparer:
             return work_df, {"chart_type": chart_type, "filters": filters}, ["No records match the requested filter criteria."]
 
         # Case A: Cross-Tabulation / Grouped Bar
-        if color_col and color_col in work_df.columns and x_col and x_col in work_df.columns:
+        if color_col and color_col in work_df.columns and x_col and x_col in work_df.columns and chart_type not in ("line", "trend", "scatter", "relationship"):
             prepared_df = (
                 work_df.groupby([x_col, color_col])
                 .size()
@@ -304,15 +304,26 @@ class DataPreparer:
                 actual_x = midpoint_x
                 parameters_used.append(f"Derived Numerical Field: '{midpoint_x}' from categorical ranges")
 
-            prepared_df = plot_df[[actual_x, actual_y]].dropna()
-            total_obs = len(prepared_df)
+            # Numeric coercion for X and Y
+            plot_df[actual_x] = pd.to_numeric(plot_df[actual_x], errors="coerce")
+            plot_df[actual_y] = pd.to_numeric(plot_df[actual_y], errors="coerce")
+
+            cols_to_keep = [actual_x, actual_y]
+            if color_col and color_col in plot_df.columns:
+                cols_to_keep.append(color_col)
+
+            clean_df = plot_df[cols_to_keep].dropna(subset=[actual_x, actual_y])
+            total_obs = len(clean_df)
+
             parameters_used.append(f"X-Axis: {actual_x}")
             parameters_used.append(f"Y-Axis: {actual_y}")
+            if color_col and color_col in clean_df.columns:
+                parameters_used.append(f"Color Series: {color_col}")
             parameters_used.append(f"Observations: {total_obs}")
 
             if total_obs > 1:
                 try:
-                    corr = float(prepared_df[actual_x].corr(prepared_df[actual_y]))
+                    corr = float(clean_df[actual_x].corr(clean_df[actual_y]))
                     direction = "positive" if corr > 0.1 else ("negative" if corr < -0.1 else "neutral / weak")
                     insights.append(
                         f"Correlation between {actual_x} and {actual_y} is {corr:.2f} ({direction} relationship across {total_obs} observations)."
@@ -320,39 +331,137 @@ class DataPreparer:
                 except Exception:
                     insights.append(f"Plotted {total_obs} observations comparing {actual_x} and {actual_y}.")
 
+            # Deterministic visualization sampling for large datasets (> 5000 rows)
+            if total_obs > 5000:
+                prepared_df = clean_df.sample(n=5000, random_state=42).reset_index(drop=True)
+                parameters_used.append(f"Rendering: Deterministic visual sample of 5,000 points from {total_obs} total rows")
+            else:
+                prepared_df = clean_df
+
             applied_params = {
                 "chart_type": "Scatter Plot",
                 "x_axis": actual_x,
                 "y_axis": actual_y,
+                "series": color_col if (color_col and color_col in prepared_df.columns) else None,
                 "observation_count": total_obs,
                 "filters": [f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters],
             }
             return prepared_df, applied_params, insights
 
-        # Case E: Line Chart / Time Series
+        # Case E: Line Chart / Time Series (Single or Multi-Series)
         if (chart_type in ("line", "trend") or "time" in chart_type) and x_col and x_col in work_df.columns:
-            other_cols = [c for c in work_df.columns if c != x_col]
-            val_col = y_col if (y_col and y_col in work_df.columns) else (other_cols[0] if other_cols else x_col)
+            other_cols = [c for c in work_df.columns if c not in (x_col, color_col)]
+            val_col = y_col if (y_col and y_col in work_df.columns and y_col != x_col) else (other_cols[0] if other_cols else x_col)
+            meas_type = measure_type if measure_type in ("sum", "mean", "min", "max", "count") else "sum"
 
-            if val_col in work_df.columns and len(work_df.columns) >= 2:
-                prepared_df = work_df[[x_col, val_col]].dropna().copy()
-            else:
-                prepared_df = work_df.groupby(x_col).size().reset_index(name="count")
-                val_col = "count"
+            # Parse datetime
+            dt_series = pd.to_datetime(work_df[x_col], errors="coerce")
+            is_valid_datetime = dt_series.notna().mean() >= 0.5
 
-            # Chronological ascending sort
-            try:
-                sort_key = pd.to_datetime(prepared_df[x_col], errors="coerce")
-                if sort_key.notna().mean() >= 0.5:
-                    prepared_df["_sort_key"] = sort_key
-                    prepared_df = prepared_df.sort_values(by="_sort_key", ascending=True).drop(columns=["_sort_key"])
+            time_grain = spec.get("time_granularity")
+            if not time_grain:
+                if is_valid_datetime:
+                    valid_dts = dt_series.dropna()
+                    if not valid_dts.empty:
+                        span_days = (valid_dts.max() - valid_dts.min()).days
+                        if span_days > 730:
+                            time_grain = "year"
+                        elif span_days > 45:
+                            time_grain = "month"
+                        elif span_days > 14:
+                            time_grain = "week"
+                        else:
+                            time_grain = "day"
+                    else:
+                        time_grain = "month"
                 else:
-                    prepared_df = prepared_df.sort_values(by=x_col, ascending=True)
-            except Exception:
+                    time_grain = "month"
+
+            time_grain = str(time_grain).lower()
+
+            plot_df = work_df.copy()
+            if is_valid_datetime:
+                plot_df["_dt"] = dt_series
+                plot_df = plot_df.dropna(subset=["_dt"])
+                if time_grain == "year":
+                    plot_df["_time_key"] = plot_df["_dt"].dt.strftime("%Y")
+                elif time_grain == "quarter":
+                    plot_df["_time_key"] = plot_df["_dt"].dt.to_period("Q").astype(str)
+                elif time_grain == "month":
+                    plot_df["_time_key"] = plot_df["_dt"].dt.strftime("%Y-%m")
+                elif time_grain == "week":
+                    plot_df["_time_key"] = plot_df["_dt"].dt.strftime("%Y-W%W")
+                elif time_grain == "day":
+                    plot_df["_time_key"] = plot_df["_dt"].dt.strftime("%Y-%m-%d")
+                else:
+                    plot_df["_time_key"] = plot_df["_dt"].dt.strftime("%Y-%m")
+            else:
+                plot_df["_time_key"] = plot_df[x_col].astype(str)
+
+            # Ensure numeric val_col for aggregation
+            plot_df[val_col] = pd.to_numeric(plot_df[val_col], errors="coerce")
+
+            # Multi-series line chart
+            has_multi_series = bool(color_col and color_col in plot_df.columns and color_col != x_col)
+            if has_multi_series:
+                # Limit top categories to top 6 to prevent visual clutter
+                top_categories = (
+                    plot_df.groupby(color_col)[val_col]
+                    .sum()
+                    .nlargest(6)
+                    .index.tolist()
+                )
+                plot_df["_series_clean"] = plot_df[color_col].apply(
+                    lambda c: str(c) if c in top_categories else "Other"
+                )
+
+                agg_fn = "count" if meas_type == "count" else meas_type
+                prepared_df = (
+                    plot_df.groupby(["_time_key", "_series_clean"])[val_col]
+                    .agg(agg_fn)
+                    .reset_index(name=val_col)
+                )
+                prepared_df = prepared_df.rename(
+                    columns={"_time_key": x_col, "_series_clean": color_col}
+                )
                 prepared_df = prepared_df.sort_values(by=x_col, ascending=True)
 
+                parameters_used.append(f"Time Dimension (X-Axis): {x_col}")
+                parameters_used.append(f"Time Grain: {time_grain.capitalize()}")
+                parameters_used.append(f"Metric (Y-Axis): {val_col}")
+                parameters_used.append(f"Aggregation: {meas_type.upper()}")
+                parameters_used.append(f"Series (Lines): {color_col} (Top {len(top_categories)} categories + Other)")
+                parameters_used.append("Sort: Chronological Ascending")
+
+                applied_params = {
+                    "chart_type": "Multi-Series Line Chart",
+                    "x_axis": x_col,
+                    "time_granularity": time_grain.capitalize(),
+                    "y_axis": val_col,
+                    "aggregation": meas_type.upper(),
+                    "series": color_col,
+                    "sorting": "Chronological Ascending",
+                    "filters": [f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters],
+                }
+                insights.append(
+                    f"Multi-series trajectory of {val_col.replace('_', ' ').title()} by {color_col.replace('_', ' ').title()} across {len(prepared_df[x_col].unique())} time periods ({time_grain})."
+                )
+                return prepared_df, applied_params, insights
+
+            # Single line chart
+            agg_fn = "count" if meas_type == "count" else meas_type
+            prepared_df = (
+                plot_df.groupby("_time_key")[val_col]
+                .agg(agg_fn)
+                .reset_index(name=val_col)
+            )
+            prepared_df = prepared_df.rename(columns={"_time_key": x_col})
+            prepared_df = prepared_df.sort_values(by=x_col, ascending=True)
+
             parameters_used.append(f"Time Dimension (X-Axis): {x_col}")
+            parameters_used.append(f"Time Grain: {time_grain.capitalize()}")
             parameters_used.append(f"Metric (Y-Axis): {val_col}")
+            parameters_used.append(f"Aggregation: {meas_type.upper()}")
             parameters_used.append("Sort: Chronological Ascending")
 
             if not prepared_df.empty:
@@ -363,20 +472,57 @@ class DataPreparer:
                 vf_str = f"{v_first:,.2f}" if isinstance(v_first, (int, float)) else str(v_first)
                 vl_str = f"{v_last:,.2f}" if isinstance(v_last, (int, float)) else str(v_last)
                 insights.append(
-                    f"{val_col.replace('_', ' ').title()} trajectory from {first_pt[x_col]} ({vf_str}) to {last_pt[x_col]} ({vl_str}) across {len(prepared_df)} time points."
+                    f"{val_col.replace('_', ' ').title()} trajectory from {first_pt[x_col]} ({vf_str}) to {last_pt[x_col]} ({vl_str}) across {len(prepared_df)} time points ({time_grain})."
                 )
 
             applied_params = {
                 "chart_type": "Line Chart (Time Series)",
                 "x_axis": x_col,
+                "time_granularity": time_grain.capitalize(),
                 "y_axis": val_col,
-                "data_points": len(prepared_df),
+                "aggregation": meas_type.upper(),
                 "sorting": "Chronological Ascending",
                 "filters": [f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters],
             }
             return prepared_df, applied_params, insights
 
-        # Case F: Categorical Aggregation (Bar or Pie)
+        # Case F: Clustered Multi-Measure Bar (e.g. Sales and Profit by Category)
+        if isinstance(y_col, list) and x_col and x_col in work_df.columns:
+            matched_measures = []
+            for m in y_col:
+                if not isinstance(m, str):
+                    continue
+                if m in work_df.columns:
+                    matched_measures.append(m)
+                else:
+                    alias = next((c for c in work_df.columns if c.lower() == f"total_{m.lower()}" or c.lower() == m.lower() or m.lower() in c.lower()), None)
+                    if alias:
+                        matched_measures.append(alias)
+            if len(matched_measures) >= 2:
+                valid_measures = matched_measures
+                plot_df = work_df.copy()
+                for m in valid_measures:
+                    plot_df[m] = pd.to_numeric(plot_df[m], errors="coerce")
+                prepared_df = plot_df.groupby(x_col)[valid_measures].sum().reset_index()
+
+                parameters_used.append(f"Category (X-Axis): {x_col}")
+                parameters_used.append(f"Measures: {', '.join(valid_measures)}")
+                parameters_used.append("Aggregation: SUM")
+
+                applied_params = {
+                    "chart_type": "Clustered Bar Chart",
+                    "x_axis": x_col,
+                    "category": x_col,
+                    "measures": valid_measures,
+                    "aggregation": "SUM",
+                    "filters": [f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters],
+                }
+                insights.append(f"Comparison of {', '.join(valid_measures)} across categories of {x_col}.")
+                return prepared_df, applied_params, insights
+            elif len(valid_measures) == 1:
+                y_col = valid_measures[0]
+
+        # Case G: Categorical Aggregation (Bar, Horizontal Bar, or Pie)
         if x_col and x_col in work_df.columns:
             other_cols = [c for c in work_df.columns if c != x_col]
             is_pre_aggregated = (
@@ -385,7 +531,7 @@ class DataPreparer:
             )
 
             # Check if measure is average on a range category column (e.g. average expected return by avenue)
-            if y_col and y_col in work_df.columns and measure_type in ("mean", "avg", "average"):
+            if y_col and isinstance(y_col, str) and y_col in work_df.columns and measure_type in ("mean", "avg", "average"):
                 y_is_range = (
                     work_df[y_col].astype(str).str.contains(r"\d+\s*[-–—to]\s*\d+").mean() >= 0.6
                     or "expect" in y_col.lower()
@@ -427,7 +573,7 @@ class DataPreparer:
                 parameters_used.append(f"Category: {x_col}")
                 parameters_used.append(f"Value: {val_col}")
                 parameters_used.append(f"Aggregation: {agg_label}")
-            elif y_col and y_col in work_df.columns and measure_type in ("sum", "min", "max"):
+            elif y_col and isinstance(y_col, str) and y_col in work_df.columns and measure_type in ("sum", "min", "max"):
                 agg_fn = measure_type
                 metric_name = f"{agg_fn}_{y_col}"
                 prepared_df = (
@@ -462,6 +608,13 @@ class DataPreparer:
                 prepared_df = prepared_df.head(limit)
                 parameters_used.append(f"Limit: Top {limit}")
 
+            # Pie Chart category limit: max 6 categories + "Other"
+            if chart_type in ("pie", "donut") and len(prepared_df) > 7:
+                top_slice = prepared_df.iloc[:6]
+                other_sum = prepared_df.iloc[6:][val_col].sum()
+                other_row = pd.DataFrame([{x_col: "Other", val_col: other_sum}])
+                prepared_df = pd.concat([top_slice, other_row], ignore_index=True)
+
             if not prepared_df.empty:
                 top_row = prepared_df.iloc[0]
                 if val_col == "investor_count" and total_filtered_rows > 0:
@@ -482,12 +635,15 @@ class DataPreparer:
                         f"Lowest category is '{low_row[x_col]}' with {low_display}."
                     )
 
+            is_horizontal = (chart_type == "horizontal_bar" or (spec.get("chart") or {}).get("orientation") == "horizontal")
+            chart_label = "Horizontal Bar Chart" if is_horizontal else ("Pie chart" if chart_type in ("pie", "donut") else "Bar chart")
+
             applied_params = {
-                "chart_type": "Pie chart" if chart_type == "pie" else "Bar chart",
+                "chart_type": chart_label,
                 "category": x_col,
                 "value": val_col,
-                "x_axis": x_col,
-                "y_axis": val_col,
+                "x_axis": x_col if not is_horizontal else val_col,
+                "y_axis": val_col if not is_horizontal else x_col,
                 "aggregation": agg_label,
                 "sorting": "Descending" if (sort_dir == "desc" or not sort_dir) else "Ascending",
                 "limit": limit,

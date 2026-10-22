@@ -81,13 +81,40 @@ class PlotlyRenderer:
         col_map = {c.lower(): c for c in cols}
         if x_col and x_col.lower() in col_map:
             x_col = col_map[x_col.lower()]
-        if y_col and y_col.lower() in col_map:
+        if y_col and isinstance(y_col, str) and y_col.lower() in col_map:
             y_col = col_map[y_col.lower()]
         if color_col and color_col.lower() in col_map:
             color_col = col_map[color_col.lower()]
 
-        # 1. Grouped / Stacked Bar Chart with explicit color column
-        if color_col and color_col in cols and x_col and x_col in cols and len(cols) >= 3:
+        # 1. Clustered Multi-Measure Bar Chart (e.g. Sales and Profit side by side)
+        is_multi_measure = isinstance(y_col, list) and len(y_col) >= 2
+        if is_multi_measure and x_col and x_col in cols:
+            measure_cols = []
+            for m in y_col:
+                if m in cols:
+                    measure_cols.append(m)
+                else:
+                    alias = next((c for c in cols if c.lower() == f"total_{m.lower()}" or c.lower() == m.lower() or m.lower() in c.lower()), None)
+                    if alias:
+                        measure_cols.append(alias)
+            fig = go.Figure()
+            for idx, m in enumerate(measure_cols):
+                fig.add_trace(go.Bar(
+                    name=m.replace("_", " ").title(),
+                    x=df[x_col],
+                    y=df[m],
+                    marker_color=POWER_BI_PALETTE[idx % len(POWER_BI_PALETTE)],
+                ))
+            fig.update_layout(
+                barmode="group",
+                title=title,
+                xaxis_title=x_col.replace("_", " ").title(),
+                yaxis_title="Values",
+                legend_title_text="Measures",
+            )
+
+        # 2. Grouped / Stacked Bar Chart with explicit categorical color column
+        elif color_col and color_col in cols and x_col and x_col in cols and len(cols) >= 3 and chart_type not in ("line", "trend", "scatter", "relationship"):
             val_col = next((c for c in cols if c not in (x_col, color_col)), "count")
             barmode = "stack" if mode == "stacked" else "group"
             fig = px.bar(
@@ -106,7 +133,7 @@ class PlotlyRenderer:
                 legend_title_text=color_col.replace("_", " ").title(),
             )
 
-        # 2. Histogram / Distribution (Raw observations)
+        # 3. Histogram / Distribution (Raw observations)
         elif chart_type in ("histogram", "distribution") and (x_col in cols or len(cols) >= 1):
             target_x = x_col if x_col in cols else cols[0]
             bin_size = (
@@ -136,20 +163,36 @@ class PlotlyRenderer:
                 bargap=0.08,
             )
 
-        # 3. Scatter Plot (Raw observations of two numerical columns)
+        # 4. Scatter Plot (Raw observations of two numerical columns, optional category color)
         elif chart_type in ("scatter", "relationship"):
             scatter_x = x_col if x_col in cols else (cols[0] if len(cols) >= 1 else None)
             scatter_y = y_col if y_col in cols else (cols[1] if len(cols) >= 2 else None)
             if scatter_x and scatter_y:
-                fig = px.scatter(
-                    df,
-                    x=scatter_x,
-                    y=scatter_y,
-                    title=title,
-                    color_discrete_sequence=[POWER_BI_PALETTE[2]],
-                )
+                has_color = bool(color_col and color_col in cols and color_col not in (scatter_x, scatter_y))
+                if has_color:
+                    fig = px.scatter(
+                        df,
+                        x=scatter_x,
+                        y=scatter_y,
+                        color=color_col,
+                        title=title,
+                        color_discrete_sequence=POWER_BI_PALETTE,
+                        render_mode="webgl" if len(df) > 3000 else "auto",
+                    )
+                    fig.update_layout(
+                        legend_title_text=color_col.replace("_", " ").title(),
+                    )
+                else:
+                    fig = px.scatter(
+                        df,
+                        x=scatter_x,
+                        y=scatter_y,
+                        title=title,
+                        color_discrete_sequence=[POWER_BI_PALETTE[2]],
+                        render_mode="webgl" if len(df) > 3000 else "auto",
+                    )
                 fig.update_traces(
-                    marker=dict(size=8, opacity=0.8, line=dict(width=1, color="#1e293b")),
+                    marker=dict(size=7, opacity=0.8, line=dict(width=1, color="#1e293b")),
                     hovertemplate=f"<b>{scatter_x}</b>: %{{x}}<br><b>{scatter_y}</b>: %{{y}}<extra></extra>",
                 )
                 fig.update_layout(
@@ -159,25 +202,43 @@ class PlotlyRenderer:
             else:
                 fig = go.Figure()
 
-        # 4. Line Chart (e.g. Trend over time)
+        # 5. Line Chart (Single or Multi-Series Trend over time)
         elif chart_type in ("line", "trend") and len(cols) >= 2:
             line_x = x_col if x_col in cols else cols[0]
-            line_y = y_col if y_col in cols else cols[1]
-            fig = px.line(
-                df,
-                x=line_x,
-                y=line_y,
-                title=title,
-                markers=True,
-                color_discrete_sequence=[POWER_BI_PALETTE[0]],
-            )
-            fig.update_traces(line=dict(width=3))
-            fig.update_layout(
-                xaxis_title=line_x.replace("_", " ").title(),
-                yaxis_title=line_y.replace("_", " ").title(),
-            )
+            line_y = y_col if y_col in cols else (cols[1] if cols[1] != line_x else (cols[0] if len(cols) > 1 else line_x))
+            has_series = bool(color_col and color_col in cols and color_col not in (line_x, line_y))
+            if has_series:
+                fig = px.line(
+                    df,
+                    x=line_x,
+                    y=line_y,
+                    color=color_col,
+                    title=title,
+                    markers=True,
+                    color_discrete_sequence=POWER_BI_PALETTE,
+                )
+                fig.update_traces(line=dict(width=2.5), marker=dict(size=6))
+                fig.update_layout(
+                    xaxis_title=line_x.replace("_", " ").title(),
+                    yaxis_title=str(line_y).replace("_", " ").title(),
+                    legend_title_text=color_col.replace("_", " ").title(),
+                )
+            else:
+                fig = px.line(
+                    df,
+                    x=line_x,
+                    y=line_y,
+                    title=title,
+                    markers=True,
+                    color_discrete_sequence=[POWER_BI_PALETTE[0]],
+                )
+                fig.update_traces(line=dict(width=3), marker=dict(size=6))
+                fig.update_layout(
+                    xaxis_title=line_x.replace("_", " ").title(),
+                    yaxis_title=str(line_y).replace("_", " ").title(),
+                )
 
-        # 5. Box Plot
+        # 6. Box Plot
         elif chart_type in ("box", "box_plot") and (x_col in cols or len(cols) >= 1):
             target_x = x_col if x_col in cols else cols[0]
             box_y = y_col if y_col in cols else (cols[1] if len(cols) > 1 else None)
@@ -198,7 +259,7 @@ class PlotlyRenderer:
             else:
                 fig = px.box(df, y=target_x, title=title, color_discrete_sequence=[POWER_BI_PALETTE[0]])
 
-        # 6. Pie / Donut
+        # 7. Pie / Donut
         elif chart_type in ("pie", "donut") and len(cols) >= 1:
             cat_col = x_col if x_col in cols else cols[0]
             val_col = y_col if y_col in cols else (cols[1] if len(cols) > 1 else None)
@@ -214,26 +275,27 @@ class PlotlyRenderer:
             )
             fig.update_traces(textposition="inside", textinfo="percent+label")
 
-        # 7. Standard Bar Chart (with deterministic Power BI category colors)
+        # 8. Standard Bar Chart (Vertical or Horizontal)
         elif len(cols) >= 2 or (x_col and x_col in cols):
             cat_col = x_col if x_col in cols else cols[0]
             val_col = y_col if y_col in cols else (cols[1] if len(cols) > 1 else cols[0])
 
-            # Auto switch to horizontal if many categories or explicit horizontal requested
             is_horizontal = (len(df) > 8 or orientation == "horizontal" or chart_type == "horizontal_bar")
             if is_horizontal:
+                # In horizontal bar, cat_col is y and val_col is x
                 fig = px.bar(
                     df,
-                    x=val_col,
-                    y=cat_col,
+                    x=val_col if val_col in cols else cols[1],
+                    y=cat_col if cat_col in cols else cols[0],
                     orientation="h",
                     title=title,
-                    color=cat_col,
+                    color=cat_col if cat_col in cols else cols[0],
                     color_discrete_sequence=POWER_BI_PALETTE,
                 )
                 fig.update_layout(
-                    xaxis_title=val_col.replace("_", " ").title(),
-                    yaxis_title=cat_col.replace("_", " ").title(),
+                    xaxis_title=str(val_col).replace("_", " ").title(),
+                    yaxis_title=str(cat_col).replace("_", " ").title(),
+                    yaxis=dict(autorange="reversed"),
                     showlegend=False,
                 )
             else:
@@ -246,8 +308,8 @@ class PlotlyRenderer:
                     color_discrete_sequence=POWER_BI_PALETTE,
                 )
                 fig.update_layout(
-                    xaxis_title=cat_col.replace("_", " ").title(),
-                    yaxis_title=val_col.replace("_", " ").title(),
+                    xaxis_title=str(cat_col).replace("_", " ").title(),
+                    yaxis_title=str(val_col).replace("_", " ").title(),
                     showlegend=False,
                 )
 
@@ -293,6 +355,18 @@ class PlotlyRenderer:
         # Persist static PNG preview using matplotlib (instant & non-blocking)
         cls._render_static_figure(df, spec, png_filepath, title)
 
+        # Mirror to backend/charts if distinct so tests and relative lookups succeed
+        from pathlib import Path
+        backend_dir = str(Path(__file__).resolve().parents[3] / "charts")
+        if os.path.abspath(settings.CHARTS_DIR) != os.path.abspath(backend_dir):
+            os.makedirs(backend_dir, exist_ok=True)
+            try:
+                import shutil
+                shutil.copy2(png_filepath, os.path.join(backend_dir, png_filename))
+                shutil.copy2(json_filepath, os.path.join(backend_dir, json_filename))
+            except Exception:
+                pass
+
         chart_path = f"/static/charts/{png_filename}"
         return fig, title, chart_path, json_filepath
 
@@ -313,7 +387,25 @@ class PlotlyRenderer:
             color_col = fields.get("color")
             chart_type = (spec.get("chart") or {}).get("type", "bar")
 
-            if color_col and color_col in df.columns and x_col and x_col in df.columns and "count" in df.columns:
+            if chart_type in ("line", "trend") and x_col and x_col in df.columns:
+                val_col = y_col if (isinstance(y_col, str) and y_col in df.columns) else next((c for c in df.columns if c != x_col and c != color_col), (df.columns[1] if len(df.columns) > 1 else x_col))
+                if color_col and color_col in df.columns and color_col != x_col:
+                    for idx, (grp_name, grp_df) in enumerate(df.groupby(color_col)):
+                        ax.plot(grp_df[x_col].astype(str), grp_df[val_col], marker='o', label=str(grp_name), color=POWER_BI_PALETTE[idx % len(POWER_BI_PALETTE)], linewidth=2)
+                    ax.legend(title=color_col.replace("_", " ").title(), facecolor="#161b33", labelcolor="#f8fafc")
+                else:
+                    ax.plot(df[x_col].astype(str), df[val_col], marker='o', color="#6366F1", linewidth=2.5)
+                ax.set_ylabel(str(val_col).replace("_", " ").title(), color="#dbeafe")
+            elif isinstance(y_col, list) and x_col and x_col in df.columns:
+                m_cols = [m for m in df.columns if m != x_col]
+                x_indices = np.arange(len(df))
+                width = 0.8 / max(1, len(m_cols))
+                for idx, m in enumerate(m_cols):
+                    ax.bar(x_indices + idx * width, df[m], width=width, label=m.replace("_", " ").title(), color=POWER_BI_PALETTE[idx % len(POWER_BI_PALETTE)], edgecolor="#1e293b")
+                ax.set_xticks(x_indices + width * (len(m_cols) - 1) / 2)
+                ax.set_xticklabels(df[x_col].astype(str))
+                ax.legend(facecolor="#161b33", labelcolor="#f8fafc")
+            elif color_col and color_col in df.columns and x_col and x_col in df.columns and "count" in df.columns:
                 # Grouped bar
                 pivot = df.pivot(index=x_col, columns=color_col, values="count").fillna(0)
                 colors = ["#6366F1", "#EC4899", "#10B981", "#F59E0B"]
@@ -324,7 +416,7 @@ class PlotlyRenderer:
                 ax.hist(df[x_col].dropna(), bins=min(20, max(5, len(df) // 2)), color="#6366F1", edgecolor="#0f172a")
                 ax.set_ylabel("Number of Investors", color="#dbeafe")
             elif chart_type in ("box", "box_plot") and x_col and x_col in df.columns:
-                box_y = y_col if (y_col and y_col in df.columns) else next((c for c in df.columns if c != x_col), None)
+                box_y = y_col if (isinstance(y_col, str) and y_col in df.columns) else next((c for c in df.columns if c != x_col), None)
                 if box_y:
                     groups_data = []
                     labels = []
@@ -341,11 +433,11 @@ class PlotlyRenderer:
                             median.set_linewidth(2)
                     ax.set_ylabel(box_y.replace("_", " ").title(), color="#dbeafe")
             elif chart_type == "scatter" and x_col and x_col in df.columns:
-                actual_y = y_col if (y_col and y_col in df.columns) else next((c for c in df.columns if c != x_col), None)
+                actual_y = y_col if (isinstance(y_col, str) and y_col in df.columns) else next((c for c in df.columns if c != x_col), None)
                 if actual_y:
                     ax.scatter(df[x_col], df[actual_y], color="#06B6D4", alpha=0.85, edgecolors="#1e293b")
                     ax.set_ylabel(actual_y.replace("_", " ").title(), color="#dbeafe")
-            elif chart_type == "pie" and x_col and x_col in df.columns:
+            elif chart_type in ("pie", "donut") and x_col and x_col in df.columns:
                 val_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
                 values = df[val_col] if val_col != x_col else df[x_col].value_counts().values
                 labels = df[x_col].astype(str) if val_col != x_col else df[x_col].value_counts().index.astype(str)

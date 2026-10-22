@@ -219,6 +219,12 @@ USER QUESTION:
         except (ValueError, TypeError):
             bin_width = None
 
+        time_column = data.get("time_column")
+        time_granularity = data.get("time_granularity")
+        series_dimension = data.get("series_dimension")
+        secondary_measure = data.get("secondary_measure")
+        secondary_measure_column = data.get("secondary_measure_column")
+
         # Check explicit visualization terms in question
         q_lower = question.lower()
         explicit_vis = bool(re.search(r"\b(?:chart|plot|graph|visualiz\w*|histogram|scatter|box\s*plot|pie|bar)\b", q_lower))
@@ -250,6 +256,11 @@ USER QUESTION:
             color_by=color_by,
             chart_title=chart_title,
             bin_width=bin_width,
+            time_column=time_column,
+            time_granularity=time_granularity,
+            series_dimension=series_dimension,
+            secondary_measure=secondary_measure,
+            secondary_measure_column=secondary_measure_column,
             is_follow_up=False,
         )
 
@@ -332,7 +343,7 @@ USER QUESTION:
         if bool(re.search(r"\b(?:relationship|versus|vs\.?|against|correlation|scatter)\b", q_lower)):
             numeric_cols = [
                 real for low, real in cols.items()
-                if any(k in low for k in ("quantity", "price", "unitprice", "age", "income", "amount", "return", "sales"))
+                if any(k in low for k in ("quantity", "price", "unitprice", "age", "income", "amount", "return", "sales", "profit", "cost", "value"))
             ]
             if len(numeric_cols) >= 2:
                 contract.intent = "RELATIONSHIP"
@@ -343,6 +354,12 @@ USER QUESTION:
                 contract.suggested_chart_type = "scatter"
                 contract.x_axis = numeric_cols[0]
                 contract.y_axis = numeric_cols[1]
+
+                # Check if colored by category (e.g. "Sales vs Profit by Category")
+                for low, real in cols.items():
+                    if real not in numeric_cols and any(w in q_lower for w in (low, low.replace("_", " "), low.rstrip("s"))):
+                        contract.color_by = real
+                        break
 
         # 5. Handle Distribution / Histogram:
         if bool(re.search(r"\b(?:distribution|histogram|spread)\b", q_lower)):
@@ -372,11 +389,68 @@ USER QUESTION:
                 contract.intent = "TIME_SERIES"
                 contract.answer_type = "GROUPED"
                 contract.time_column = time_col
-                contract.group_by = [time_col]
+
+                # Determine time granularity
+                if any(w in q_lower for w in ("monthly", "month by month", "per month")):
+                    time_grain = "month"
+                elif any(w in q_lower for w in ("yearly", "year by year", "annually", "annual")):
+                    time_grain = "year"
+                elif any(w in q_lower for w in ("quarterly", "per quarter")):
+                    time_grain = "quarter"
+                elif any(w in q_lower for w in ("weekly", "per week")):
+                    time_grain = "week"
+                elif any(w in q_lower for w in ("daily", "day by day", "per day")):
+                    time_grain = "day"
+                else:
+                    time_grain = contract.time_granularity or "month"
+
+                contract.time_granularity = time_grain
+
+                # Check if multi-series line chart (e.g. "monthly sales by category" or "by country")
+                series_dim = None
+                for low, real in cols.items():
+                    if real != time_col and any(w in q_lower for w in (low, low.replace("_", " "), low.rstrip("s"))):
+                        if contract.measure_column and real == contract.measure_column:
+                            continue
+                        series_dim = real
+                        break
+
+                if series_dim:
+                    contract.series_dimension = series_dim
+                    contract.group_by = [time_col, series_dim]
+                else:
+                    contract.group_by = [time_col]
+
                 contract.should_visualize = True
                 contract.suggested_chart_type = "line"
                 contract.x_axis = time_col
                 contract.sort = SortSpec(field=time_col, direction="asc")
+
+        # 8. Handle Part-to-whole / Pie / Donut
+        if bool(re.search(r"\b(?:contribution|share|proportion|part of|pie|donut)\b", q_lower)):
+            contract.should_visualize = True
+            contract.suggested_chart_type = "pie"
+
+        # 9. Handle Top-N Ranking -> Horizontal Bar
+        if asks_ranking or re.search(r"\btop\s+\d+\b", q_lower):
+            contract.should_visualize = True
+            contract.suggested_chart_type = "horizontal_bar"
+
+        # 10. Handle Clustered Multi-Measure Bar: e.g. "sales and profit by category"
+        is_and_question = bool(re.search(r"\band\b", q_lower))
+        if is_and_question and not is_temporal and len(contract.group_by) == 1:
+            matching_numeric = [
+                real for low, real in cols.items()
+                if any(k in low for k in ("sales", "profit", "revenue", "quantity", "price", "cost"))
+                and (low in q_lower or low.replace("_", " ") in q_lower)
+            ]
+            if len(matching_numeric) >= 2:
+                contract.measure = matching_numeric[0]
+                contract.measure_column = matching_numeric[0]
+                contract.secondary_measure = matching_numeric[1]
+                contract.secondary_measure_column = matching_numeric[1]
+                contract.suggested_chart_type = "clustered_bar"
+                contract.should_visualize = True
 
         return contract
 
@@ -405,40 +479,66 @@ USER QUESTION:
                 should_visualize=False,
             )
 
-        # Detect columns in question
+        # Generic column type classification based on schema dtypes and names
+        datetime_cols = []
+        numeric_cols = []
+        cat_cols = []
+        raw_cols_list = schema.get("columns", []) if isinstance(schema, dict) else schema or []
+        for c in raw_cols_list:
+            c_name = c.get("name", "") if isinstance(c, dict) else str(c)
+            c_dtype = str(c.get("dtype", "")).lower() if isinstance(c, dict) else ""
+            if not c_name:
+                continue
+            name_low = c_name.lower()
+            if any(dt in c_dtype for dt in ("date", "time", "timestamp")) or any(k in name_low for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day")):
+                datetime_cols.append(c_name)
+            elif any(nt in c_dtype for nt in ("int", "float", "real", "double", "num", "dec")) or any(k in name_low for k in ("sales", "profit", "revenue", "quantity", "unitprice", "price", "amount", "margin", "cost", "discount", "age", "salary")):
+                numeric_cols.append(c_name)
+            else:
+                cat_cols.append(c_name)
+
+        # Matched columns in order of appearance in question
+        matched_numeric = [col for col in numeric_cols if col.lower() in q_lower or col.lower().replace("_", " ") in q_lower]
+        matched_cat = [col for col in cat_cols if col.lower() in q_lower or col.lower().replace("_", " ") in q_lower or col.lower().rstrip("s") in q_lower]
+
         qty_col = next((real for low, real in cols.items() if any(k in low for k in ("quantity", "qty", "units", "sales_volume"))), None)
         price_col = next((real for low, real in cols.items() if any(k in low for k in ("unitprice", "price", "unit_price", "rate", "cost"))), None)
         cust_col = next((real for low, real in cols.items() if any(k in low for k in ("customer", "client", "user_id"))), None)
         country_col = next((real for low, real in cols.items() if any(k in low for k in ("country", "nation", "region", "location"))), None)
-        date_col = next((real for low, real in cols.items() if any(k in low for k in ("date", "time", "year", "month", "invoicedate"))), None)
+        date_col = datetime_cols[0] if datetime_cols else next((real for low, real in cols.items() if any(k in low for k in ("date", "time", "year", "month", "invoicedate"))), None)
         inv_col = next((real for low, real in cols.items() if any(k in low for k in ("invoiceno", "invoice", "orderid", "order_id", "transaction", "id"))), None)
 
-        # Find any matching categorical column in question
-        matched_cat_col = None
-        for low, real in cols.items():
-            clean_low = low.replace("_", " ")
-            clean_stem = clean_low.rstrip("s")
-            words = [w.rstrip("s") for w in re.findall(r"\b\w+\b", q_lower)]
-            if any(w == clean_stem or clean_stem in w or w == clean_low for w in words):
-                matched_cat_col = real
-                break
+        matched_cat_col = matched_cat[0] if matched_cat else None
 
         # Check ranking: top N
         top_match = re.search(r"\btop\s+(\d+)\b", q_lower)
         limit_val = int(top_match.group(1)) if top_match else None
-        sort_spec = SortSpec(field="metric", direction="desc") if (top_match or "most" in q_lower or "highest" in q_lower) else None
 
         # Check grouping
         asks_grouping = bool(re.search(r"\b(?:by|per|across|for each|each|breakdown by)\b", q_lower)) or bool(top_match)
         group_by = []
         if (asks_grouping or top_match) and (country_col and ("country" in q_lower or "countries" in q_lower)):
             group_by = [country_col]
-        elif (asks_grouping or top_match) and matched_cat_col and matched_cat_col != qty_col and matched_cat_col != price_col:
+        elif (asks_grouping or top_match) and matched_cat_col:
             group_by = [matched_cat_col]
 
+        # Time grain detection
+        time_grain = "month"
+        if any(w in q_lower for w in ("yearly", "year by year", "annually", "annual", "year")):
+            time_grain = "year"
+        elif any(w in q_lower for w in ("quarterly", "per quarter", "quarter")):
+            time_grain = "quarter"
+        elif any(w in q_lower for w in ("weekly", "per week", "week")):
+            time_grain = "week"
+        elif any(w in q_lower for w in ("daily", "day by day", "per day", "day")):
+            time_grain = "day"
+
         # 1. SCATTER / RELATIONSHIP
-        is_scatter = bool(re.search(r"\b(?:relationship|versus|vs\.?)\b", q_lower))
-        if is_scatter and qty_col and price_col:
+        is_scatter = bool(re.search(r"\b(?:relationship|versus|vs\.?|against|correlation)\b", q_lower))
+        if is_scatter:
+            x_c = matched_numeric[0] if len(matched_numeric) >= 1 else (qty_col or "Quantity")
+            y_c = matched_numeric[1] if len(matched_numeric) >= 2 else (price_col or "UnitPrice")
+            col_by = matched_cat[0] if matched_cat else None
             return QueryContract(
                 query_id=query_id,
                 dataset_id=dataset_id,
@@ -447,55 +547,139 @@ USER QUESTION:
                 answer_type="RELATIONSHIP",
                 should_visualize=True,
                 suggested_chart_type="scatter",
-                x_axis=qty_col,
-                y_axis=price_col,
+                x_axis=x_c,
+                y_axis=y_c,
+                color_by=col_by,
             )
 
         # 2. DISTRIBUTION / HISTOGRAM
-        is_dist = bool(re.search(r"\b(?:distribution|histogram)\b", q_lower))
-        if is_dist and qty_col:
+        is_dist = bool(re.search(r"\b(?:distribution|histogram|spread)\b", q_lower))
+        if is_dist:
+            dist_c = matched_numeric[0] if matched_numeric else (qty_col or "Quantity")
             return QueryContract(
                 query_id=query_id,
                 dataset_id=dataset_id,
                 original_query=question,
                 intent="DISTRIBUTION",
                 answer_type="DISTRIBUTION",
-                measure=qty_col,
-                measure_column=qty_col,
-                measure_expression=qty_col,
+                measure=dist_c,
+                measure_column=dist_c,
+                measure_expression=dist_c,
                 should_visualize=True,
                 suggested_chart_type="histogram",
-                x_axis=qty_col,
+                x_axis=dist_c,
             )
 
-        # 3. TIME-BASED TREND
+        # 3. MULTI-MEASURE CLUSTERED BAR (e.g. Show sales and profit by category)
+        if len(matched_numeric) >= 2 and matched_cat:
+            m1 = matched_numeric[0]
+            m2 = matched_numeric[1]
+            cat_dim = matched_cat[0]
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="AGGREGATION",
+                answer_type="GROUPED",
+                measure=m1,
+                measure_column=m1,
+                measure_expression=m1,
+                secondary_measure=m2,
+                secondary_measure_column=m2,
+                aggregation="SUM",
+                dimensions=[cat_dim],
+                group_by=[cat_dim],
+                should_visualize=True,
+                suggested_chart_type="bar",
+                x_axis=cat_dim,
+                y_axis=f"total_{m1.lower()}",
+            )
+
+        # 4. PROPORTION / CONTRIBUTION / PIE
+        is_pie = bool(re.search(r"\b(?:contribution|proportion|share|ratio|pie|donut)\b", q_lower))
+        if is_pie and matched_cat:
+            cat_dim = matched_cat[0]
+            meas_col = matched_numeric[0] if matched_numeric else (qty_col or "Quantity")
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="PROPORTION",
+                answer_type="GROUPED",
+                measure=meas_col,
+                measure_column=meas_col,
+                measure_expression=meas_col,
+                aggregation="SUM",
+                dimensions=[cat_dim],
+                group_by=[cat_dim],
+                should_visualize=True,
+                suggested_chart_type="pie",
+                x_axis=cat_dim,
+                y_axis=f"total_{meas_col.lower()}",
+            )
+
+        # 5. TOP-N RANKING / HORIZONTAL BAR
+        if top_match and (matched_cat or country_col):
+            cat_dim = matched_cat[0] if matched_cat else country_col
+            meas_col = matched_numeric[0] if matched_numeric else (qty_col or "Quantity")
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="RANKING",
+                answer_type="GROUPED",
+                measure=meas_col,
+                measure_column=meas_col,
+                measure_expression=meas_col,
+                aggregation="SUM",
+                dimensions=[cat_dim],
+                group_by=[cat_dim],
+                limit=limit_val,
+                sort=SortSpec(field=f"total_{meas_col.lower()}", direction="desc"),
+                should_visualize=True,
+                suggested_chart_type="horizontal_bar",
+                x_axis=cat_dim,
+                y_axis=f"total_{meas_col.lower()}",
+            )
+
+        # 6. TIME-BASED TREND (Single or Multi-Series)
         is_trend = bool(re.search(
             r"\b(?:over time|changed over time|change over time|trend|trend over time|historical trend|daily|weekly|monthly|quarterly|yearly|annually|month by month|day by day|year by year|sales trend|revenue trend|quantity trend|timeline|trajectory)\b",
             q_lower
         ))
         if is_trend and (date_col or group_by):
-            trend_dim = date_col or (group_by[0] if group_by else None)
-            expr = f'"{qty_col}" * "{price_col}"' if (qty_col and price_col and "revenue" in q_lower) else (qty_col or "metric")
+            trend_dim = date_col or (group_by[0] if group_by else "Date")
+            series_dim = matched_cat[0] if matched_cat else None
+            trend_groups = [trend_dim]
+            if series_dim and series_dim != trend_dim:
+                trend_groups.append(series_dim)
+
+            meas_name = matched_numeric[0] if matched_numeric else ("revenue" if "revenue" in q_lower else (qty_col or "Quantity"))
+            meas_col = matched_numeric[0] if matched_numeric else (f"{qty_col} * {price_col}" if (qty_col and price_col and "revenue" in q_lower) else qty_col)
+            expr = f'"{qty_col}" * "{price_col}"' if (not matched_numeric and qty_col and price_col and "revenue" in q_lower) else meas_col
             return QueryContract(
                 query_id=query_id,
                 dataset_id=dataset_id,
                 original_query=question,
                 intent="TIME_SERIES",
                 answer_type="GROUPED",
-                measure="revenue" if "revenue" in q_lower else "Quantity",
-                measure_column=f"{qty_col} * {price_col}" if (qty_col and price_col and "revenue" in q_lower) else qty_col,
+                measure=meas_name,
+                measure_column=meas_col,
                 measure_expression=expr,
                 aggregation="SUM",
                 time_column=trend_dim,
-                group_by=[trend_dim] if trend_dim else [],
+                time_granularity=time_grain,
+                series_dimension=series_dim,
+                dimensions=trend_groups,
+                group_by=trend_groups,
                 should_visualize=True,
                 suggested_chart_type="line",
                 x_axis=trend_dim,
-                y_axis="total_revenue" if "revenue" in q_lower else "total_quantity",
-                sort=SortSpec(field=trend_dim, direction="asc") if trend_dim else None,
+                y_axis=f"total_{meas_name.lower()}",
+                sort=SortSpec(field=trend_dim, direction="asc"),
             )
 
-        # 4. REVENUE
+        # 7. REVENUE
         is_revenue = bool(re.search(r"\b(?:revenue|turnover|total sales)\b", q_lower))
         if is_revenue:
             expr = f'"{qty_col}" * "{price_col}"' if qty_col and price_col else "revenue"
@@ -518,6 +702,7 @@ USER QUESTION:
                 x_axis=group_by[0] if group_by else None,
                 y_axis="total_revenue" if group_by else None,
             )
+
 
         # 5. TRANSACTIONS / ORDERS / INVOICES
         is_trans = bool(re.search(r"\b(?:transactions?|orders?|invoices?)\b", q_lower))

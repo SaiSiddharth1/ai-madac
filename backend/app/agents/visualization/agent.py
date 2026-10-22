@@ -52,6 +52,7 @@ from app.agents.visualization.contract import QueryContract, extract_query_contr
 from app.agents.visualization.spec_validator import SpecValidator
 from app.agents.visualization.data_preparer import DataPreparer
 from app.agents.visualization.plotly_renderer import PlotlyRenderer
+from app.agents.visualization.quality_gate import VisualizationQualityGate
 from app.core.llm_provider import get_llm
 from app.db.database import sync_engine
 
@@ -359,6 +360,25 @@ class VisualizationAgent:
                 "agents_used": list(set(state.get("agents_used", []) + ["chart_renderer"])),
             }
 
+        # Visualization Quality Gate Evaluation
+        quality_report = VisualizationQualityGate.evaluate(spec, prepared_df, contract)
+        if not quality_report.passed:
+            logger.warning(
+                f"Visualization Quality Gate failed (score={quality_report.score}): {quality_report.critical_errors}. Recommendation: {quality_report.recommendation}"
+            )
+            if quality_report.recommendation == "repair":
+                fallback_spec = SpecValidator.build_deterministic_spec(contract, list(df.columns))
+                spec = fallback_spec
+                prepared_df, applied_params, insights = DataPreparer.prepare(df, spec)
+                quality_report = VisualizationQualityGate.evaluate(spec, prepared_df, contract)
+
+            if not quality_report.passed:
+                reason = "Chart failed visual quality validation: " + "; ".join(quality_report.critical_errors)
+                return {
+                    "visualization_result": self._empty_visualization_result(reason),
+                    "agents_used": list(set(state.get("agents_used", []) + ["chart_renderer"])),
+                }
+
         try:
             plotly_fig, chart_title, chart_path, json_path = PlotlyRenderer.render(
                 prepared_df, spec, question
@@ -411,6 +431,7 @@ class VisualizationAgent:
             "chart_json": chart_json_dict,
             "chart_jsons": [chart_path.replace(".png", ".json")],
             "titles": [chart_title],
+            "quality_score": round(quality_report.score, 2),
         }
 
         return {
