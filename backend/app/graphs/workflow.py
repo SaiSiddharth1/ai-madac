@@ -69,6 +69,10 @@ async def sql_node(state: AgentState) -> dict[str, Any]:
     errors = res.get("errors", [])
     if errors:
         await workflow_event_manager.emit(query_id, "sql_agent", "failed", f"SQL execution error: {errors[0]}")
+        plan = state.get("execution_plan", [])
+        for viz_agent in ("visualization_agent", "visualization_validator", "chart_renderer"):
+            if viz_agent in plan:
+                await workflow_event_manager.emit(query_id, viz_agent, "skipped", "Skipped due to upstream SQL execution failure")
     else:
         await workflow_event_manager.emit(query_id, "sql_agent", "completed", "Data retrieved successfully")
     return res

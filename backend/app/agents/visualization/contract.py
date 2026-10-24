@@ -40,17 +40,28 @@ SEMANTIC_ALIASES: dict[str, list[str]] = {
     "age": ["age", "investor age", "investor's age", "years old", "age group", "age distribution"],
     "income": [
         "income", "annual income", "annual_income", "salary", "earnings", "revenue",
-        "household income", "monthly income"
+        "household income", "monthly income", "monthly_income", "monthly salary", "pay", "compensation"
     ],
-    "department": ["department", "dept", "division", "team", "unit"],
+    "job_role": [
+        "job_role", "job role", "job roles", "role", "roles", "position", "positions",
+        "title", "job title", "designation", "profession", "occupation"
+    ],
+    "job_level": ["job_level", "job level", "level", "seniority", "grade", "rank"],
+    "department": ["department", "dept", "division", "team", "unit", "business unit"],
     "status": ["status", "state", "condition", "stage"],
-    "product": ["product", "item", "sku", "product line", "product category"],
+    "product": ["product", "item", "sku", "product line", "product category", "product name"],
+    "category": ["category", "categories", "segment", "type", "classification", "group"],
     "region": ["region", "area", "zone", "location", "territory", "geography"],
     "city": ["city", "town", "metro", "municipality"],
     "state": ["state", "province"],
     "country": ["country", "nation"],
-    "date": ["date", "year", "month", "day", "quarter", "period", "timestamp", "time"],
+    "customer": ["customer", "customers", "client", "clients", "buyer", "buyers", "customer id", "customer name"],
+    "order": ["order", "orders", "transaction", "transactions", "invoice", "invoices", "order id"],
     "sales": ["sales", "revenue", "turnover", "total sales", "gross sales", "amount"],
+    "profit": ["profit", "earnings", "net profit", "margin", "gain"],
+    "quantity": ["quantity", "units", "units sold", "volume", "qty", "count"],
+    "discount": ["discount", "markdown", "rebate", "concession"],
+    "date": ["date", "year", "month", "day", "quarter", "period", "timestamp", "time", "order date", "ship date"],
 }
 
 
@@ -261,7 +272,8 @@ def is_visualization_requested(question: str, intent: str = "") -> bool:
 
 def normalize_term(term: str) -> str:
     """Normalize a column name or query phrase for robust semantic matching."""
-    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", term.lower())
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", term)
+    cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", s.lower())
     return " ".join(cleaned.split())
 
 

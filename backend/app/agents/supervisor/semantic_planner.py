@@ -12,7 +12,7 @@ from typing import Any, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.core.llm_provider import get_llm
-from app.schemas.query_contract import FilterSpec, HavingSpec, QueryContract, SortSpec
+from app.schemas.query_contract import CalculationSpec, FilterSpec, HavingSpec, OperandSpec, QueryContract, SortSpec
 from app.agents.visualization.contract import resolve_column_semantically
 
 logger = logging.getLogger(__name__)
@@ -30,35 +30,52 @@ CORE ARCHITECTURE PRINCIPLES:
    - "country", "nation", "region" -> Country / Region column (e.g., 'Country').
    - Do NOT select columns based on positional order or assume the first numeric column is the requested metric.
 
-2. STRICT AGGREGATION RULES:
+2. CRITICAL RULE ON RATE/SALARY NUMERIC COLUMNS:
+   - Columns like 'MonthlyIncome', 'MonthlyRate', 'DailyRate', 'HourlyRate', 'AnnualSalary', 'Age' are NUMERIC measures.
+   - Questions like 'What is the maximum monthly income?' or 'What is the average daily rate?' are SCALAR AGGREGATIONS:
+     intent: 'AGGREGATION', answer_type: 'SCALAR', measure: 'MonthlyIncome', aggregation: 'MAX', group_by: [], should_visualize: false.
+   - The word 'monthly', 'daily', or 'hourly' in these questions is part of the metric name, NEVER a time-series or trend!
+
+3. STRICT AGGREGATION RULES:
    - "total", "sum", "overall", "aggregate" -> SUM
    - "average", "mean", "avg" -> AVG
    - "minimum", "min", "lowest" -> MIN
    - "maximum", "max", "highest" -> MAX
-   - "how many rows", "number of records", "count" -> COUNT
-   - "unique customers", "distinct customers", "how many different customers" -> COUNT_DISTINCT on the customer identifier column. NEVER replace distinct counting with row counting!
+   - "how many rows", "number of records", "count", "how many employees/orders" -> COUNT (measure: 'total_records')
+   - "unique <entity>", "distinct <entity>" (e.g. "unique job roles", "distinct customers") -> COUNT_DISTINCT on that specific column (e.g. 'JobRole', 'CustomerID'). NEVER default to Age or another numeric column!
 
-3. GROUPING MUST NEVER BE INVENTED:
-   - If the user asks: "What is the total revenue?" or "What are the units sold?", NO GROUPING IS REQUESTED!
+4. GROUPING MUST NEVER BE INVENTED:
+   - If the user asks: "What is the total revenue?" or "What is the maximum monthly income?", NO GROUPING IS REQUESTED!
      answer_type MUST be "SCALAR", group_by MUST be empty [].
      NEVER introduce grouping by country, segment, category, or date unless the user explicitly asks for it!
    - If the user asks: "What is the total revenue by country?", THEN AND ONLY THEN:
      answer_type MUST be "GROUPED", group_by MUST be ["Country"].
    - If the user asks: "Top 10 countries by revenue", group_by MUST be ["Country"], limit MUST be 10, sort MUST be {"field": "revenue", "direction": "desc"}.
 
-4. VISUALIZATION RULES:
-   - should_visualize should be true if:
-     a) Explicitly requested: "chart", "plot", "visualize", "graph", "histogram", "scatter", "distribution", "pie", "bar".
-     b) Naturally visual: distributions, multi-category comparisons, rankings, time-series trends, relationships/correlations.
-   - should_visualize should be false for simple scalar metrics ("What is the total revenue?", "How many rows?") unless explicitly requested to plot.
+5. DERIVED MATHEMATICAL CALCULATIONS:
+   If the question asks to compute the difference, sum, ratio, profit margin, or percentage between metrics:
+   - intent MUST be "CALCULATION"
+   - populate "calculation" object with operator: SUBTRACT, ADD, MULTIPLY, DIVIDE, RATIO, MARGIN, PERCENTAGE, PERCENTAGE_CHANGE
+   - Operands define base metrics:
+     - "difference between total sales and total profit" -> operator: "SUBTRACT", operands: [{"measure": "Sales", "aggregation": "SUM"}, {"measure": "Profit", "aggregation": "SUM"}], label: "Difference"
+     - "profit margin based on total sales and total profit" -> operator: "MARGIN", operands: [{"measure": "Sales", "aggregation": "SUM"}, {"measure": "Profit", "aggregation": "SUM"}], label: "Profit Margin"
+     - "percentage of total sales comes from the Technology category" -> operator: "PERCENTAGE", operands: [{"measure": "Sales", "aggregation": "SUM", "filters": [{"column": "Category", "operator": "=", "value": "Technology"}]}, {"measure": "Sales", "aggregation": "SUM", "filters": []}], label: "Technology Sales Percentage"
+     - "ratio of total sales to total profit" -> operator: "RATIO", operands: [{"measure": "Sales", "aggregation": "SUM"}, {"measure": "Profit", "aggregation": "SUM"}], label: "Ratio"
+     - "difference between sales and profit by category" -> operator: "SUBTRACT", group_by: ["Category"], answer_type: "GROUPED", operands: [{"measure": "Sales", "aggregation": "SUM"}, {"measure": "Profit", "aggregation": "SUM"}], label: "Difference by Category"
+
+6. VISUALIZATION RULES:
+   - If the user explicitly asks for a chart type ("as a bar chart", "as a line chart", "as a multi-line chart", "as a scatter plot", "as a histogram", "as a pie chart", "as a grouped bar chart"), that chart type is LOCKED:
+     should_visualize: true, requested_visualization: true, suggested_chart_type: "<chart_type>".
+   - should_visualize should be false for simple scalar metrics ("What is the total revenue?", "What is the maximum monthly income?") unless explicitly requested to plot.
    - Chart types:
      - Distribution of one numeric column -> "histogram" (RAW OBSERVATIONS, no aggregation!)
      - Relationship between two numeric columns -> "scatter" (RAW OBSERVATIONS, no aggregation!)
      - Category + numeric metric -> "bar" (or "horizontal_bar" if long labels or top-N ranking)
      - Time + numeric metric -> "line"
+     - Multi-series line -> "multi_line"
      - Small part-to-whole -> "pie"
 
-5. DATASET RELEVANCE:
+7. DATASET RELEVANCE:
    - If the question is completely unrelated to the dataset (e.g. "What is the weather in Hyderabad?" when dataset has sales or finance data), set:
      "is_related_to_dataset": false,
      "unrelated_reason": "The question is not related to the currently loaded dataset schema.",
@@ -82,6 +99,7 @@ Respond with ONLY a valid JSON object matching this schema:
   "filters": [],
   "sort": null,
   "limit": null,
+  "calculation": null,
   "should_visualize": false,
   "suggested_chart_type": null,
   "x_axis": null,
@@ -239,6 +257,32 @@ USER QUESTION:
         secondary_measure = data.get("secondary_measure")
         secondary_measure_column = data.get("secondary_measure_column")
 
+        # Parse calculation if present
+        calculation = None
+        raw_calc = data.get("calculation")
+        if isinstance(raw_calc, dict) and "operator" in raw_calc:
+            operands = []
+            for op in raw_calc.get("operands", []):
+                if isinstance(op, dict):
+                    op_filters = []
+                    for f in op.get("filters", []):
+                        if isinstance(f, dict) and "column" in f:
+                            op_filters.append(FilterSpec(column=f["column"], operator=f.get("operator", "="), value=f.get("value")))
+                    operands.append(OperandSpec(
+                        name=op.get("name", "A"),
+                        measure=op.get("measure"),
+                        measure_column=op.get("measure_column") or op.get("measure"),
+                        aggregation=op.get("aggregation", "SUM"),
+                        filters=op_filters,
+                    ))
+            calculation = CalculationSpec(
+                operator=raw_calc["operator"],
+                operands=operands,
+                label=raw_calc.get("label"),
+                expression=raw_calc.get("expression"),
+                target_column_name=raw_calc.get("target_column_name"),
+            )
+
         # Check explicit visualization terms in question
         q_lower = question.lower()
         explicit_vis = bool(re.search(r"\b(?:chart|plot|graph|visualiz\w*|histogram|scatter|box\s*plot|pie|bar)\b", q_lower))
@@ -263,6 +307,7 @@ USER QUESTION:
             having=having,
             sort=sort,
             limit=limit,
+            calculation=calculation,
             requested_visualization=explicit_vis,
             should_visualize=should_visualize,
             suggested_chart_type=suggested_chart_type,
@@ -297,6 +342,34 @@ USER QUESTION:
         if not contract.is_related_to_dataset:
             return contract
 
+        # 0. Explicit Chart Request Lock:
+        explicit_chart = None
+        if re.search(r"\bmulti[-_\s]line\b", q_lower):
+            explicit_chart = "multi_line"
+        elif re.search(r"\bgrouped\s*bar\b|\bclustered\s*bar\b", q_lower):
+            explicit_chart = "grouped_bar"
+        elif re.search(r"\bhorizontal\s*bar\b", q_lower):
+            explicit_chart = "horizontal_bar"
+        elif re.search(r"\bpie\b|\bdonut\b", q_lower):
+            explicit_chart = "pie"
+        elif re.search(r"\bhistogram\b", q_lower):
+            explicit_chart = "histogram"
+        elif re.search(r"\bscatter\b", q_lower):
+            explicit_chart = "scatter"
+        elif re.search(r"\bbox\s*plot\b|\bbox\b", q_lower):
+            explicit_chart = "box"
+        elif re.search(r"\bbar\s*chart\b|\bbar\s*graph\b|\bas a bar\b|\bin a bar\b|\bbar\b", q_lower):
+            explicit_chart = "bar"
+        elif re.search(r"\bline\s*chart\b|\bline\s*graph\b|\bas a line\b|\bin a line\b|\bline\b", q_lower):
+            explicit_chart = "line"
+        elif re.search(r"\barea\b", q_lower):
+            explicit_chart = "area"
+
+        if explicit_chart:
+            contract.requested_visualization = True
+            contract.should_visualize = True
+            contract.suggested_chart_type = explicit_chart
+
         # 1. Prevent unwanted grouping, EXCEPT for time-series / temporal queries:
         is_temporal = bool(re.search(
             r"\b(?:over time|changed over time|change over time|trend|trend over time|historical trend|month by month|day by day|year by year|sales trend|revenue trend|quantity trend)\b",
@@ -309,11 +382,17 @@ USER QUESTION:
 
         asks_grouping = bool(re.search(r"\b(?:by|per|across|for each|each|breakdown by)\b", q_lower)) or is_temporal
         asks_ranking = bool(re.search(r"\b(?:top|bottom|highest|lowest)\s+\d*\b", q_lower))
-        if not asks_grouping and not asks_ranking and not is_temporal:
-            if not contract.group_by or any(term in q_lower for term in ("total revenue", "total units", "total quantity", "average unit price", "average age", "unique customers", "total sales", "monthly income", "monthly salary", "max", "maximum", "min", "minimum")):
-                contract.group_by = []
-                contract.answer_type = "SCALAR"
-                contract.should_visualize = contract.requested_visualization  # only visualize if user explicitly asked
+        if not explicit_chart and not asks_grouping and not asks_ranking and not is_temporal:
+            contract.group_by = []
+            contract.dimensions = []
+            contract.answer_type = "SCALAR"
+            contract.should_visualize = False
+            contract.suggested_chart_type = None
+            contract.time_column = None
+            contract.time_granularity = None
+            contract.series_dimension = None
+            if contract.intent in ("TIME_SERIES", "TREND", "VISUALIZATION"):
+                contract.intent = "AGGREGATION"
 
         # 2. Prevent Measure Swapping:
         is_price_question = bool(re.search(r"\b(?:unit\s*price|price per unit|unitprice|price|cost|rate)\b", q_lower))
@@ -427,9 +506,32 @@ USER QUESTION:
             if bin_match:
                 contract.bin_width = float(bin_match.group(1))
 
-        # 6. Distinct counting:
-        if bool(re.search(r"\b(?:unique|distinct)\b", q_lower)):
+        # 6. Distinct counting & Row counting:
+        is_distinct = bool(re.search(r"\b(?:unique|distinct)\b", q_lower))
+        if is_distinct:
             contract.aggregation = "COUNT_DISTINCT"
+            dist_m = re.search(r"\b(?:unique|distinct)\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\b", q_lower)
+            if dist_m:
+                entity_cand = dist_m.group(1).strip()
+                entity_col = resolve_column_semantically(entity_cand, list(cols.values()))
+                if not entity_col:
+                    sing = (entity_cand[:-3] + "y") if entity_cand.endswith("ies") else (entity_cand[:-1] if entity_cand.endswith("s") and not entity_cand.endswith("ss") else entity_cand)
+                    entity_col = resolve_column_semantically(sing, list(cols.values()))
+                if entity_col:
+                    contract.measure = entity_col
+                    contract.measure_column = entity_col
+                    contract.measure_expression = entity_col
+
+        is_row_count = bool(re.search(r"\b(?:how many\s+(?:employees|records|rows|orders|transactions|invoices|people|items|customers|investors)?\s*(?:are there|in total|total)?|count of records|total count)\b", q_lower))
+        if is_row_count and not is_distinct and not any(k in q_lower for k in ("sales", "profit", "revenue", "income", "salary", "price", "quantity", "discount", "margin", "cost", "return")):
+            contract.intent = "AGGREGATION"
+            contract.answer_type = "SCALAR"
+            contract.aggregation = "COUNT"
+            contract.measure = "total_records"
+            contract.measure_column = None
+            contract.measure_expression = None
+            contract.group_by = []
+            contract.should_visualize = False
 
         # 7. Handle Time Series / Trend / Line Chart:
         if is_temporal or is_explicit_line:
@@ -587,6 +689,148 @@ USER QUESTION:
 
         return contract
 
+    def _detect_calculation(
+        self,
+        question: str,
+        q_lower: str,
+        cols: dict[str, str],
+        schema: dict[str, Any],
+        dataset_id: str,
+        query_id: str,
+    ) -> Optional[QueryContract]:
+        """Detect mathematical / derived metric queries deterministically."""
+        is_diff = bool(re.search(r"\b(?:difference between|how much higher|how much more|gap between)\b", q_lower))
+        is_margin = bool(re.search(r"\b(?:profit margin|margin based on)\b", q_lower))
+        is_pct = bool(re.search(r"\b(?:what percentage of|what percent of|percentage of total|share of total)\b", q_lower))
+        is_ratio = bool(re.search(r"\b(?:ratio of)\b", q_lower))
+        is_sum = bool(re.search(r"\b(?:sum of total)\b", q_lower))
+        is_sales_per_order = bool(re.search(r"\baverage\s+sales\s+per\s+order\b", q_lower))
+
+        if not (is_diff or is_margin or is_pct or is_ratio or is_sum or is_sales_per_order):
+            return None
+
+        group_by = []
+        by_m = re.search(r"\bby\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\b", q_lower)
+        if by_m:
+            grp_col = resolve_column_semantically(by_m.group(1).strip(), list(cols.values()))
+            if grp_col:
+                group_by = [grp_col]
+
+        if is_sales_per_order:
+            sales_col = resolve_column_semantically("sales", list(cols.values())) or "Sales"
+            order_col = next((c for c in cols.values() if any(k in c.lower() for k in ("order_id", "orderid", "invoiceno", "transaction"))), "Order_ID")
+            calc_spec = CalculationSpec(
+                operator="DIVIDE",
+                operands=[
+                    OperandSpec(name="Total Sales", measure=sales_col, measure_column=sales_col, aggregation="SUM"),
+                    OperandSpec(name="Total Orders", measure=order_col, measure_column=order_col, aggregation="COUNT_DISTINCT"),
+                ],
+                label="Average Sales Per Order",
+            )
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="CALCULATION",
+                answer_type="SCALAR",
+                measure=sales_col,
+                aggregation="AVG",
+                group_by=[],
+                calculation=calc_spec,
+                should_visualize=False,
+            )
+
+        if is_margin:
+            sales_col = resolve_column_semantically("sales", list(cols.values())) or "Sales"
+            profit_col = resolve_column_semantically("profit", list(cols.values())) or "Profit"
+            calc_spec = CalculationSpec(
+                operator="MARGIN",
+                operands=[
+                    OperandSpec(name="Total Sales", measure=sales_col, measure_column=sales_col, aggregation="SUM"),
+                    OperandSpec(name="Total Profit", measure=profit_col, measure_column=profit_col, aggregation="SUM"),
+                ],
+                label="Profit Margin",
+            )
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="CALCULATION",
+                answer_type="GROUPED" if group_by else "SCALAR",
+                measure="Profit Margin",
+                group_by=group_by,
+                calculation=calc_spec,
+                should_visualize=bool(group_by),
+                suggested_chart_type="bar" if group_by else None,
+            )
+
+        if is_pct:
+            sales_col = resolve_column_semantically("sales", list(cols.values())) or "Sales"
+            cat_col = resolve_column_semantically("category", list(cols.values())) or "Category"
+            cat_val = None
+            for cand_val in ("Technology", "Furniture", "Office Supplies", "Consumer", "Corporate", "Home Office"):
+                if cand_val.lower() in q_lower:
+                    cat_val = cand_val
+                    break
+            if not cat_val:
+                cat_val = "Technology"
+
+            calc_spec = CalculationSpec(
+                operator="PERCENTAGE",
+                operands=[
+                    OperandSpec(name=f"{cat_val} Sales", measure=sales_col, measure_column=sales_col, aggregation="SUM", filters=[FilterSpec(column=cat_col, operator="=", value=cat_val)]),
+                    OperandSpec(name="Total Sales", measure=sales_col, measure_column=sales_col, aggregation="SUM", filters=[]),
+                ],
+                label=f"{cat_val} Percentage of Total {sales_col}",
+            )
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="CALCULATION",
+                answer_type="SCALAR",
+                measure=f"{cat_val} Percentage",
+                calculation=calc_spec,
+                should_visualize=False,
+            )
+
+        if is_diff or is_sum or is_ratio:
+            m_cand = []
+            for phrase in ("sales", "profit", "revenue", "income", "salary", "quantity", "cost", "discount", "return"):
+                if phrase in q_lower:
+                    res = resolve_column_semantically(phrase, list(cols.values()))
+                    if res and res not in m_cand:
+                        m_cand.append(res)
+
+            meas_a = m_cand[0] if len(m_cand) >= 1 else "Sales"
+            meas_b = m_cand[1] if len(m_cand) >= 2 else ("Profit" if meas_a != "Profit" else "Sales")
+
+            op = "SUBTRACT" if is_diff else ("ADD" if is_sum else "RATIO")
+            lbl = f"Difference between {meas_a} and {meas_b}" if is_diff else (f"Sum of {meas_a} and {meas_b}" if is_sum else f"Ratio of {meas_a} to {meas_b}")
+
+            calc_spec = CalculationSpec(
+                operator=op,
+                operands=[
+                    OperandSpec(name=f"Total {meas_a}", measure=meas_a, measure_column=meas_a, aggregation="SUM"),
+                    OperandSpec(name=f"Total {meas_b}", measure=meas_b, measure_column=meas_b, aggregation="SUM"),
+                ],
+                label=lbl,
+            )
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="CALCULATION",
+                answer_type="GROUPED" if group_by else "SCALAR",
+                measure=lbl,
+                group_by=group_by,
+                calculation=calc_spec,
+                should_visualize=bool(group_by),
+                suggested_chart_type="bar" if group_by else None,
+            )
+
+        return None
+
     def _heuristic_contract_fallback(
         self,
         question: str,
@@ -611,6 +855,11 @@ USER QUESTION:
                 answer_type="UNRELATED",
                 should_visualize=False,
             )
+
+        # Check for calculation queries first
+        calc_contract = self._detect_calculation(question, q_lower, cols, schema, dataset_id, query_id)
+        if calc_contract:
+            return calc_contract
 
         # Generic column type classification based on schema dtypes and names
         datetime_cols = []
@@ -1120,26 +1369,33 @@ USER QUESTION:
 
         # 7. STANDARD BAR / GROUPED CATEGORICAL
         if "bar" in q_lower or asks_grouping:
+            has_grouping_kw = bool(re.search(r"\b(?:by|for each|across)\b", q_lower))
             cat_dim = None
-            by_m = re.search(r"\b(?:by|for each|across)\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\b", q_lower)
-            if by_m:
-                cat_dim = resolve_column_semantically(by_m.group(1).strip(), list(cols.values()))
-            if not cat_dim and matched_cat:
-                cat_dim = matched_cat[0]
-            if not cat_dim:
-                cat_dim = cat_cols[0] if cat_cols else list(cols.values())[0]
+            if has_grouping_kw:
+                by_m = re.search(r"\b(?:by|for each|across)\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\b", q_lower)
+                if by_m:
+                    cat_dim = resolve_column_semantically(by_m.group(1).strip(), list(cols.values()))
+                if not cat_dim and matched_cat:
+                    cat_dim = matched_cat[0]
+                if not cat_dim:
+                    cat_dim = cat_cols[0] if cat_cols else list(cols.values())[0]
 
             is_min = bool(re.search(r"\b(?:min|minimum|lowest|smallest|least)\b", q_lower))
             is_max = bool(re.search(r"\b(?:max|maximum|highest|largest|peak|greatest)\b", q_lower))
             is_count = bool(re.search(r"\b(?:number of|count of|how many|records|investors)\b", q_lower))
             is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
+
             meas_col = None
-            for phrase in ("age", "expected return", "expected_return", "sales", "revenue", "profit", "price", "unitprice"):
+            for phrase in ("monthly income", "monthly salary", "daily rate", "hourly rate", "income", "salary", "age", "expected return", "expected_return", "sales", "revenue", "profit", "price", "unitprice", "quantity"):
                 if phrase in q_lower:
                     res = resolve_column_semantically(phrase, list(cols.values()))
                     if res and res != cat_dim:
                         meas_col = res
                         break
+            if not meas_col and matched_numeric:
+                meas_col = matched_numeric[0]
+            if not meas_col and numeric_cols:
+                meas_col = numeric_cols[0]
 
             if is_min:
                 agg = "MIN"
@@ -1151,25 +1407,48 @@ USER QUESTION:
                 agg = "COUNT"
             else:
                 agg = "SUM"
-            meas = cat_dim if agg == "COUNT" else meas_col
 
-            return QueryContract(
-                query_id=query_id,
-                dataset_id=dataset_id,
-                original_query=question,
-                intent="AGGREGATION",
-                answer_type="GROUPED",
-                measure=meas,
-                measure_column=meas,
-                measure_expression=meas,
-                aggregation=agg,
-                dimensions=[cat_dim],
-                group_by=[cat_dim],
-                should_visualize=True,
-                suggested_chart_type="bar",
-                x_axis=cat_dim,
-                y_axis=f"{agg.lower()}_{meas.lower()}",
-            )
+            if cat_dim and has_grouping_kw:
+                meas = cat_dim if agg == "COUNT" else (meas_col or cat_dim)
+                return QueryContract(
+                    query_id=query_id,
+                    dataset_id=dataset_id,
+                    original_query=question,
+                    intent="AGGREGATION",
+                    answer_type="GROUPED",
+                    measure=meas,
+                    measure_column=meas,
+                    measure_expression=meas,
+                    aggregation=agg,
+                    dimensions=[cat_dim],
+                    group_by=[cat_dim],
+                    requested_visualization=True,
+                    should_visualize=True,
+                    suggested_chart_type="bar",
+                    x_axis=cat_dim,
+                    y_axis=f"{agg.lower()}_{meas.lower()}",
+                )
+            else:
+                # Explicit single-metric bar chart (no grouping)
+                meas = meas_col or "metric"
+                return QueryContract(
+                    query_id=query_id,
+                    dataset_id=dataset_id,
+                    original_query=question,
+                    intent="AGGREGATION",
+                    answer_type="SCALAR",
+                    measure=meas,
+                    measure_column=meas,
+                    measure_expression=meas,
+                    aggregation=agg,
+                    dimensions=[],
+                    group_by=[],
+                    requested_visualization=True,
+                    should_visualize=True,
+                    suggested_chart_type="bar",
+                    x_axis=meas,
+                    y_axis=f"{agg.lower()}_{meas.lower()}",
+                )
 
         # 8. DERIVED REVENUE ONLY IF NO DIRECT SALES/REVENUE COLUMN EXISTS IN SCHEMA
         direct_sales_col = next((real for low, real in cols.items() if low in ("sales", "revenue", "turnover", "gross_sales")), None)

@@ -32,15 +32,21 @@ def get_llm(
     """
     configured_provider = (provider or settings.LLM_PROVIDER or "").lower()
 
-    # If OpenAI is configured/requested but key is missing while Google API key exists, switch to Google
-    if configured_provider == "openai" and (not settings.OPENAI_API_KEY or settings.OPENAI_API_KEY == "sk-your-openai-key") and settings.GOOGLE_API_KEY:
-        logger.info("OPENAI_API_KEY is not configured, but GOOGLE_API_KEY is present. Using Google Gemini provider.")
+    openai_is_invalid = (
+        not settings.OPENAI_API_KEY
+        or "your" in settings.OPENAI_API_KEY.lower()
+        or settings.OPENAI_API_KEY.startswith("sk-your")
+        or len(settings.OPENAI_API_KEY) < 20
+    )
+    # If OpenAI is configured/requested but key is missing/dummy while Google API key exists, switch to Google
+    if configured_provider == "openai" and openai_is_invalid and settings.GOOGLE_API_KEY:
+        logger.info("OPENAI_API_KEY is not configured or dummy, but GOOGLE_API_KEY is present. Using Google Gemini provider.")
         selected_provider = "google"
     elif configured_provider in ("google", "gemini"):
         selected_provider = "google"
     elif configured_provider == "anthropic":
         selected_provider = "anthropic"
-    elif configured_provider == "openai":
+    elif configured_provider == "openai" and not openai_is_invalid:
         selected_provider = "openai"
     else:
         # Default to google if GOOGLE_API_KEY is present, else openai

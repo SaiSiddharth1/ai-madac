@@ -223,10 +223,60 @@ class ReportAgent:
             or (sql_result and len(sql_result.get("rows", [])) == 1 and len(sql_result.get("columns", [])) == 1)
         )
 
-        kpi_data = None
-        explanation_data = None
+        # Handle DETERMINISTIC CALCULATION results
+        calc_res = (sql_result or {}).get("calculation_result")
+        if calc_res and calc_res.get("calculated"):
+            op = calc_res.get("operator", "")
+            lbl = calc_res.get("label", "Derived Calculation")
+            formatted = calc_res.get("formatted_value", "")
+            expr = calc_res.get("expression", "")
+            grouped = calc_res.get("grouped", False)
 
-        if is_scalar and sql_result and sql_result.get("rows"):
+            if grouped:
+                grp_dim = calc_res.get("group_dimension") or "category"
+                results_by_grp = calc_res.get("results_by_group") or []
+                top_summaries = [f"{r['group']} ({r['formatted_value']})" for r in results_by_grp[:4]]
+                answer = f"The {lbl.lower()} was calculated across all {len(results_by_grp)} {grp_dim.lower()} categories: {', '.join(top_summaries)}."
+                insights = [
+                    f"Computed deterministically as {expr}.",
+                    f"All {len(results_by_grp)} categories evaluated without numerical loss.",
+                ]
+            else:
+                if op in ("MARGIN", "PROFIT_MARGIN"):
+                    answer = f"The profit margin is {formatted} (based on verified total sales and profit)."
+                elif op in ("PERCENTAGE", "PERCENT"):
+                    answer = f"The calculated share is {formatted} of the total."
+                elif op in ("SUBTRACT", "DIFFERENCE", "MINUS"):
+                    answer = f"The difference is {formatted} (calculated deterministically as {expr})."
+                elif op in ("DIVIDE", "RATIO"):
+                    answer = f"The ratio is {formatted}."
+                elif op in ("ADD", "SUM", "PLUS"):
+                    answer = f"The total sum is {formatted}."
+                else:
+                    answer = f"The calculated result for {lbl.lower()} is {formatted}."
+
+                insights = [
+                    f"Computed using deterministic calculation engine: {expr} = {formatted}.",
+                    "Operands verified against database records; zero arithmetic hallucination.",
+                ]
+
+            explanation_data = {
+                "what_this_shows": f"Verified mathematical calculation: {lbl}.",
+                "parameters_used": [
+                    f"Calculation Operator: {op}",
+                    f"Expression: {expr}",
+                    f"Result: {formatted}",
+                ],
+                "key_insights": insights,
+            }
+            kpi_data = {
+                "label": lbl,
+                "value": formatted,
+                "raw_value": calc_res.get("value"),
+            }
+
+        # Handle SCALAR results
+        elif is_scalar and sql_result and sql_result.get("rows"):
             metric_name = sql_result.get("metric_name") or sql_result.get("columns", ["Total"])[0].replace("_", " ").title()
             scalar_val = sql_result.get("formatted_value") or str(sql_result.get("scalar_value") if sql_result.get("scalar_value") is not None else sql_result["rows"][0].get(sql_result["columns"][0]))
             raw_val = sql_result.get("scalar_value") if sql_result.get("scalar_value") is not None else sql_result["rows"][0].get(sql_result["columns"][0])

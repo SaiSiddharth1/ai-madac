@@ -22,6 +22,22 @@ class HavingSpec(BaseModel):
     value: Any
 
 
+class OperandSpec(BaseModel):
+    name: str = "A"
+    measure: Optional[str] = None
+    measure_column: Optional[str] = None
+    aggregation: Optional[str] = "SUM"
+    filters: list[FilterSpec] = Field(default_factory=list)
+
+
+class CalculationSpec(BaseModel):
+    operator: str  # SUBTRACT, ADD, MULTIPLY, DIVIDE, RATIO, PERCENTAGE, PERCENTAGE_CHANGE, MARGIN
+    operands: list[OperandSpec] = Field(default_factory=list)
+    expression: Optional[str] = None
+    label: Optional[str] = None
+    target_column_name: Optional[str] = None
+
+
 class SortSpec(BaseModel):
     field: str
     direction: str = "desc"  # 'asc' or 'desc'
@@ -56,6 +72,7 @@ class QueryContract(BaseModel):
     having: list[HavingSpec] = Field(default_factory=list)
     sort: Optional[SortSpec] = None
     limit: Optional[int] = None
+    calculation: Optional[CalculationSpec] = None
 
     # Visualization fields
     requested_visualization: bool = False

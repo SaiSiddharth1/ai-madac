@@ -211,6 +211,20 @@ class SQLAgent:
                 else:
                     formatted_value = str(raw_val)
 
+            # Deterministic calculation layer
+            calc_result_dict = None
+            if contract.calculation:
+                from app.analytics.calculation_engine import CalculationEngine
+                df, calc_res = CalculationEngine.compute_from_dataframe(df, contract.calculation)
+                if calc_res:
+                    calc_result_dict = calc_res.model_dump()
+                    if not calc_res.grouped and calc_res.value is not None:
+                        scalar_value = calc_res.value
+                        formatted_value = calc_res.formatted_value
+                        metric_name = calc_res.label
+                columns = df.columns.tolist()
+                rows = to_json_safe(df)
+
             result_data = {
                 "query": sql_query,
                 "source_question": question,
@@ -223,6 +237,7 @@ class SQLAgent:
                 "scalar_value": scalar_value,
                 "formatted_value": formatted_value,
                 "metric_name": metric_name,
+                "calculation_result": calc_result_dict,
             }
 
             validated_result = {
@@ -240,6 +255,7 @@ class SQLAgent:
                 "scalar_value": scalar_value,
                 "formatted_value": formatted_value,
                 "metric_name": metric_name,
+                "calculation_result": calc_result_dict,
             }
 
             return {
@@ -320,6 +336,56 @@ class SQLAgent:
                     where_conditions.append(f"{col_q} {sql_op} '{safe_val}'")
             elif val is not None:
                 where_conditions.append(f"{col_q} {sql_op} {val}")
+
+        # 0. CALCULATION SPECIFICATION
+        if contract.calculation and contract.calculation.operands:
+            calc = contract.calculation
+            select_items = []
+            not_nulls = []
+
+            # Add group dimensions if grouped
+            if contract.group_by:
+                for g in contract.group_by:
+                    g_q = quote_col(g)
+                    select_items.append(g_q)
+                    not_nulls.append(f"{g_q} IS NOT NULL")
+
+            for i, op in enumerate(calc.operands):
+                op_meas = op.measure_column or op.measure
+                op_q = quote_col(op_meas) if op_meas else "*"
+                op_agg = (op.aggregation or "SUM").upper()
+                op_alias = self._sanitize_alias(op.name or f"operand_{i+1}")
+
+                # Check if this operand has specific filters (e.g. Technology category)
+                if op.filters:
+                    conds = []
+                    for f in op.filters:
+                        fq = quote_col(f.column)
+                        safe_v = str(f.value).replace("'", "''")
+                        conds.append(f"{fq} = '{safe_v}'")
+                    cond_str = " AND ".join(conds)
+                    case_expr = f"CASE WHEN {cond_str} THEN {op_q} ELSE 0 END"
+                    select_items.append(f"ROUND(CAST(SUM({case_expr}) AS NUMERIC), 2) AS {op_alias}")
+                else:
+                    if op_agg == "COUNT_DISTINCT":
+                        select_items.append(f"COUNT(DISTINCT {op_q}) AS {op_alias}")
+                    elif op_agg == "COUNT":
+                        select_items.append(f"COUNT(*) AS {op_alias}")
+                    elif op_agg == "AVG":
+                        select_items.append(f"ROUND(CAST(AVG({op_q}) AS NUMERIC), 2) AS {op_alias}")
+                    else:
+                        select_items.append(f"ROUND(CAST(SUM({op_q}) AS NUMERIC), 2) AS {op_alias}")
+                    if op_meas and op_agg != "COUNT":
+                        not_nulls.append(f"{op_q} IS NOT NULL")
+
+            all_where = where_conditions + not_nulls
+            where_sql = f" WHERE {' AND '.join(all_where)}" if all_where else ""
+
+            if contract.group_by:
+                group_sql = ", ".join([quote_col(g) for g in contract.group_by])
+                return f'SELECT {", ".join(select_items)} FROM "{safe_table}"{where_sql} GROUP BY {group_sql} ORDER BY {group_sql} ASC'
+            else:
+                return f'SELECT {", ".join(select_items)} FROM "{safe_table}"{where_sql}'
 
         # 1. SCALAR AGGREGATION: GROUPING MUST NEVER BE INVENTED
         if contract.answer_type == "SCALAR":
@@ -546,8 +612,8 @@ class SQLAgent:
         If result contains unwanted grouping or incorrect shape, repair deterministically.
         """
         if contract.answer_type == "SCALAR":
-            # SCALAR must have exactly 1 row
-            if len(df) > 1 or len(df.columns) > 1:
+            # SCALAR must have exactly 1 row (multiple columns allowed for multi-operand calculations)
+            if (len(df) > 1) or (len(df.columns) > 1 and not contract.calculation):
                 logger.warning(
                     "Result validation failed for SCALAR: got %d rows, %d columns. Re-executing pure scalar query.",
                     len(df), len(df.columns),
