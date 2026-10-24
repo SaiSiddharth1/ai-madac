@@ -223,6 +223,8 @@ class VisualizationAgent:
                 contract.bin = {"mode": "fixed", "size": query_contract_dict["bin_width"]}
             if query_contract_dict.get("group_by"):
                 contract.requested_dimensions = query_contract_dict["group_by"]
+            if query_contract_dict.get("series_dimension"):
+                contract.series_dimension = query_contract_dict["series_dimension"]
 
         if contract.is_follow_up and not sql_result and prev_result and prev_result.get("validated"):
             sql_result = {
@@ -259,6 +261,8 @@ class VisualizationAgent:
                 candidate_spec.setdefault("fields", {})["x"] = query_contract_dict["x_axis"]
             if query_contract_dict.get("y_axis"):
                 candidate_spec.setdefault("fields", {})["y"] = query_contract_dict["y_axis"]
+            if query_contract_dict.get("series_dimension"):
+                candidate_spec.setdefault("fields", {})["color"] = query_contract_dict["series_dimension"]
             if query_contract_dict.get("bin_width"):
                 candidate_spec["bin_width"] = query_contract_dict["bin_width"]
 

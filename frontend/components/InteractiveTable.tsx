@@ -216,7 +216,7 @@ export default function InteractiveTable({
                     }}
                   >
                     <span style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
-                      {col.replace("_", " ").title ? col.replace("_", " ").toUpperCase() : col}
+                      {col.replace(/_/g, " ")}
                       <span style={{ fontSize: "0.7rem", opacity: isSorted ? 1 : 0.4 }}>
                         {isSorted ? (sortDir === "asc" ? "▲" : "▼") : "⇅"}
                       </span>

@@ -92,7 +92,51 @@ async def run_query_stream(
     profile_record = profile_result.scalar_one_or_none()
     profile_json = profile_record.profile_json if profile_record else {}
 
-    # Create Query record
+    # Check for pure conversational chat vs dataset query
+    from app.agents.supervisor.chat_router import classify_chat_or_dataset
+    chat_route = await classify_chat_or_dataset(body.question, dataset.schema_info)
+    if chat_route.get("mode") == "CHAT":
+        query_record = Query(
+            user_id=current_user.id,
+            dataset_id=dataset_id,
+            question=body.question,
+            intent="CHAT",
+        )
+        db.add(query_record)
+        await db.commit()
+        await db.refresh(query_record)
+
+        chat_resp_text = chat_route.get("response") or "Hi! How can I help you with your data today?"
+        report_record = Report(
+            query_id=query_record.id,
+            answer=chat_resp_text,
+            insights=[],
+            chart_paths=[],
+            data_used={"response_type": "CHAT"},
+            agents_used=[],
+        )
+        db.add(report_record)
+        await db.commit()
+        await db.refresh(report_record)
+
+        response_obj = FullQueryResponse(
+            query=QueryResponse.model_validate(query_record),
+            report=ReportResponse.model_validate(report_record),
+            agents=[],
+        )
+
+        async def chat_event_generator() -> AsyncGenerator[str, None]:
+            chat_payload = {
+                "mode": "CHAT",
+                "status": "completed",
+                "message": chat_resp_text,
+                "result": response_obj.model_dump(mode="json"),
+            }
+            yield f"data: {json.dumps(chat_payload, default=str)}\n\n"
+
+        return StreamingResponse(chat_event_generator(), media_type="text/event-stream")
+
+    # Create Query record for dataset workflow
     query_record = Query(
         user_id=current_user.id,
         dataset_id=dataset_id,

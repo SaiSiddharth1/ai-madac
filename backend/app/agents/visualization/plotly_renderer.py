@@ -78,12 +78,21 @@ class PlotlyRenderer:
 
         cols = df.columns.tolist()
 
-        # If x_col or y_col is missing from cols, resolve case-insensitively
+        # If x_col or y_col is missing from cols, resolve case-insensitively or via alias
         col_map = {c.lower(): c for c in cols}
         if x_col and x_col.lower() in col_map:
             x_col = col_map[x_col.lower()]
-        if y_col and isinstance(y_col, str) and y_col.lower() in col_map:
-            y_col = col_map[y_col.lower()]
+        if y_col and isinstance(y_col, str):
+            if y_col.lower() in col_map:
+                y_col = col_map[y_col.lower()]
+            elif f"total_{y_col.lower()}" in col_map:
+                y_col = col_map[f"total_{y_col.lower()}"]
+            elif f"average_{y_col.lower()}" in col_map:
+                y_col = col_map[f"average_{y_col.lower()}"]
+            else:
+                cand_y = next((c for c in cols if c not in (x_col, color_col) and pd.api.types.is_numeric_dtype(df[c])), None)
+                if cand_y:
+                    y_col = cand_y
         if color_col and color_col.lower() in col_map:
             color_col = col_map[color_col.lower()]
 
@@ -254,10 +263,17 @@ class PlotlyRenderer:
                 fig = go.Figure()
 
         # 5. Line Chart (Single or Multi-Series Line)
-        elif chart_type in ("line", "trend", "multi_line") and len(cols) >= 2:
+        elif chart_type in ("line", "trend", "multi_line") and len(cols) >= 1:
             line_x = x_col if x_col in cols else cols[0]
-            line_y = y_col if y_col in cols else (cols[1] if cols[1] != line_x else (cols[0] if len(cols) > 1 else line_x))
-            has_series = bool(color_col and color_col in cols and color_col not in (line_x, line_y))
+            rem_for_y = [c for c in cols if c != line_x and c != color_col]
+            line_y = y_col if (y_col and y_col in cols and y_col != line_x and y_col != color_col) else (rem_for_y[0] if rem_for_y else (cols[1] if len(cols) > 1 else cols[0]))
+            has_series = bool(
+                color_col
+                and color_col in cols
+                and color_col not in (line_x, line_y)
+                and 1 < df[color_col].nunique() <= 12
+                and not pd.api.types.is_numeric_dtype(df[color_col])
+            )
 
             x_1d = ensure_1d(df[line_x], str(line_x))
             y_1d = ensure_1d(df[line_y], str(line_y))
@@ -279,12 +295,17 @@ class PlotlyRenderer:
                     y=line_y,
                     color=color_col,
                     title=title,
-                    markers=True,
+                    markers=True if len(clean_line_df) <= 150 else False,
                     color_discrete_map=STABLE_CATEGORY_COLORS,
                     color_discrete_sequence=POWER_BI_PALETTE,
                 )
-                fig.update_traces(line=dict(width=2.5), marker=dict(size=6))
+                fig.update_traces(
+                    line=dict(width=2.5),
+                    marker=dict(size=6),
+                    hovertemplate=f"<b>%{{fullData.name}}</b><br>%{{x}}<br>{str(line_y).replace('_', ' ').title()}: %{{y:,.2f}}<extra></extra>",
+                )
                 fig.update_layout(
+                    showlegend=True,
                     xaxis_title=line_x.replace("_", " ").title(),
                     yaxis_title=str(line_y).replace("_", " ").title(),
                     legend_title_text=color_col.replace("_", " ").title(),
@@ -302,11 +323,16 @@ class PlotlyRenderer:
                     x=line_x,
                     y=line_y,
                     title=title,
-                    markers=True,
+                    markers=True if len(clean_line_df) <= 80 else False,
                     color_discrete_sequence=[POWER_BI_PALETTE[0]],
                 )
-                fig.update_traces(line=dict(width=3), marker=dict(size=6))
+                fig.update_traces(
+                    line=dict(width=3, color=POWER_BI_PALETTE[0]),
+                    marker=dict(size=6, color=POWER_BI_PALETTE[0]),
+                    hovertemplate=f"<b>%{{x}}</b><br>{str(line_y).replace('_', ' ').title()}: %{{y:,.2f}}<extra></extra>",
+                )
                 fig.update_layout(
+                    showlegend=False,
                     xaxis_title=line_x.replace("_", " ").title(),
                     yaxis_title=str(line_y).replace("_", " ").title(),
                 )

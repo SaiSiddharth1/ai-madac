@@ -429,7 +429,7 @@ class DataPreparer:
         # Case E: Line Chart / Multi-Series Line (Numeric or Chronological Sort)
         if (chart_type in ("line", "trend", "multi_line") or "time" in str(chart_type).lower()) and x_col and x_col in work_df.columns:
             other_cols = [c for c in work_df.columns if c not in (x_col, color_col)]
-            val_col = y_col if (y_col and y_col in work_df.columns and y_col != x_col) else (other_cols[0] if other_cols else x_col)
+            val_col = y_col if (y_col and y_col in work_df.columns and y_col != x_col and y_col != color_col) else (other_cols[0] if other_cols else x_col)
             meas_type = measure_type if measure_type in ("sum", "mean", "min", "max", "count") else "sum"
 
             plot_df = work_df.copy()
@@ -486,7 +486,12 @@ class DataPreparer:
             agg_fn = "mean" if meas_type in ("mean", "avg", "average") else ("count" if meas_type == "count" else meas_type)
 
             # 3. Multi-series vs Single-line
-            has_multi_series = bool(color_col and color_col in plot_df.columns and color_col != x_col)
+            has_multi_series = False
+            if color_col and color_col in plot_df.columns and color_col not in (x_col, val_col):
+                if not pd.api.types.is_numeric_dtype(plot_df[color_col]):
+                    n_uniq = plot_df[color_col].nunique()
+                    if 1 < n_uniq <= 12:
+                        has_multi_series = True
 
             if has_multi_series:
                 # Group by [X, series_dim] and aggregate

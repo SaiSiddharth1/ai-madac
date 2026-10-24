@@ -55,6 +55,39 @@ async def execute_query(
     profile_record = profile_result.scalar_one_or_none()
     profile_json = profile_record.profile_json if profile_record else {}
 
+    # Check for pure conversational chat vs dataset query
+    from app.agents.supervisor.chat_router import classify_chat_or_dataset
+    chat_route = await classify_chat_or_dataset(question, dataset.schema_info)
+    if chat_route.get("mode") == "CHAT":
+        query_record = Query(
+            user_id=user_id,
+            dataset_id=dataset_id,
+            question=question,
+            intent="CHAT",
+        )
+        db.add(query_record)
+        await db.commit()
+        await db.refresh(query_record)
+
+        chat_resp_text = chat_route.get("response") or "Hi! How can I help you with your data today?"
+        report_record = Report(
+            query_id=query_record.id,
+            answer=chat_resp_text,
+            insights=[],
+            chart_paths=[],
+            data_used={"response_type": "CHAT"},
+            agents_used=[],
+        )
+        db.add(report_record)
+        await db.commit()
+        await db.refresh(report_record)
+
+        return {
+            "query": query_record,
+            "report": report_record,
+            "agents": [],
+        }
+
     # 3. Create Query record
     query_record = Query(
         user_id=user_id,

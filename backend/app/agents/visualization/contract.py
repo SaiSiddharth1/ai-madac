@@ -624,9 +624,16 @@ def extract_query_contract(
     if explicit_chart in ("line", "multi_line"):
         # Resolve X dimension
         x_dim = None
-        by_match = re.search(r"\b(?:by|across|per)\s+([a-zA-Z0-9_]+)", q)
-        if by_match:
-            x_dim = resolve_column_semantically(by_match.group(1), available_cols)
+        if is_temporal:
+            x_dim = next((
+                c for c in datetime_matched + available_cols
+                if any(k in c.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day", "created_at", "saledate"))
+            ), None)
+
+        if not x_dim:
+            by_match = re.search(r"\b(?:by|across|per)\s+([a-zA-Z0-9_]+)", q)
+            if by_match:
+                x_dim = resolve_column_semantically(by_match.group(1), available_cols)
         if not x_dim:
             x_dim = next((c for c in datetime_matched + numeric_matched + matched_cols if c != measure_col and c != series_dim), None)
         dimensions = [x_dim] if x_dim else []

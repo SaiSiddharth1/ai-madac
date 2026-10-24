@@ -293,14 +293,28 @@ class SQLAgent:
 
         # Filters
         where_conditions = []
+        op_map = {
+            "=": "=", "==": "=", "equals": "=", "equal": "=",
+            "!=": "!=", "<>": "!=", "not_equal": "!=", "not_equals": "!=",
+            ">": ">", "greater_than": ">",
+            ">=": ">=", "greater_than_or_equal": ">=", "greater_or_equal": ">=",
+            "<": "<", "less_than": "<",
+            "<=": "<=", "less_than_or_equal": "<=", "less_or_equal": "<=",
+            "like": "LIKE", "contains": "LIKE",
+        }
         for f in contract.filters:
             col_q = quote_col(f.column)
             val = f.value
+            op = getattr(f, "operator", "=") or "="
+            sql_op = op_map.get(str(op).lower(), "=")
             if isinstance(val, str):
                 safe_val = val.replace("'", "''")
-                where_conditions.append(f"{col_q} = '{safe_val}'")
+                if sql_op == "LIKE":
+                    where_conditions.append(f"{col_q} LIKE '%{safe_val}%'")
+                else:
+                    where_conditions.append(f"{col_q} {sql_op} '{safe_val}'")
             elif val is not None:
-                where_conditions.append(f"{col_q} = {val}")
+                where_conditions.append(f"{col_q} {sql_op} {val}")
 
         # 1. SCALAR AGGREGATION: GROUPING MUST NEVER BE INVENTED
         if contract.answer_type == "SCALAR":

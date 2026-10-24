@@ -143,7 +143,13 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
         let detail = `HTTP ${response.status}`;
         try {
           const errBody = await response.json();
-          detail = errBody.detail || JSON.stringify(errBody);
+          if (typeof errBody.detail === "string") {
+            detail = errBody.detail;
+          } else if (errBody.detail) {
+            detail = JSON.stringify(errBody.detail);
+          } else {
+            detail = JSON.stringify(errBody);
+          }
         } catch { /* response wasn't JSON */ }
         throw new Error(`Failed to start workflow stream: ${detail}`);
       }
@@ -212,7 +218,13 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
 
             if (event.result) {
               const res = event.result;
-              res.workflow = { ...currentWorkflow };
+              const isChat = event.mode === "CHAT" || res.query?.intent === "CHAT" || res.report?.response_type === "CHAT";
+              if (isChat) {
+                res.mode = "CHAT";
+                res.workflow = null;
+              } else {
+                res.workflow = { ...currentWorkflow };
+              }
               
               setHistory((prev) => [
                 ...prev.filter((m) => m.id !== tempUserMsg.id),
@@ -324,13 +336,43 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
                   </div>
                 </div>
 
-                {/* AI Response Card */}
-                <div className="glass-card" style={{ alignSelf: "flex-start", maxWidth: "90%", width: "100%", padding: "20px" }}>
-                  {/* Visual Agent Workflow Execution Pipeline */}
-                  <AgentWorkflow state={item.workflow || getHistoricalWorkflowState(qInfo, rInfo)} />
+                {/* AI Response Card or Conversational Chat Bubble */}
+                {(() => {
+                  const isChat = (
+                    item.mode === "CHAT"
+                    || qInfo.intent === "CHAT"
+                    || rInfo.response_type === "CHAT"
+                    || (rInfo.data_used && rInfo.data_used.response_type === "CHAT")
+                  );
+                  if (isChat) {
+                    return (
+                      <div style={{ alignSelf: "flex-start", maxWidth: "80%" }}>
+                        <div
+                          style={{
+                            background: "rgba(30, 41, 59, 0.7)",
+                            border: "1px solid rgba(255, 255, 255, 0.1)",
+                            backdropFilter: "blur(12px)",
+                            color: "var(--text-primary)",
+                            padding: "14px 20px",
+                            borderRadius: "18px 18px 18px 2px",
+                            fontSize: "0.92rem",
+                            lineHeight: 1.6,
+                            boxShadow: "0 4px 20px rgba(0, 0, 0, 0.15)",
+                          }}
+                        >
+                          {rInfo.answer || "Hi! How can I help you with your data today?"}
+                        </div>
+                      </div>
+                    );
+                  }
 
-                  {/* Agent execution badges */}
-                  <AgentStatusBadge agents={rInfo.agents_used || []} />
+                  return (
+                    <div className="glass-card" style={{ alignSelf: "flex-start", maxWidth: "90%", width: "100%", padding: "20px" }}>
+                      {/* Visual Agent Workflow Execution Pipeline */}
+                      <AgentWorkflow state={item.workflow || getHistoricalWorkflowState(qInfo, rInfo)} />
+
+                      {/* Agent execution badges */}
+                      <AgentStatusBadge agents={rInfo.agents_used || []} />
 
                   {(() => {
                     const msgKey = String(qInfo.id || idx);
@@ -497,7 +539,9 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
                       </details>
                     </div>
                   )}
-                </div>
+                    </div>
+                  );
+                })()}
               </div>
             );
           })
