@@ -378,28 +378,33 @@ class SQLAgent:
                 sec_alias = self._sanitize_alias(contract.secondary_measure or "secondary_metric")
                 agg_select += f', ROUND(SUM({sec_expr}), 2) AS total_{sec_alias}'
 
-            # Ordering: time-series queries must be chronological ASC, while category rankings are DESC
-            is_time_series = (
-                contract.intent == "TIME_SERIES"
-                or contract.suggested_chart_type == "line"
-                or any("date" in g.lower() or "time" in g.lower() or "year" in g.lower() or "month" in g.lower() for g in contract.group_by)
+            # Ordering and grouping:
+            # 1. Genuine temporal time-series queries
+            temporal_col = next((
+                g for g in contract.group_by
+                if any(k in g.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day", "created_at", "saledate"))
+            ), None)
+
+            is_line_or_trend = (
+                contract.intent in ("TIME_SERIES", "TREND")
+                or contract.suggested_chart_type in ("line", "multi_line")
             )
-            if is_time_series:
-                time_col = next((g for g in contract.group_by if any(k in g.lower() for k in ("date", "time", "year", "month", "invoicedate"))), contract.group_by[0] if contract.group_by else "Date")
+
+            if temporal_col:
                 grain = contract.time_granularity or "month"
                 if grain == "year":
-                    time_sql_expr = f"COALESCE(strftime('%Y', {quote_col(time_col)}), SUBSTR({quote_col(time_col)}, 1, 4))"
+                    time_sql_expr = f"COALESCE(strftime('%Y', {quote_col(temporal_col)}), SUBSTR({quote_col(temporal_col)}, 1, 4))"
                 elif grain == "day":
-                    time_sql_expr = f"COALESCE(strftime('%Y-%m-%d', {quote_col(time_col)}), SUBSTR({quote_col(time_col)}, 1, 10))"
+                    time_sql_expr = f"COALESCE(strftime('%Y-%m-%d', {quote_col(temporal_col)}), SUBSTR({quote_col(temporal_col)}, 1, 10))"
                 else:  # month default
-                    time_sql_expr = f"COALESCE(strftime('%Y-%m', {quote_col(time_col)}), SUBSTR({quote_col(time_col)}, 1, 7))"
+                    time_sql_expr = f"COALESCE(strftime('%Y-%m', {quote_col(temporal_col)}), SUBSTR({quote_col(temporal_col)}, 1, 7))"
 
-                other_group_cols = [quote_col(g) for g in contract.group_by if g != time_col]
+                other_group_cols = [quote_col(g) for g in contract.group_by if g != temporal_col]
                 if other_group_cols:
-                    group_select_sql = f'{time_sql_expr} AS {quote_col(time_col)}, {", ".join(other_group_cols)}'
+                    group_select_sql = f'{time_sql_expr} AS {quote_col(temporal_col)}, {", ".join(other_group_cols)}'
                     group_clause_sql = f'{time_sql_expr}, {", ".join(other_group_cols)}'
                 else:
-                    group_select_sql = f'{time_sql_expr} AS {quote_col(time_col)}'
+                    group_select_sql = f'{time_sql_expr} AS {quote_col(temporal_col)}'
                     group_clause_sql = time_sql_expr
 
                 order_col = time_sql_expr
@@ -412,11 +417,26 @@ class SQLAgent:
                     f'SELECT {group_select_sql}, {agg_select} FROM "{safe_table}"'
                     f'{where_sql} GROUP BY {group_clause_sql} ORDER BY {order_col} {direction}{limit_sql}'
                 )
+            elif is_line_or_trend:
+                # Non-temporal numeric or ordinal line chart (e.g. Age, or Age + Gender)
+                x_col = contract.group_by[0]
+                other_group_cols = [quote_col(g) for g in contract.group_by[1:]]
+                order_expr = f"CAST({quote_col(x_col)} AS NUMERIC)"
+                direction = "ASC"
+                if contract.sort:
+                    direction = contract.sort.direction.upper()
+                order_clause = f"{order_expr} {direction}" + (f", {', '.join(other_group_cols)}" if other_group_cols else "")
+                limit_sql = f" LIMIT {contract.limit}" if contract.limit else " LIMIT 500"
+
+                return (
+                    f'SELECT {group_sql}, {agg_select} FROM "{safe_table}"'
+                    f'{where_sql} GROUP BY {group_sql} ORDER BY {order_clause}{limit_sql}'
+                )
             else:
                 direction = "DESC"
                 if contract.sort:
                     direction = contract.sort.direction.upper()
-                limit_sql = f" LIMIT {contract.limit}" if contract.limit else " LIMIT 10"
+                limit_sql = f" LIMIT {contract.limit}" if contract.limit else " LIMIT 15"
 
                 return (
                     f'SELECT {group_sql}, {agg_select} FROM "{safe_table}"'

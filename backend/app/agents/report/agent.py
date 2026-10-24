@@ -132,6 +132,7 @@ class ReportAgent:
                     "visualization": viz,
                     "parameters": viz.get("parameters"),
                     "chart_json": viz.get("chart_json"),
+                    "response_type": "VISUALIZATION",
                 }
                 final_report = {
                     "answer": str(answer),
@@ -140,6 +141,7 @@ class ReportAgent:
                     "chart_json": viz.get("chart_json"),
                     "parameters": viz.get("parameters"),
                     "visualization_result": viz,
+                    "response_type": "VISUALIZATION",
                     "data_used": prev_data_used,
                     "agents_used": list(set(agents_used)),
                 }
@@ -288,19 +290,41 @@ class ReportAgent:
                 if isinstance(viz_result.get("explanation"), dict):
                     explanation_data = dict(viz_result["explanation"])
 
-        data_used_payload = sql_result or {}
-        if isinstance(data_used_payload, dict) and viz_result:
-            data_used_payload["visualization"] = viz_result
-            data_used_payload["parameters"] = viz_result.get("parameters")
-            data_used_payload["chart_json"] = viz_result.get("chart_json")
+        has_chart = bool(chart_paths and len(chart_paths) > 0 and viz_result and viz_result.get("visualization_available", True))
 
+        # Explicit Section 36 Visualization Metadata
+        viz_meta = None
+        if has_chart and viz_result:
+            chart_obj = viz_result.get("chart") or {}
+            params = viz_result.get("parameters") or {}
+            viz_meta = {
+                "should_visualize": True,
+                "chart_type": viz_result.get("chart_type") or chart_obj.get("chart_type"),
+                "x": chart_obj.get("x_axis") or params.get("category"),
+                "y": chart_obj.get("y_axis") or params.get("value"),
+                "series_dimension": params.get("series_dimension") or chart_obj.get("color"),
+            }
+
+        # Rule 35: VISUALIZATION takes priority over SCALAR
         final_response_type = (
             "UNRELATED" if is_unrelated
+            else "VISUALIZATION" if has_chart
             else "SCALAR" if is_scalar
-            else "VISUALIZATION" if chart_paths
             else "GROUPED" if (structured_intent.get("group_by_needed") or (sql_result and len(sql_result.get("columns", [])) >= 2))
             else "TABLE"
         )
+
+        data_used_payload = sql_result or {}
+        if isinstance(data_used_payload, dict):
+            if viz_result:
+                data_used_payload["visualization"] = viz_result
+                data_used_payload["parameters"] = viz_result.get("parameters")
+                data_used_payload["chart_json"] = viz_result.get("chart_json")
+            data_used_payload["response_type"] = final_response_type
+            data_used_payload["kpi"] = kpi_data if not has_chart else None
+            data_used_payload["explanation"] = explanation_data
+            if viz_meta:
+                data_used_payload["visualization_meta"] = viz_meta
 
         final_report = {
             "answer": str(answer),
@@ -309,8 +333,9 @@ class ReportAgent:
             "chart_json": viz_result.get("chart_json") if viz_result else None,
             "parameters": viz_result.get("parameters") if viz_result else (sql_result.get("parameters") if sql_result else None),
             "visualization_result": viz_result,
+            "visualization": viz_meta,
             "response_type": final_response_type,
-            "kpi": kpi_data,
+            "kpi": kpi_data if not has_chart else None,
             "explanation": explanation_data,
             "data_used": data_used_payload,
             "agents_used": list(set(agents_used)),

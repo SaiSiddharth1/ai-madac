@@ -187,6 +187,26 @@ class QueryContract:
     def suggested_chart_type(self, val: Optional[str]):
         self.requested_chart = val
 
+    @property
+    def x_axis(self) -> Optional[str]:
+        return self.requested_dimensions[0] if self.requested_dimensions else None
+
+    @x_axis.setter
+    def x_axis(self, val: Optional[str]):
+        if val:
+            if val not in self.requested_dimensions:
+                self.requested_dimensions.insert(0, val)
+
+    @property
+    def y_axis(self) -> Optional[str]:
+        meas = self.measure
+        return meas.get("column") if isinstance(meas, dict) else None
+
+    @y_axis.setter
+    def y_axis(self, val: Optional[str]):
+        if val:
+            self.requested_measures = [{"type": "avg", "column": val}]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "raw_question": self.raw_question,
@@ -363,7 +383,9 @@ def extract_query_contract(
 
     # Detect explicit chart requests
     explicit_chart = None
-    if re.search(r"\bpie\b|\bdonut\b", q):
+    if re.search(r"\bmulti[-_\s]line\b", q):
+        explicit_chart = "multi_line"
+    elif re.search(r"\bpie\b|\bdonut\b", q):
         explicit_chart = "pie"
     elif re.search(r"\b(?:bar chart|bar graph|horizontal bar|grouped bar|stacked bar)\b", q) or re.search(r"\bbar\b", q):
         explicit_chart = "bar"
@@ -464,7 +486,21 @@ def extract_query_contract(
     measure_col = None
     if re.search(r"\b(?:average|mean|avg)\b", q):
         measure_type = "mean"
-        measure_col = numeric_matched[0] if numeric_matched else (range_matched[0] if range_matched else None)
+        # Extract target measure phrase e.g. "average expected return by age"
+        m_avg = re.search(r"\b(?:average|mean|avg)\s+(?:of\s+)?([a-zA-Z0-9_\s%]+?)(?:\s+by|\s+for|\s+across|\s+as|\s+in|\s+and|$)", q)
+        target_measure = None
+        if m_avg:
+            phrase = m_avg.group(1).strip()
+            target_measure = resolve_column_semantically(phrase, available_cols)
+        if target_measure and target_measure in matched_cols:
+            measure_col = target_measure
+        elif numeric_matched:
+            by_match = re.search(r"\b(?:by|across|per)\s+([a-zA-Z0-9_]+)", q)
+            by_col = resolve_column_semantically(by_match.group(1), available_cols) if by_match else None
+            meas_candidates = [c for c in numeric_matched + range_matched if c != by_col]
+            measure_col = meas_candidates[0] if meas_candidates else numeric_matched[0]
+        else:
+            measure_col = range_matched[0] if range_matched else None
     elif re.search(r"\b(?:total|sum)\b", q):
         measure_type = "sum"
         measure_col = numeric_matched[0] if numeric_matched else None
@@ -474,34 +510,36 @@ def extract_query_contract(
     elif re.search(r"\b(?:lowest|minimum|min)\b", q) and not re.search(r"\b(?:least popular|lowest count)\b", q):
         measure_type = "min"
         measure_col = numeric_matched[0] if numeric_matched else None
-    elif numeric_matched:
+    elif numeric_matched and not (explicit_chart in ("scatter", "histogram")):
         measure_type = "sum"
         measure_col = numeric_matched[0]
 
     # Detect Binning (e.g., "bins of 5", "bins of 5 years", "bin size 5")
     bin_spec: Optional[dict[str, Any]] = None
-    bin_match = re.search(r"\b(?:bins?\s*(?:of|size)?\s*(\d+)|(\d+)\s*(?:years?|year)?\s*bins?)\b", q)
+    bin_match = re.search(r"\b(?:bins?\s*(?:of|size)?\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:years?|year)?\s*bins?)\b", q)
     if bin_match:
-        size = int(bin_match.group(1) or bin_match.group(2))
+        size_raw = bin_match.group(1) or bin_match.group(2)
+        size = float(size_raw) if "." in size_raw else int(size_raw)
         bin_spec = {"mode": "fixed", "size": size, "bin_size": size}
 
     # Detect Intent
     intent = "categorical_comparison"
     if explicit_chart == "histogram" or re.search(r"\b(?:distribution|histogram|spread)\b", q):
         intent = "distribution"
+        explicit_chart = "histogram"
         if not bin_spec:
             bin_spec = {"mode": "auto"}
-    elif explicit_chart == "scatter":
+    elif explicit_chart in ("scatter", "relationship"):
         intent = "relationship"
+        explicit_chart = "scatter"
     elif len(numeric_matched) >= 2 and any(tok in q for tok in ("versus", "vs", "relationship", "correlation", "against")):
         intent = "relationship"
         if not explicit_chart:
             explicit_chart = "scatter"
     elif len(numeric_matched) == 1 and (len(range_matched) == 1 or len(categorical_matched) == 1) and any(tok in q for tok in ("versus", "vs", "relationship", "against")):
-        # One numerical + one categorical/range: Box plot represents distribution across brackets
-        intent = "distribution"
         if not explicit_chart:
-            explicit_chart = "box"
+            explicit_chart = "scatter" if "scatter" in q else "box"
+            intent = "relationship" if explicit_chart == "scatter" else "distribution"
     elif len(plot_dimensions) >= 2 and any(tok in q for tok in ("versus", "vs", "by", "across", "and")):
         intent = "cross_tabulation"
     elif filters and len(plot_dimensions) == 1:
@@ -509,8 +547,9 @@ def extract_query_contract(
     elif explicit_chart in ("pie", "donut") or re.search(r"\b(?:proportion|percentage|share|ratio|contribution|contributions)\b", q):
         intent = "proportion"
         explicit_chart = "pie"
-    elif re.search(r"\b(?:trend|over time|growth|over the years|monthly|yearly)\b", q):
+    elif explicit_chart in ("line", "multi_line") or re.search(r"\b(?:trend|over time|growth|over the years|monthly|yearly)\b", q):
         intent = "trend"
+        explicit_chart = explicit_chart or "line"
     elif re.search(r"\b(?:rank|ranking|top|bottom|most popular|least popular)\b", q):
         intent = "ranking"
     elif len(plot_matched_cols) == 0 and not is_follow_up:
@@ -538,12 +577,19 @@ def extract_query_contract(
         else:
             time_grain = "month"
 
-        # Check for multi-series line chart (e.g. monthly sales by category)
         if plot_dimensions:
             series_dim = plot_dimensions[0]
 
-    # Check for scatter vs multi-measure bar chart
+    # Line and Multi-line handling
     color_by_col = None
+    if explicit_chart in ("line", "multi_line"):
+        intent = "trend"
+        if explicit_chart == "multi_line" or (plot_dimensions and len(plot_dimensions) >= 1):
+            if plot_dimensions:
+                series_dim = plot_dimensions[0]
+                color_by_col = series_dim
+
+    # Scatter vs Clustered bar
     is_scatter = (
         explicit_chart == "scatter"
         or (len(numeric_matched) >= 2 and bool(re.search(r"\b(?:versus|vs\.?|relationship|against|correlation)\b", q)))
@@ -574,16 +620,30 @@ def extract_query_contract(
         if sorting.get("direction") == "desc" and not explicit_chart:
             explicit_chart = "horizontal_bar"
 
+    # Dimensions calculation
+    if explicit_chart in ("line", "multi_line"):
+        # Resolve X dimension
+        x_dim = None
+        by_match = re.search(r"\b(?:by|across|per)\s+([a-zA-Z0-9_]+)", q)
+        if by_match:
+            x_dim = resolve_column_semantically(by_match.group(1), available_cols)
+        if not x_dim:
+            x_dim = next((c for c in datetime_matched + numeric_matched + matched_cols if c != measure_col and c != series_dim), None)
+        dimensions = [x_dim] if x_dim else []
+        if series_dim and series_dim not in dimensions:
+            dimensions.append(series_dim)
+        sorting = {"field": x_dim, "direction": "asc"}
+    elif intent in ("relationship", "distribution"):
+        dimensions = []
+    elif plot_dimensions:
+        dimensions = [d for d in plot_dimensions if d != measure_col]
+    else:
+        dimensions = [c for c in plot_matched_cols if c != measure_col]
+
     vis_required = (
         is_visualization_requested(q_raw, intent)
         or bool(explicit_chart)
         or intent in ("cross_tabulation", "distribution", "relationship", "filtered_categorical_distribution", "trend", "proportion")
-    )
-
-    dimensions = (
-        plot_dimensions
-        if plot_dimensions
-        else ([] if intent in ("relationship", "distribution") else plot_matched_cols)
     )
 
     return QueryContract(

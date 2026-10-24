@@ -45,6 +45,7 @@ class ReportResponse(BaseModel):
     chart_json: Optional[dict[str, Any]] = None
     parameters: Optional[dict[str, Any]] = None
     visualization_result: Optional[dict[str, Any]] = None
+    visualization: Optional[dict[str, Any]] = None
     response_type: Optional[str] = None
     kpi: Optional[dict[str, Any]] = None
     explanation: Optional[dict[str, Any]] = None
@@ -63,7 +64,8 @@ class ReportResponse(BaseModel):
                 data.setdefault("chart_json", d_used.get("chart_json"))
                 data.setdefault("parameters", d_used.get("parameters"))
                 data.setdefault("visualization_result", d_used.get("visualization"))
-                data.setdefault("response_type", d_used.get("response_type"))
+                data.setdefault("visualization", d_used.get("visualization_meta") or data.get("visualization"))
+                data.setdefault("response_type", d_used.get("response_type") or data.get("response_type"))
                 data.setdefault("kpi", d_used.get("kpi"))
                 data.setdefault("explanation", d_used.get("explanation"))
             return data
@@ -73,6 +75,7 @@ class ReportResponse(BaseModel):
             chart_json = getattr(data, "chart_json", None) or d_used.get("chart_json")
             parameters = getattr(data, "parameters", None) or d_used.get("parameters")
             visualization_result = getattr(data, "visualization_result", None) or d_used.get("visualization")
+            visualization = getattr(data, "visualization", None) or d_used.get("visualization_meta")
             response_type = getattr(data, "response_type", None) or d_used.get("response_type")
             kpi = getattr(data, "kpi", None) or d_used.get("kpi")
             explanation = getattr(data, "explanation", None) or d_used.get("explanation")
@@ -85,6 +88,7 @@ class ReportResponse(BaseModel):
                 "chart_json": chart_json,
                 "parameters": parameters,
                 "visualization_result": visualization_result,
+                "visualization": visualization,
                 "response_type": response_type,
                 "kpi": kpi,
                 "explanation": explanation,

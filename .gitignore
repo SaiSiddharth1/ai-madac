@@ -41,5 +41,11 @@ models/
 # Logs
 *.log
 
+# Database and local state
+*.db
+*.db-shm
+*.db-wal
+scratch/
+
 # Docker
 docker-compose.override.yml

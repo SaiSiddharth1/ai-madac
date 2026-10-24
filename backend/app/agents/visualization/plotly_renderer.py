@@ -21,6 +21,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 
 from app.config import settings
+from app.agents.visualization.data_preparer import ensure_1d
 
 logger = logging.getLogger(__name__)
 
@@ -98,11 +99,13 @@ class PlotlyRenderer:
                     if alias:
                         measure_cols.append(alias)
             fig = go.Figure()
+            x_1d = ensure_1d(df[x_col], str(x_col))
             for idx, m in enumerate(measure_cols):
+                y_1d = ensure_1d(df[m], str(m))
                 fig.add_trace(go.Bar(
                     name=m.replace("_", " ").title(),
-                    x=df[x_col],
-                    y=df[m],
+                    x=x_1d,
+                    y=y_1d,
                     marker_color=POWER_BI_PALETTE[idx % len(POWER_BI_PALETTE)],
                 ))
             fig.update_layout(
@@ -114,11 +117,16 @@ class PlotlyRenderer:
             )
 
         # 2. Grouped / Stacked Bar Chart with explicit categorical color column
-        elif color_col and color_col in cols and x_col and x_col in cols and len(cols) >= 3 and chart_type not in ("line", "trend", "scatter", "relationship"):
+        elif color_col and color_col in cols and x_col and x_col in cols and len(cols) >= 3 and chart_type not in ("line", "trend", "multi_line", "scatter", "relationship"):
             val_col = next((c for c in cols if c not in (x_col, color_col)), "count")
             barmode = "stack" if mode == "stacked" else "group"
+            clean_grouped_df = pd.DataFrame({
+                x_col: ensure_1d(df[x_col], str(x_col)),
+                val_col: ensure_1d(df[val_col], str(val_col)),
+                color_col: ensure_1d(df[color_col], str(color_col)),
+            })
             fig = px.bar(
-                df,
+                clean_grouped_df,
                 x=x_col,
                 y=val_col,
                 color=color_col,
@@ -136,27 +144,55 @@ class PlotlyRenderer:
         # 3. Histogram / Distribution (Raw observations)
         elif chart_type in ("histogram", "distribution") and (x_col in cols or len(cols) >= 1):
             target_x = x_col if x_col in cols else cols[0]
+            x_1d = ensure_1d(df[target_x], str(target_x)).dropna()
+            clean_hist_df = pd.DataFrame({target_x: x_1d})
+
             bin_size = (
                 spec.get("bin_width")
                 or (spec.get("binning") or {}).get("bin_size")
                 or (spec.get("binning") or {}).get("size")
                 or (spec.get("bins") or {}).get("size")
             )
+            if not bin_size and not clean_hist_df.empty:
+                min_v = float(clean_hist_df[target_x].min())
+                max_v = float(clean_hist_df[target_x].max())
+                val_range = max_v - min_v
+                n_obs = len(clean_hist_df)
+                if val_range == 0 or clean_hist_df[target_x].nunique() <= 5:
+                    bin_size = 1.0
+                else:
+                    iqr = float(clean_hist_df[target_x].quantile(0.75) - clean_hist_df[target_x].quantile(0.25))
+                    h = (2.0 * iqr / (n_obs ** (1.0 / 3.0))) if iqr > 0 else (val_range / max(1.0 + np.log2(n_obs), 1.0))
+                    candidates = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0]
+                    bin_size = min(candidates, key=lambda c: abs(c - h))
+
             fig = px.histogram(
-                df,
+                clean_hist_df,
                 x=target_x,
                 title=title,
                 color_discrete_sequence=[POWER_BI_PALETTE[0]],
             )
-            if bin_size:
+            if bin_size and not clean_hist_df.empty:
                 try:
-                    min_v = float(df[target_x].min())
-                    max_v = float(df[target_x].max())
+                    min_v = float(clean_hist_df[target_x].min())
+                    max_v = float(clean_hist_df[target_x].max())
                     start_edge = float(np.floor(min_v / bin_size) * bin_size)
                     end_edge = float(np.ceil(max_v / bin_size) * bin_size)
-                    fig.update_traces(xbins=dict(start=start_edge, end=end_edge + bin_size, size=bin_size))
+                    fig.update_traces(
+                        xbins=dict(start=start_edge, end=end_edge + bin_size, size=bin_size),
+                        marker=dict(color=POWER_BI_PALETTE[0], line=dict(width=1, color="#1e293b")),
+                        hovertemplate="<b>Bin Range:</b> %{x}<br><b>Count:</b> %{y}<extra></extra>",
+                    )
                 except Exception:
-                    pass
+                    fig.update_traces(
+                        marker=dict(color=POWER_BI_PALETTE[0], line=dict(width=1, color="#1e293b")),
+                        hovertemplate="<b>Bin Range:</b> %{x}<br><b>Count:</b> %{y}<extra></extra>",
+                    )
+            else:
+                fig.update_traces(
+                    marker=dict(color=POWER_BI_PALETTE[0], line=dict(width=1, color="#1e293b")),
+                    hovertemplate="<b>Bin Range:</b> %{x}<br><b>Count:</b> %{y}<extra></extra>",
+                )
             fig.update_layout(
                 xaxis_title=target_x.replace("_", " ").title(),
                 yaxis_title="Count of Observations",
@@ -168,32 +204,47 @@ class PlotlyRenderer:
             scatter_x = x_col if x_col in cols else (cols[0] if len(cols) >= 1 else None)
             scatter_y = y_col if y_col in cols else (cols[1] if len(cols) >= 2 else None)
             if scatter_x and scatter_y:
+                x_1d = ensure_1d(df[scatter_x], str(scatter_x))
+                y_1d = ensure_1d(df[scatter_y], str(scatter_y))
                 has_color = bool(color_col and color_col in cols and color_col not in (scatter_x, scatter_y))
                 if has_color:
+                    color_1d = ensure_1d(df[color_col], str(color_col))
+                    clean_scatter_df = pd.DataFrame({
+                        scatter_x: x_1d,
+                        scatter_y: y_1d,
+                        color_col: color_1d,
+                    }).dropna(subset=[scatter_x, scatter_y])
+
                     fig = px.scatter(
-                        df,
+                        clean_scatter_df,
                         x=scatter_x,
                         y=scatter_y,
                         color=color_col,
                         title=title,
+                        color_discrete_map=STABLE_CATEGORY_COLORS,
                         color_discrete_sequence=POWER_BI_PALETTE,
-                        render_mode="webgl" if len(df) > 3000 else "auto",
+                        render_mode="webgl" if len(clean_scatter_df) > 3000 else "auto",
                     )
                     fig.update_layout(
                         legend_title_text=color_col.replace("_", " ").title(),
                     )
                 else:
+                    clean_scatter_df = pd.DataFrame({
+                        scatter_x: x_1d,
+                        scatter_y: y_1d,
+                    }).dropna(subset=[scatter_x, scatter_y])
+
                     fig = px.scatter(
-                        df,
+                        clean_scatter_df,
                         x=scatter_x,
                         y=scatter_y,
                         title=title,
                         color_discrete_sequence=[POWER_BI_PALETTE[2]],
-                        render_mode="webgl" if len(df) > 3000 else "auto",
+                        render_mode="webgl" if len(clean_scatter_df) > 3000 else "auto",
                     )
                 fig.update_traces(
-                    marker=dict(size=7, opacity=0.8, line=dict(width=1, color="#1e293b")),
-                    hovertemplate=f"<b>{scatter_x}</b>: %{{x}}<br><b>{scatter_y}</b>: %{{y}}<extra></extra>",
+                    marker=dict(size=8, opacity=0.85, line=dict(width=1, color="#1e293b")),
+                    hovertemplate=f"<b>{scatter_x}:</b> %{{x}}<br><b>{scatter_y}:</b> %{{y}}<extra></extra>",
                 )
                 fig.update_layout(
                     xaxis_title=scatter_x.replace("_", " ").title(),
@@ -202,19 +253,34 @@ class PlotlyRenderer:
             else:
                 fig = go.Figure()
 
-        # 5. Line Chart (Single or Multi-Series Trend over time)
-        elif chart_type in ("line", "trend") and len(cols) >= 2:
+        # 5. Line Chart (Single or Multi-Series Line)
+        elif chart_type in ("line", "trend", "multi_line") and len(cols) >= 2:
             line_x = x_col if x_col in cols else cols[0]
             line_y = y_col if y_col in cols else (cols[1] if cols[1] != line_x else (cols[0] if len(cols) > 1 else line_x))
             has_series = bool(color_col and color_col in cols and color_col not in (line_x, line_y))
+
+            x_1d = ensure_1d(df[line_x], str(line_x))
+            y_1d = ensure_1d(df[line_y], str(line_y))
+
             if has_series:
+                color_1d = ensure_1d(df[color_col], str(color_col))
+                clean_line_df = pd.DataFrame({
+                    line_x: x_1d,
+                    line_y: y_1d,
+                    color_col: color_1d,
+                })
+                # If X is numeric, sort numerically ascending
+                if pd.api.types.is_numeric_dtype(clean_line_df[line_x]):
+                    clean_line_df = clean_line_df.sort_values(by=[line_x, color_col], ascending=[True, True])
+
                 fig = px.line(
-                    df,
+                    clean_line_df,
                     x=line_x,
                     y=line_y,
                     color=color_col,
                     title=title,
                     markers=True,
+                    color_discrete_map=STABLE_CATEGORY_COLORS,
                     color_discrete_sequence=POWER_BI_PALETTE,
                 )
                 fig.update_traces(line=dict(width=2.5), marker=dict(size=6))
@@ -224,8 +290,15 @@ class PlotlyRenderer:
                     legend_title_text=color_col.replace("_", " ").title(),
                 )
             else:
+                clean_line_df = pd.DataFrame({
+                    line_x: x_1d,
+                    line_y: y_1d,
+                })
+                if pd.api.types.is_numeric_dtype(clean_line_df[line_x]):
+                    clean_line_df = clean_line_df.sort_values(by=line_x, ascending=True)
+
                 fig = px.line(
-                    df,
+                    clean_line_df,
                     x=line_x,
                     y=line_y,
                     title=title,
@@ -243,8 +316,12 @@ class PlotlyRenderer:
             target_x = x_col if x_col in cols else cols[0]
             box_y = y_col if y_col in cols else (cols[1] if len(cols) > 1 else None)
             if box_y:
+                clean_box_df = pd.DataFrame({
+                    target_x: ensure_1d(df[target_x], str(target_x)),
+                    box_y: ensure_1d(df[box_y], str(box_y)),
+                })
                 fig = px.box(
-                    df,
+                    clean_box_df,
                     x=target_x,
                     y=box_y,
                     title=title,
@@ -257,15 +334,22 @@ class PlotlyRenderer:
                     showlegend=False,
                 )
             else:
-                fig = px.box(df, y=target_x, title=title, color_discrete_sequence=[POWER_BI_PALETTE[0]])
+                clean_box_df = pd.DataFrame({
+                    target_x: ensure_1d(df[target_x], str(target_x))
+                })
+                fig = px.box(clean_box_df, y=target_x, title=title, color_discrete_sequence=[POWER_BI_PALETTE[0]])
 
         # 7. Pie / Donut
         elif chart_type in ("pie", "donut") and len(cols) >= 1:
             cat_col = x_col if x_col in cols else cols[0]
             val_col = y_col if y_col in cols else (cols[1] if len(cols) > 1 else None)
             is_donut = (mode == "donut" or "donut" in str(chart_type).lower())
+            clean_pie_df = pd.DataFrame({
+                cat_col: ensure_1d(df[cat_col], str(cat_col)),
+                val_col: ensure_1d(df[val_col], str(val_col)),
+            })
             fig = px.pie(
-                df,
+                clean_pie_df,
                 names=cat_col,
                 values=val_col,
                 title=title,
@@ -281,15 +365,18 @@ class PlotlyRenderer:
             val_col = y_col if y_col in cols else (cols[1] if len(cols) > 1 else cols[0])
 
             is_horizontal = (len(df) > 8 or orientation == "horizontal" or chart_type == "horizontal_bar")
+            clean_bar_df = pd.DataFrame({
+                cat_col: ensure_1d(df[cat_col], str(cat_col)),
+                val_col: ensure_1d(df[val_col], str(val_col)),
+            })
             if is_horizontal:
-                # In horizontal bar, cat_col is y and val_col is x
                 fig = px.bar(
-                    df,
-                    x=val_col if val_col in cols else cols[1],
-                    y=cat_col if cat_col in cols else cols[0],
+                    clean_bar_df,
+                    x=val_col,
+                    y=cat_col,
                     orientation="h",
                     title=title,
-                    color=cat_col if cat_col in cols else cols[0],
+                    color=cat_col,
                     color_discrete_sequence=POWER_BI_PALETTE,
                 )
                 fig.update_layout(
@@ -300,7 +387,7 @@ class PlotlyRenderer:
                 )
             else:
                 fig = px.bar(
-                    df,
+                    clean_bar_df,
                     x=cat_col,
                     y=val_col,
                     title=title,

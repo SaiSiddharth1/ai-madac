@@ -62,8 +62,8 @@ class VisualizationQualityGate:
             critical_errors.append(f"X-axis column '{x_col}' does not exist in prepared data.")
             score -= 0.5
 
-        # 2. Time-series Line Chart checks
-        if chart_type in ("line", "trend"):
+        # 2. Line & Multi-series Line Chart checks
+        if chart_type in ("line", "trend", "multi_line", "multiline"):
             # Check point count: plotting > 500 points for a trend is bad practice
             if len(df) > 500:
                 warnings.append(
@@ -71,11 +71,14 @@ class VisualizationQualityGate:
                 )
                 score -= 0.2
 
-            # Check if x is time-like or chronological
+            # Check if x is time-like, chronological, or numeric (e.g. Age)
             target_x = cols_lower.get(str(x_col).lower(), df.columns[0])
             dt_check = pd.to_datetime(df[target_x], errors="coerce")
-            if dt_check.notna().mean() < 0.3 and not any(k in str(target_x).lower() for k in ("date", "time", "year", "month", "day", "period")):
-                warnings.append(f"Line chart X-axis '{target_x}' may not be temporal.")
+            num_check = pd.to_numeric(df[target_x], errors="coerce")
+            is_temporal = dt_check.notna().mean() >= 0.3 or any(k in str(target_x).lower() for k in ("date", "time", "year", "month", "day", "period"))
+            is_numeric = num_check.notna().mean() >= 0.7
+            if not (is_temporal or is_numeric):
+                warnings.append(f"Line chart X-axis '{target_x}' may not be numeric or temporal.")
                 score -= 0.15
 
             # Multi-series line count check

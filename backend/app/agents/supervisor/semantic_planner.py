@@ -13,6 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.core.llm_provider import get_llm
 from app.schemas.query_contract import FilterSpec, QueryContract, SortSpec
+from app.agents.visualization.contract import resolve_column_semantically
 
 logger = logging.getLogger(__name__)
 
@@ -418,13 +419,56 @@ USER QUESTION:
                 if series_dim:
                     contract.series_dimension = series_dim
                     contract.group_by = [time_col, series_dim]
+                    contract.suggested_chart_type = "multi_line"
                 else:
                     contract.group_by = [time_col]
+                    contract.suggested_chart_type = "line"
 
                 contract.should_visualize = True
-                contract.suggested_chart_type = "line"
                 contract.x_axis = time_col
                 contract.sort = SortSpec(field=time_col, direction="asc")
+            else:
+                # Continuous / ordinal numeric or categorical line chart (e.g. Age)
+                # Find X dimension after "by": e.g. "by age"
+                by_m = re.search(r"\bby\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\b", q_lower)
+                x_cand = by_m.group(1).strip() if by_m else None
+                x_col = resolve_column_semantically(x_cand, list(cols.values())) if x_cand else None
+                if not x_col:
+                    x_col = next((real for low, real in cols.items() if low in q_lower or low.replace("_", " ") in q_lower), None)
+
+                # Check for series dimension (e.g. "for male and female investors" or "by gender")
+                series_dim = None
+                for low, real in cols.items():
+                    if real != x_col and (low in q_lower or low.replace("_", " ") in q_lower or any(alias in q_lower for alias in ("male", "female", "men", "women") if "gender" in low or "sex" in low)):
+                        if contract.measure_column and real == contract.measure_column:
+                            continue
+                        series_dim = real
+                        break
+
+                # Resolve measure if "average <measure> by <dim>"
+                avg_m = re.search(r"\b(?:average|mean|avg)\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\s+by\b", q_lower)
+                if avg_m:
+                    m_phrase = avg_m.group(1).strip()
+                    m_col = resolve_column_semantically(m_phrase, list(cols.values()))
+                    if m_col:
+                        contract.measure = m_col
+                        contract.measure_column = m_col
+                        contract.measure_expression = m_col
+                        contract.aggregation = "AVG"
+
+                if x_col:
+                    contract.intent = "TREND"
+                    contract.answer_type = "GROUPED"
+                    contract.x_axis = x_col
+                    if series_dim:
+                        contract.series_dimension = series_dim
+                        contract.group_by = [x_col, series_dim]
+                        contract.suggested_chart_type = "multi_line"
+                    else:
+                        contract.group_by = [x_col]
+                        contract.suggested_chart_type = "line"
+                    contract.sort = SortSpec(field=x_col, direction="asc")
+                    contract.should_visualize = True
 
         # 8. Handle Part-to-whole / Pie / Donut
         if bool(re.search(r"\b(?:contribution|share|proportion|part of|pie|donut)\b", q_lower)):
@@ -534,47 +578,185 @@ USER QUESTION:
             time_grain = "day"
 
         # 1. SCATTER / RELATIONSHIP
-        is_scatter = bool(re.search(r"\b(?:relationship|versus|vs\.?|against|correlation)\b", q_lower))
+        is_scatter = bool(re.search(r"\b(?:relationship|versus|vs\.?|against|correlation|scatter)\b", q_lower))
         if is_scatter:
-            x_c = matched_numeric[0] if len(matched_numeric) >= 1 else (qty_col or "Quantity")
-            y_c = matched_numeric[1] if len(matched_numeric) >= 2 else (price_col or "UnitPrice")
-            col_by = matched_cat[0] if matched_cat else None
+            cand_cols = []
+            for phrase in ("expected return", "expected_return", "investment avenue", "investment objective", "annual income", "unit price", "unit_price", "sales", "revenue", "profit", "quantity"):
+                if phrase in q_lower:
+                    res = resolve_column_semantically(phrase, list(cols.values()))
+                    if res and res not in cand_cols:
+                        cand_cols.append(res)
+            for w in re.findall(r'[a-zA-Z_]+', q_lower):
+                res = resolve_column_semantically(w, list(cols.values()))
+                if res and res not in cand_cols:
+                    cand_cols.append(res)
+
+            # Check color_by (e.g. by gender)
+            color_col = None
+            for low, real in cols.items():
+                if real not in cand_cols and (low in q_lower or low.replace("_", " ") in q_lower or any(alias in q_lower for alias in ("male", "female", "men", "women") if "gender" in low or "sex" in low)):
+                    color_col = real
+                    break
+
+            # Check filters (e.g. "Mutual Funds investors")
+            filters_list = []
+            for val_phrase in ("mutual funds", "equity", "fixed deposits", "gold", "debentures", "government bonds", "male", "female"):
+                if val_phrase in q_lower:
+                    # find matching column
+                    for low, real in cols.items():
+                        if any(w in val_phrase for w in ("mutual", "fund", "equity", "gold", "deposit", "bond")) and any(k in low for k in ("avenue", "investment")):
+                            filters_list.append(FilterSpec(column=real, operator="=", value=val_phrase.title() if "mutual" in val_phrase else val_phrase.capitalize()))
+                            break
+
+            x_c = cand_cols[0] if len(cand_cols) >= 1 else (matched_numeric[0] if matched_numeric else (numeric_cols[0] if numeric_cols else list(cols.values())[0]))
+            y_c = cand_cols[1] if len(cand_cols) >= 2 else (matched_numeric[1] if len(matched_numeric) > 1 else (numeric_cols[1] if len(numeric_cols) > 1 else x_c))
+
             return QueryContract(
                 query_id=query_id,
                 dataset_id=dataset_id,
                 original_query=question,
                 intent="RELATIONSHIP",
                 answer_type="RELATIONSHIP",
+                aggregation=None,
+                filters=filters_list,
                 should_visualize=True,
                 suggested_chart_type="scatter",
                 x_axis=x_c,
                 y_axis=y_c,
-                color_by=col_by,
+                color_by=color_col,
             )
 
         # 2. DISTRIBUTION / HISTOGRAM
         is_dist = bool(re.search(r"\b(?:distribution|histogram|spread)\b", q_lower))
         if is_dist:
-            dist_c = matched_numeric[0] if matched_numeric else (qty_col or "Quantity")
+            target_c = None
+            for phrase in ("expected return", "expected_return", "investment avenue", "investment objective", "age", "income", "salary", "sales", "quantity", "price", "unitprice"):
+                if phrase in q_lower:
+                    res = resolve_column_semantically(phrase, list(cols.values()))
+                    if res:
+                        target_c = res
+                        break
+            if not target_c:
+                for real in cols.values():
+                    if real.lower() in q_lower or real.lower().replace("_", " ") in q_lower:
+                        target_c = real
+                        break
+            if not target_c:
+                target_c = matched_numeric[0] if matched_numeric else (numeric_cols[0] if numeric_cols else list(cols.values())[0])
+
+            bin_match = re.search(r"\b(?:bin\s*width|bin\s*size|bins?\s*of)\s*(\d+(?:\.\d+)?)\b", q_lower)
+            b_width = float(bin_match.group(1)) if bin_match else None
+
             return QueryContract(
                 query_id=query_id,
                 dataset_id=dataset_id,
                 original_query=question,
                 intent="DISTRIBUTION",
                 answer_type="DISTRIBUTION",
-                measure=dist_c,
-                measure_column=dist_c,
-                measure_expression=dist_c,
+                measure=target_c,
+                measure_column=target_c,
+                measure_expression=target_c,
+                aggregation=None,
                 should_visualize=True,
                 suggested_chart_type="histogram",
-                x_axis=dist_c,
+                x_axis=target_c,
+                bin_width=b_width,
             )
 
-        # 3. MULTI-MEASURE CLUSTERED BAR (e.g. Show sales and profit by category)
-        if len(matched_numeric) >= 2 and matched_cat:
-            m1 = matched_numeric[0]
-            m2 = matched_numeric[1]
-            cat_dim = matched_cat[0]
+        # 3. LINE & MULTI-LINE (Temporal or Numeric X)
+        is_trend = bool(re.search(
+            r"\b(?:over time|changed over time|change over time|trend|trend over time|historical trend|daily|weekly|monthly|quarterly|yearly|annually|month by month|day by day|year by year|sales trend|revenue trend|quantity trend|timeline|trajectory)\b",
+            q_lower
+        ))
+        is_line_q = bool(re.search(r"\b(?:multi[-_\s]line|line chart|line graph|plot as a line|as a line chart|as line)\b", q_lower))
+        is_multi_q = bool(re.search(r"\bmulti[-_\s]line\b", q_lower)) or any(w in q_lower for w in ("male and female", "female and male", "both genders"))
+        if is_line_q or (is_trend and (date_col or group_by)):
+            # Check for X column
+            by_m = re.search(r"\bby\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\b", q_lower)
+            x_cand = by_m.group(1).strip() if by_m else None
+            x_col = resolve_column_semantically(x_cand, list(cols.values())) if x_cand else None
+            if not x_col and date_col:
+                x_col = date_col
+            if not x_col:
+                x_col = matched_numeric[0] if matched_numeric else (numeric_cols[0] if numeric_cols else list(cols.values())[0])
+
+            # Check for series dimension
+            series_dim = None
+            if is_multi_q or len(cat_cols) > 0:
+                for low, real in cols.items():
+                    if real != x_col and (low in q_lower or low.replace("_", " ") in q_lower or any(alias in q_lower for alias in ("male", "female", "men", "women") if "gender" in low or "sex" in low)):
+                        series_dim = real
+                        break
+
+            # Check for measure
+            meas_col = None
+            avg_m = re.search(r"\b(?:average|mean|avg)\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\s+by\b", q_lower)
+            if avg_m:
+                meas_col = resolve_column_semantically(avg_m.group(1).strip(), list(cols.values()))
+            if not meas_col:
+                for phrase in ("expected return", "expected_return", "revenue", "sales", "profit", "quantity", "unitprice", "price"):
+                    if phrase in q_lower:
+                        res = resolve_column_semantically(phrase, list(cols.values()))
+                        if res and res not in (x_col, series_dim):
+                            meas_col = res
+                            break
+            if not meas_col:
+                meas_col = next((c for c in cols.values() if c not in (x_col, series_dim)), x_col)
+
+            is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
+            agg = "AVG" if is_avg else "SUM"
+            ans_groups = [x_col, series_dim] if series_dim else [x_col]
+
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="TIME_SERIES" if x_col == date_col else "TREND",
+                answer_type="GROUPED",
+                measure=meas_col,
+                measure_column=meas_col,
+                measure_expression=meas_col,
+                aggregation=agg,
+                dimensions=ans_groups,
+                group_by=ans_groups,
+                series_dimension=series_dim,
+                should_visualize=True,
+                suggested_chart_type="multi_line" if series_dim else "line",
+                x_axis=x_col,
+                y_axis=f"average_{meas_col.lower()}" if is_avg else f"total_{meas_col.lower()}",
+                sort=SortSpec(field=x_col, direction="asc"),
+            )
+
+        # 4. GROUPED / CLUSTERED BAR (Multi-Measure or 2 Dimensions)
+        is_grouped_bar = bool(re.search(r"\b(?:grouped|clustered)\b", q_lower)) or (len(matched_numeric) >= 2 and (matched_cat or "each" in q_lower or "by" in q_lower))
+        if is_grouped_bar and len(cols) >= 3:
+            cat_dim = None
+            by_m = re.search(r"\b(?:for each|by|each)\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\b", q_lower)
+            if by_m:
+                cat_dim = resolve_column_semantically(by_m.group(1).strip(), list(cols.values()))
+            if not cat_dim and matched_cat:
+                cat_dim = matched_cat[0]
+            if not cat_dim:
+                cat_dim = cat_cols[0] if cat_cols else list(cols.values())[0]
+
+            m_candidates = []
+            for phrase in ("age", "expected return", "expected_return", "sales", "profit", "revenue", "quantity", "unitprice"):
+                if phrase in q_lower:
+                    res = resolve_column_semantically(phrase, list(cols.values()))
+                    if res and res != cat_dim and res not in m_candidates:
+                        m_candidates.append(res)
+            if len(m_candidates) < 2:
+                for c in cols.values():
+                    if c != cat_dim and c not in m_candidates:
+                        m_candidates.append(c)
+                    if len(m_candidates) == 2:
+                        break
+
+            m1 = m_candidates[0] if len(m_candidates) >= 1 else "Metric1"
+            m2 = m_candidates[1] if len(m_candidates) >= 2 else "Metric2"
+            is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
+            agg = "AVG" if is_avg else "SUM"
+
             return QueryContract(
                 query_id=query_id,
                 dataset_id=dataset_id,
@@ -586,103 +768,133 @@ USER QUESTION:
                 measure_expression=m1,
                 secondary_measure=m2,
                 secondary_measure_column=m2,
-                aggregation="SUM",
+                aggregation=agg,
                 dimensions=[cat_dim],
                 group_by=[cat_dim],
                 should_visualize=True,
-                suggested_chart_type="bar",
+                suggested_chart_type="grouped_bar",
                 x_axis=cat_dim,
-                y_axis=f"total_{m1.lower()}",
+                y_axis=m1,
             )
 
-        # 4. PROPORTION / CONTRIBUTION / PIE
-        is_pie = bool(re.search(r"\b(?:contribution|proportion|share|ratio|pie|donut)\b", q_lower))
-        if is_pie and matched_cat:
-            cat_dim = matched_cat[0]
-            meas_col = matched_numeric[0] if matched_numeric else (qty_col or "Quantity")
+        # 5. PROPORTION / CONTRIBUTION / PIE
+        is_pie = bool(re.search(r"\b(?:contribution|proportion|share|ratio|pie|donut|percentage)\b", q_lower))
+        if is_pie:
+            target_cat = None
+            by_m = re.search(r"\bby\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\b", q_lower)
+            if by_m:
+                target_cat = resolve_column_semantically(by_m.group(1).strip(), list(cols.values()))
+            if not target_cat and matched_cat:
+                target_cat = matched_cat[0]
+            if not target_cat:
+                target_cat = cat_cols[0] if cat_cols else list(cols.values())[0]
+
             return QueryContract(
                 query_id=query_id,
                 dataset_id=dataset_id,
                 original_query=question,
                 intent="PROPORTION",
                 answer_type="GROUPED",
-                measure=meas_col,
-                measure_column=meas_col,
-                measure_expression=meas_col,
-                aggregation="SUM",
-                dimensions=[cat_dim],
-                group_by=[cat_dim],
+                measure=target_cat,
+                measure_column=target_cat,
+                measure_expression=target_cat,
+                aggregation="COUNT",
+                dimensions=[target_cat],
+                group_by=[target_cat],
                 should_visualize=True,
                 suggested_chart_type="pie",
-                x_axis=cat_dim,
-                y_axis=f"total_{meas_col.lower()}",
+                x_axis=target_cat,
+                y_axis="investor_count",
             )
 
-        # 5. TOP-N RANKING / HORIZONTAL BAR
-        if top_match and (matched_cat or country_col):
-            cat_dim = matched_cat[0] if matched_cat else country_col
-            meas_col = matched_numeric[0] if matched_numeric else (qty_col or "Quantity")
+        # 6. TOP-N RANKING / HORIZONTAL BAR
+        is_horiz = bool(re.search(r"\b(?:horizontal bar|horizontal)\b", q_lower))
+        if (top_match or is_horiz) and (matched_cat or country_col or cat_cols):
+            cat_dim = None
+            by_m = re.search(r"\bby\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\b", q_lower)
+            if by_m:
+                cat_dim = resolve_column_semantically(by_m.group(1).strip(), list(cols.values()))
+            if not cat_dim:
+                cat_dim = matched_cat[0] if matched_cat else (cat_cols[0] if cat_cols else list(cols.values())[0])
+
+            is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
+            meas_col = None
+            for phrase in ("expected return", "expected_return", "age", "sales", "revenue", "profit", "return"):
+                if phrase in q_lower:
+                    res = resolve_column_semantically(phrase, list(cols.values()))
+                    if res and res != cat_dim:
+                        meas_col = res
+                        break
+
+            agg = ("AVG" if is_avg else "SUM") if meas_col else "COUNT"
+            meas_name = meas_col or cat_dim
+
             return QueryContract(
                 query_id=query_id,
                 dataset_id=dataset_id,
                 original_query=question,
                 intent="RANKING",
                 answer_type="GROUPED",
-                measure=meas_col,
-                measure_column=meas_col,
-                measure_expression=meas_col,
-                aggregation="SUM",
+                measure=meas_name,
+                measure_column=meas_name,
+                measure_expression=meas_name,
+                aggregation=agg,
                 dimensions=[cat_dim],
                 group_by=[cat_dim],
-                limit=limit_val,
-                sort=SortSpec(field=f"total_{meas_col.lower()}", direction="desc"),
+                limit=limit_val or 5,
+                sort=SortSpec(field=f"ranking_metric", direction="desc"),
                 should_visualize=True,
                 suggested_chart_type="horizontal_bar",
                 x_axis=cat_dim,
-                y_axis=f"total_{meas_col.lower()}",
+                y_axis=meas_name,
             )
 
-        # 6. TIME-BASED TREND (Single or Multi-Series)
-        is_trend = bool(re.search(
-            r"\b(?:over time|changed over time|change over time|trend|trend over time|historical trend|daily|weekly|monthly|quarterly|yearly|annually|month by month|day by day|year by year|sales trend|revenue trend|quantity trend|timeline|trajectory)\b",
-            q_lower
-        ))
-        if is_trend and (date_col or group_by):
-            trend_dim = date_col or (group_by[0] if group_by else "Date")
-            series_dim = matched_cat[0] if matched_cat else None
-            trend_groups = [trend_dim]
-            if series_dim and series_dim != trend_dim:
-                trend_groups.append(series_dim)
+        # 7. STANDARD BAR / GROUPED CATEGORICAL
+        if "bar" in q_lower or asks_grouping:
+            cat_dim = None
+            by_m = re.search(r"\b(?:by|for each|across)\s+([a-zA-Z_]+(?:\s+[a-zA-Z_]+)?)\b", q_lower)
+            if by_m:
+                cat_dim = resolve_column_semantically(by_m.group(1).strip(), list(cols.values()))
+            if not cat_dim and matched_cat:
+                cat_dim = matched_cat[0]
+            if not cat_dim:
+                cat_dim = cat_cols[0] if cat_cols else list(cols.values())[0]
 
-            meas_name = matched_numeric[0] if matched_numeric else ("revenue" if "revenue" in q_lower else (qty_col or "Quantity"))
-            meas_col = matched_numeric[0] if matched_numeric else (f"{qty_col} * {price_col}" if (qty_col and price_col and "revenue" in q_lower) else qty_col)
-            expr = f'"{qty_col}" * "{price_col}"' if (not matched_numeric and qty_col and price_col and "revenue" in q_lower) else meas_col
+            is_count = bool(re.search(r"\b(?:number of|count of|how many|records|investors)\b", q_lower))
+            is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
+            meas_col = None
+            for phrase in ("age", "expected return", "expected_return", "sales", "revenue", "profit", "price", "unitprice"):
+                if phrase in q_lower:
+                    res = resolve_column_semantically(phrase, list(cols.values()))
+                    if res and res != cat_dim:
+                        meas_col = res
+                        break
+
+            agg = "COUNT" if is_count or not meas_col else ("AVG" if is_avg else "SUM")
+            meas = cat_dim if agg == "COUNT" else meas_col
+
             return QueryContract(
                 query_id=query_id,
                 dataset_id=dataset_id,
                 original_query=question,
-                intent="TIME_SERIES",
+                intent="AGGREGATION",
                 answer_type="GROUPED",
-                measure=meas_name,
-                measure_column=meas_col,
-                measure_expression=expr,
-                aggregation="SUM",
-                time_column=trend_dim,
-                time_granularity=time_grain,
-                series_dimension=series_dim,
-                dimensions=trend_groups,
-                group_by=trend_groups,
+                measure=meas,
+                measure_column=meas,
+                measure_expression=meas,
+                aggregation=agg,
+                dimensions=[cat_dim],
+                group_by=[cat_dim],
                 should_visualize=True,
-                suggested_chart_type="line",
-                x_axis=trend_dim,
-                y_axis=f"total_{meas_name.lower()}",
-                sort=SortSpec(field=trend_dim, direction="asc"),
+                suggested_chart_type="bar",
+                x_axis=cat_dim,
+                y_axis=f"{agg.lower()}_{meas.lower()}",
             )
 
-        # 7. REVENUE
+        # 8. RETAIL-SPECIFIC ONLY IF COLUMNS EXIST IN SCHEMA
         is_revenue = bool(re.search(r"\b(?:revenue|turnover|total sales)\b", q_lower))
-        if is_revenue:
-            expr = f'"{qty_col}" * "{price_col}"' if qty_col and price_col else "revenue"
+        if is_revenue and qty_col and price_col:
+            expr = f'"{qty_col}" * "{price_col}"'
             sort = SortSpec(field="total_revenue", direction="desc") if (top_match or "highest" in q_lower) else None
             return QueryContract(
                 query_id=query_id,
@@ -691,7 +903,7 @@ USER QUESTION:
                 intent="AGGREGATION",
                 answer_type="GROUPED" if group_by else "SCALAR",
                 measure="revenue",
-                measure_column=f"{qty_col} * {price_col}" if qty_col and price_col else "revenue",
+                measure_column=f"{qty_col} * {price_col}",
                 measure_expression=expr,
                 aggregation="SUM",
                 group_by=group_by,
@@ -703,107 +915,10 @@ USER QUESTION:
                 y_axis="total_revenue" if group_by else None,
             )
 
-
-        # 5. TRANSACTIONS / ORDERS / INVOICES
-        is_trans = bool(re.search(r"\b(?:transactions?|orders?|invoices?)\b", q_lower))
-        if is_trans:
-            agg_type = "COUNT_DISTINCT" if (inv_col and "unique" in q_lower) else "COUNT"
-            return QueryContract(
-                query_id=query_id,
-                dataset_id=dataset_id,
-                original_query=question,
-                intent="AGGREGATION",
-                answer_type="GROUPED" if group_by else "SCALAR",
-                measure=inv_col or "InvoiceNo",
-                measure_column=inv_col or "InvoiceNo",
-                measure_expression=inv_col or "InvoiceNo",
-                aggregation=agg_type,
-                group_by=group_by,
-                limit=limit_val,
-                should_visualize=bool(group_by),
-                suggested_chart_type="bar" if group_by else None,
-            )
-
-        # 6. PRICE
-        is_price = bool(re.search(r"\b(?:unit\s*price|price per unit|unitprice|price)\b", q_lower))
-        is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
-        if is_price and price_col and not is_revenue:
-            agg = "AVG" if is_avg else "SUM"
-            return QueryContract(
-                query_id=query_id,
-                dataset_id=dataset_id,
-                original_query=question,
-                intent="AGGREGATION",
-                answer_type="GROUPED" if group_by else "SCALAR",
-                measure="UnitPrice",
-                measure_column=price_col,
-                measure_expression=price_col,
-                aggregation=agg,
-                group_by=group_by,
-                limit=limit_val,
-                should_visualize=bool(group_by),
-            )
-
-        # 7. UNITS / QUANTITY
-        is_units = (
-            bool(re.search(r"\b(?:quantity|items?|units?\s+sold|items?\s+sold)\b", q_lower))
-            or (bool(re.search(r"\bunits?\b", q_lower)) and not is_price)
-        )
-        if is_units and qty_col:
-            agg = "AVG" if is_avg else "SUM"
-            return QueryContract(
-                query_id=query_id,
-                dataset_id=dataset_id,
-                original_query=question,
-                intent="AGGREGATION",
-                answer_type="GROUPED" if group_by else "SCALAR",
-                measure="Quantity",
-                measure_column=qty_col,
-                measure_expression=qty_col,
-                aggregation=agg,
-                group_by=group_by,
-                limit=limit_val,
-                should_visualize=bool(group_by),
-                suggested_chart_type="bar" if group_by else None,
-            )
-
-        # 8. UNIQUE CUSTOMERS
-        is_unique = bool(re.search(r"\b(?:unique|distinct)\b", q_lower))
-        if is_unique and cust_col:
-            return QueryContract(
-                query_id=query_id,
-                dataset_id=dataset_id,
-                original_query=question,
-                intent="AGGREGATION",
-                answer_type="SCALAR",
-                measure="CustomerID",
-                measure_column=cust_col,
-                measure_expression=cust_col,
-                aggregation="COUNT_DISTINCT",
-            )
-
-        # 9. POPULAR / RANKED CATEGORY (e.g. Most popular investment avenue)
-        is_popular = bool(re.search(r"\b(?:most popular|popular|highest count|top avenue|favorite)\b", q_lower))
-        if is_popular and matched_cat_col:
-            return QueryContract(
-                query_id=query_id,
-                dataset_id=dataset_id,
-                original_query=question,
-                intent="AGGREGATION",
-                answer_type="GROUPED",
-                measure=matched_cat_col,
-                measure_column=matched_cat_col,
-                measure_expression=matched_cat_col,
-                aggregation="COUNT",
-                group_by=[matched_cat_col],
-                sort=SortSpec(field="investor_count", direction="desc"),
-                limit=1,
-                should_visualize=False,
-            )
-
-        # 10. GENERIC METRIC IN QUESTION
+        # 9. GENERIC METRIC IN QUESTION
         metric_col = next((real for low, real in cols.items() if low in q_lower or low.replace("_", " ") in q_lower), None)
         if metric_col:
+            is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
             agg = "AVG" if is_avg else ("COUNT" if "count" in q_lower else "SUM")
             ans_type = "GROUPED" if group_by else "SCALAR"
             return QueryContract(

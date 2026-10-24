@@ -17,7 +17,7 @@ from app.agents.visualization.contract import QueryContract
 SUPPORTED_CHART_TYPES = {
     "bar", "horizontal_bar", "grouped_bar", "stacked_bar",
     "clustered_column", "clustered_bar", "stacked_column", "stacked_bar",
-    "line", "pie", "donut", "histogram", "scatter", "box", "box_plot", "heatmap", "area", "kpi", "card"
+    "line", "multi_line", "pie", "donut", "histogram", "scatter", "box", "box_plot", "heatmap", "area", "kpi", "card"
 }
 
 
@@ -52,6 +52,10 @@ class SpecValidator:
                 chart_obj["type"] = "horizontal_bar"
                 chart_obj["mode"] = "stacked"
                 chart_obj["orientation"] = "horizontal"
+            elif v_lower in ("multi_line", "multiline"):
+                chart_obj["type"] = "line"
+                chart_obj["mode"] = "lines+markers"
+                chart_obj["orientation"] = "vertical"
             else:
                 chart_obj["type"] = v_lower
 
@@ -68,6 +72,8 @@ class SpecValidator:
             fields["color"] = spec["legend"]
         if "color" in spec and "color" not in fields:
             fields["color"] = spec["color"]
+        if "series_dimension" in spec and "color" not in fields:
+            fields["color"] = spec["series_dimension"]
         normalized["fields"] = fields
 
         measure = dict(spec.get("measure") or {})
@@ -196,46 +202,58 @@ class SpecValidator:
         intent = str(contract.intent or "").lower()
         avail = [str(c) for c in available_columns if c]
 
-        # Case 0: Time Series / Line Chart (Single or Multi-Series)
-        is_time_series = (
-            explicit_chart in ("line", "trend")
+        # Case 0: Line / Multi-Series Line Chart (Temporal or Numeric X-Axis)
+        is_line_chart = (
+            explicit_chart in ("line", "trend", "multi_line", "multiline")
             or intent in ("trend", "time_series")
             or bool(contract.time_granularity)
             or any("date" in str(f).lower() or "time" in str(f).lower() or "year" in str(f).lower() for f in requested + dims)
         )
-        if is_time_series:
-            # Detect temporal column for X
+        if is_line_chart:
+            # Check for temporal column first
             time_col = next((
                 c for c in dims + requested + avail
                 if any(k in c.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day", "created_at", "saledate"))
-            ), (dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Date"))))
+            ), None)
 
-            # Detect measure column for Y
-            meas_col = contract.measure.get("column") if isinstance(contract.measure, dict) else None
-            if not meas_col:
-                meas_col = next((
-                    c for c in requested + avail
-                    if c != time_col and any(k in c.lower() for k in ("revenue", "total", "quantity", "price", "amount", "sales", "profit", "value", "unitprice"))
-                ), (requested[0] if requested and requested[0] != time_col else (avail[1] if len(avail) > 1 else "Value")))
+            # If no temporal column, use first dimension or requested column (e.g. Age)
+            x_col = time_col or (dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "X")))
 
-            meas_type = contract.measure.get("type", "sum") if isinstance(contract.measure, dict) else "sum"
-            meas_label = str(meas_col).replace("_", " ").title()
-
-            # Multi-series line chart check
+            # Multi-series line chart dimension check
             series_dim = getattr(contract, "series_dimension", None)
             if not series_dim and len(dims) > 1:
-                series_dim = next((d for d in dims if d != time_col), None)
+                series_dim = next((d for d in dims if d != x_col), None)
 
-            chart_title = f"{meas_label} by {str(series_dim).replace('_', ' ').title()} Over Time" if series_dim else f"{meas_label} Over Time"
+            # Detect measure column for Y
+            meas_col = contract.measure.get("column") if isinstance(contract.measure, dict) else (getattr(contract, "measure_column", None) or getattr(contract, "measure", None))
+            if not meas_col or meas_col in (x_col, series_dim):
+                meas_candidates = [c for c in requested if c not in (x_col, series_dim)]
+                if meas_candidates:
+                    meas_col = meas_candidates[0]
+                else:
+                    meas_col = next((
+                        c for c in avail
+                        if c not in (x_col, series_dim) and any(k in c.lower() for k in ("return", "expect", "revenue", "total", "quantity", "price", "amount", "sales", "profit", "value", "unitprice", "score"))
+                    ), next((c for c in avail if c not in (x_col, series_dim)), "Value"))
+
+            meas_type = contract.measure.get("type", "avg") if isinstance(contract.measure, dict) else (contract.aggregation or "avg")
+            if meas_type in ("SUM", "AVG", "MIN", "MAX", "COUNT"):
+                meas_type = meas_type.lower()
+            meas_label = str(meas_col).replace("_", " ").title()
+
+            title_parts = [f"{meas_type.upper()} {meas_label}" if meas_type != "raw" else meas_label, f"by {str(x_col).replace('_', ' ').title()}"]
+            if series_dim:
+                title_parts.append(f"for {str(series_dim).replace('_', ' ').title()}")
+            chart_title = " ".join(title_parts)
 
             return {
                 "visualization_available": True,
                 "query_interpretation": {
-                    "intent": "time_series",
-                    "requested_fields": [time_col, meas_col] + ([series_dim] if series_dim else []),
+                    "intent": "time_series" if time_col else "trend",
+                    "requested_fields": [x_col, meas_col] + ([series_dim] if series_dim else []),
                 },
                 "fields": {
-                    "x": time_col,
+                    "x": x_col,
                     "y": meas_col,
                     "color": series_dim,
                     "facet": None,
@@ -245,10 +263,10 @@ class SpecValidator:
                     "column": meas_col,
                 },
                 "filters": contract.filters,
-                "sorting": {"field": time_col, "direction": "asc"},
+                "sorting": {"field": x_col, "direction": "asc"},
                 "limit": contract.limit,
                 "binning": None,
-                "time_granularity": getattr(contract, "time_granularity", None) or "month",
+                "time_granularity": getattr(contract, "time_granularity", None) or ("month" if time_col else None),
                 "chart": {
                     "type": "line",
                     "orientation": "vertical",
@@ -256,7 +274,7 @@ class SpecValidator:
                 },
                 "title": chart_title,
                 "axis_labels": {
-                    "x": str(time_col).replace("_", " ").title(),
+                    "x": str(x_col).replace("_", " ").title(),
                     "y": meas_label,
                 },
                 "legend": {

@@ -19,8 +19,67 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def ensure_1d(val: Any, col_name: str = "") -> Optional[pd.Series]:
+    """
+    Universally guarantees that axis data is a valid 1-D pandas Series.
+    Rejects or squeezes 2-D DataFrames/arrays, flattens series containing arrays,
+    and returns a clean pd.Series with a reset index.
+    """
+    if val is None:
+        return None
+
+    # Handle DataFrame
+    if isinstance(val, pd.DataFrame):
+        if val.empty:
+            return pd.Series(dtype=object)
+        if val.shape[1] == 1:
+            val = val.iloc[:, 0]
+        else:
+            # If multiple columns have the exact same name (duplicate columns in DataFrame), take first
+            if len(set(val.columns)) == 1:
+                val = val.iloc[:, 0]
+            else:
+                raise ValueError(
+                    f"Expected 1-D series for '{col_name}', but received DataFrame with {val.shape[1]} columns: {list(val.columns)}"
+                )
+
+    # Handle numpy ndarray
+    if isinstance(val, np.ndarray):
+        squeezed = np.asarray(val).squeeze()
+        if squeezed.ndim == 0:
+            squeezed = np.array([squeezed])
+        elif squeezed.ndim != 1:
+            raise ValueError(
+                f"Expected 1-D array for '{col_name}', but received array with shape {val.shape}"
+            )
+        return pd.Series(squeezed).reset_index(drop=True)
+
+    # Handle list or tuple
+    if isinstance(val, (list, tuple)):
+        if val and isinstance(val[0], (list, tuple, np.ndarray)):
+            flat = [item[0] if len(item) == 1 else item for item in val]
+            if any(isinstance(x, (list, tuple, np.ndarray)) for x in flat):
+                raise ValueError(f"Expected 1-D sequence for '{col_name}', received nested sequence")
+            return pd.Series(flat).reset_index(drop=True)
+        return pd.Series(val).reset_index(drop=True)
+
+    # Handle pandas Series
+    if isinstance(val, pd.Series):
+        if not val.empty and isinstance(val.iloc[0], (np.ndarray, list, tuple)):
+            if all(len(x) == 1 for x in val.dropna()):
+                val = val.apply(lambda x: x[0] if isinstance(x, (np.ndarray, list, tuple)) and len(x) == 1 else x)
+            else:
+                raise ValueError(f"Series for '{col_name}' contains multi-element array entries")
+        return val.reset_index(drop=True)
+
+    # Scalar / single element
+    return pd.Series([val])
+
+
 class DataPreparer:
     """Prepares tabular data for Plotly rendering and calculates true mathematical insights."""
+
+    ensure_1d = staticmethod(ensure_1d)
 
     @staticmethod
     def parse_range_midpoint(val: Any) -> Optional[float]:
@@ -190,11 +249,22 @@ class DataPreparer:
             return prepared_df, applied_params, insights
 
         # Case B: Histogram / Distribution
-        if chart_type == "histogram":
-            # Verify data type: Categorical data must NOT be histogrammed!
+        if chart_type in ("histogram", "distribution"):
+            # Check if range category (e.g. Expect '10-20%', '20-30%')
+            is_range_cat = (
+                work_df[x_col].astype(str).str.contains(r"\d+\s*[-–—to]\s*\d+").mean() >= 0.6
+                or "expect" in str(x_col).lower()
+                or "return" in str(x_col).lower()
+            ) and pd.to_numeric(work_df[x_col], errors="coerce").isna().sum() > 0
+
             num_check = pd.to_numeric(work_df[x_col], errors="coerce")
-            if num_check.notna().mean() < 0.8:
-                # Column is categorical: route to Bar chart of counts
+            if is_range_cat:
+                raw_obs = work_df[x_col].apply(cls.parse_range_midpoint).dropna()
+                parameters_used.append(f"Derived Numerical Midpoints for '{x_col}' (e.g. 10-20% → 15%, 20-30% → 25%)")
+            elif num_check.notna().mean() >= 0.7:
+                raw_obs = num_check.dropna()
+            else:
+                # Column is purely categorical: route to Bar chart of counts
                 prepared_df = work_df[x_col].value_counts().reset_index()
                 prepared_df.columns = [x_col, "investor_count"]
                 parameters_used.append(f"Category: {x_col}")
@@ -208,25 +278,27 @@ class DataPreparer:
                 insights.append(f"Distribution of categorical field '{x_col}' across {total_filtered_rows} observations.")
                 return prepared_df, applied_params, insights
 
-            # HISTOGRAM RULE: Keep raw observations
-            raw_obs = num_check.dropna()
+            # HISTOGRAM RULE: Keep raw 1-D observations
+            raw_obs = ensure_1d(raw_obs, str(x_col)).dropna()
             total_obs = len(raw_obs)
             bin_size = binning.get("bin_size") or binning.get("size")
 
-            # Bin edge calculation and validation
+            if total_obs > 0 and not bin_size:
+                # Dynamic bin calculation
+                min_v = float(raw_obs.min())
+                max_v = float(raw_obs.max())
+                val_range = max_v - min_v
+                n_uniq = raw_obs.nunique()
+                if val_range == 0 or n_uniq <= 5:
+                    bin_size = 1.0
+                else:
+                    iqr = float(raw_obs.quantile(0.75) - raw_obs.quantile(0.25))
+                    h = (2.0 * iqr / (total_obs ** (1.0 / 3.0))) if iqr > 0 else (val_range / max(1.0 + np.log2(total_obs), 1.0))
+                    candidates = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0]
+                    bin_size = min(candidates, key=lambda c: abs(c - h))
+
             if bin_size:
-                min_edge = float(np.floor(raw_obs.min() / bin_size) * bin_size)
-                max_edge = float(np.ceil(raw_obs.max() / bin_size) * bin_size)
-                edges = np.arange(min_edge, max_edge + bin_size, bin_size)
-                counts, _ = np.histogram(raw_obs, bins=edges)
-                # BIN VALIDATION: adjacent edges differ by bin_size and counts sum to total_obs
-                edge_diffs = np.diff(edges)
-                assert np.allclose(edge_diffs, bin_size), "Adjacent bin edges must differ by bin_size."
-                assert counts.sum() == total_obs, f"Histogram count sum ({counts.sum()}) must equal total observations ({total_obs})."
                 parameters_used.append(f"Bin Size: {bin_size}")
-            else:
-                counts, edges = np.histogram(raw_obs, bins="auto")
-                assert counts.sum() == total_obs, f"Histogram count sum ({counts.sum()}) must equal total observations ({total_obs})."
 
             prepared_df = pd.DataFrame({x_col: raw_obs})
             parameters_used.append(f"Variable: {x_col}")
@@ -274,20 +346,22 @@ class DataPreparer:
             return prepared_df, applied_params, insights
 
         # Case D: Scatter / Relationship
-        if chart_type == "scatter" and x_col and y_col and x_col in work_df.columns and y_col in work_df.columns:
-            plot_df = work_df.copy()
+        if chart_type in ("scatter", "relationship") and x_col and y_col and x_col in work_df.columns and y_col in work_df.columns:
+            # 1-D normalizer ensures strictly 1D series
+            s_x = ensure_1d(work_df[x_col], str(x_col))
+            s_y = ensure_1d(work_df[y_col], str(y_col))
+
             actual_y = y_col
             # Check if y_col is categorical range (e.g. '10-20%', '20-30%', '30-40%')
             y_is_range = (
-                plot_df[y_col].astype(str).str.contains(r"\d+\s*[-–—to]\s*\d+").mean() >= 0.6
-                or "expect" in y_col.lower()
-                or "return" in y_col.lower()
-            ) and pd.to_numeric(plot_df[y_col], errors="coerce").isna().sum() > 0
+                s_y.astype(str).str.contains(r"\d+\s*[-–—to]\s*\d+").mean() >= 0.6
+                or "expect" in str(y_col).lower()
+                or "return" in str(y_col).lower()
+            ) and pd.to_numeric(s_y, errors="coerce").isna().sum() > 0
 
             if y_is_range:
-                midpoint_col = "Expected Return Midpoint (%)"
-                plot_df[midpoint_col] = plot_df[y_col].apply(cls.parse_range_midpoint)
-                actual_y = midpoint_col
+                actual_y = "Expected Return Midpoint (%)"
+                s_y = s_y.apply(cls.parse_range_midpoint)
                 parameters_used.append(
                     "Derived Numerical Field: 'Expected Return Midpoint (%)' calculated transparently from range categories (10-20% → 15%, 20-30% → 25%, 30-40% → 35%)"
                 )
@@ -295,25 +369,29 @@ class DataPreparer:
             # Check if x_col is categorical range
             actual_x = x_col
             x_is_range = (
-                plot_df[x_col].astype(str).str.contains(r"\d+\s*[-–—to]\s*\d+").mean() >= 0.6
-            ) and pd.to_numeric(plot_df[x_col], errors="coerce").isna().sum() > 0
+                s_x.astype(str).str.contains(r"\d+\s*[-–—to]\s*\d+").mean() >= 0.6
+            ) and pd.to_numeric(s_x, errors="coerce").isna().sum() > 0
 
             if x_is_range:
-                midpoint_x = f"{x_col} Midpoint"
-                plot_df[midpoint_x] = plot_df[x_col].apply(cls.parse_range_midpoint)
-                actual_x = midpoint_x
-                parameters_used.append(f"Derived Numerical Field: '{midpoint_x}' from categorical ranges")
+                actual_x = f"{x_col} Midpoint"
+                s_x = s_x.apply(cls.parse_range_midpoint)
+                parameters_used.append(f"Derived Numerical Field: '{actual_x}' from categorical ranges")
 
             # Numeric coercion for X and Y
-            plot_df[actual_x] = pd.to_numeric(plot_df[actual_x], errors="coerce")
-            plot_df[actual_y] = pd.to_numeric(plot_df[actual_y], errors="coerce")
+            s_x = pd.to_numeric(s_x, errors="coerce")
+            s_y = pd.to_numeric(s_y, errors="coerce")
 
-            cols_to_keep = [actual_x, actual_y]
-            if color_col and color_col in plot_df.columns:
-                cols_to_keep.append(color_col)
+            df_dict = {actual_x: s_x, actual_y: s_y}
+            if color_col and color_col in work_df.columns and color_col not in (x_col, y_col):
+                df_dict[color_col] = ensure_1d(work_df[color_col], str(color_col))
 
-            clean_df = plot_df[cols_to_keep].dropna(subset=[actual_x, actual_y])
+            clean_df = pd.DataFrame(df_dict).dropna(subset=[actual_x, actual_y])
             total_obs = len(clean_df)
+
+            # Strict 1-D & equal length validation
+            assert ensure_1d(clean_df[actual_x]).ndim == 1, "Scatter X axis must be 1-D Series"
+            assert ensure_1d(clean_df[actual_y]).ndim == 1, "Scatter Y axis must be 1-D Series"
+            assert len(clean_df[actual_x]) == len(clean_df[actual_y]), "Scatter X and Y must have equal length"
 
             parameters_used.append(f"X-Axis: {actual_x}")
             parameters_used.append(f"Y-Axis: {actual_y}")
@@ -331,7 +409,7 @@ class DataPreparer:
                 except Exception:
                     insights.append(f"Plotted {total_obs} observations comparing {actual_x} and {actual_y}.")
 
-            # Deterministic visualization sampling for large datasets (> 5000 rows)
+            # Deterministic visualization sampling for very large datasets (> 5000 rows)
             if total_obs > 5000:
                 prepared_df = clean_df.sample(n=5000, random_state=42).reset_index(drop=True)
                 parameters_used.append(f"Rendering: Deterministic visual sample of 5,000 points from {total_obs} total rows")
@@ -348,121 +426,131 @@ class DataPreparer:
             }
             return prepared_df, applied_params, insights
 
-        # Case E: Line Chart / Time Series (Single or Multi-Series)
-        if (chart_type in ("line", "trend") or "time" in chart_type) and x_col and x_col in work_df.columns:
+        # Case E: Line Chart / Multi-Series Line (Numeric or Chronological Sort)
+        if (chart_type in ("line", "trend", "multi_line") or "time" in str(chart_type).lower()) and x_col and x_col in work_df.columns:
             other_cols = [c for c in work_df.columns if c not in (x_col, color_col)]
             val_col = y_col if (y_col and y_col in work_df.columns and y_col != x_col) else (other_cols[0] if other_cols else x_col)
             meas_type = measure_type if measure_type in ("sum", "mean", "min", "max", "count") else "sum"
 
-            # Parse datetime
-            dt_series = pd.to_datetime(work_df[x_col], errors="coerce")
-            is_valid_datetime = dt_series.notna().mean() >= 0.5
-
-            time_grain = spec.get("time_granularity")
-            if not time_grain:
-                if is_valid_datetime:
-                    valid_dts = dt_series.dropna()
-                    if not valid_dts.empty:
-                        span_days = (valid_dts.max() - valid_dts.min()).days
-                        if span_days > 730:
-                            time_grain = "year"
-                        elif span_days > 45:
-                            time_grain = "month"
-                        elif span_days > 14:
-                            time_grain = "week"
-                        else:
-                            time_grain = "day"
-                    else:
-                        time_grain = "month"
-                else:
-                    time_grain = "month"
-
-            time_grain = str(time_grain).lower()
-
             plot_df = work_df.copy()
-            if is_valid_datetime:
-                plot_df["_dt"] = dt_series
-                plot_df = plot_df.dropna(subset=["_dt"])
-                if time_grain == "year":
-                    plot_df["_time_key"] = plot_df["_dt"].dt.strftime("%Y")
-                elif time_grain == "quarter":
-                    plot_df["_time_key"] = plot_df["_dt"].dt.to_period("Q").astype(str)
-                elif time_grain == "month":
-                    plot_df["_time_key"] = plot_df["_dt"].dt.strftime("%Y-%m")
-                elif time_grain == "week":
-                    plot_df["_time_key"] = plot_df["_dt"].dt.strftime("%Y-W%W")
-                elif time_grain == "day":
-                    plot_df["_time_key"] = plot_df["_dt"].dt.strftime("%Y-%m-%d")
-                else:
-                    plot_df["_time_key"] = plot_df["_dt"].dt.strftime("%Y-%m")
+
+            # 1. Determine if X is numeric (e.g. Age, Tenor, Year number) or Datetime
+            x_num = pd.to_numeric(plot_df[x_col], errors="coerce")
+            x_is_numeric = (
+                pd.api.types.is_numeric_dtype(plot_df[x_col])
+                or (x_num.notna().mean() >= 0.85 and not any(k in str(x_col).lower() for k in ("date", "time", "invoicedate")))
+            )
+
+            is_valid_datetime = False
+            time_grain = spec.get("time_granularity") or "month"
+
+            if x_is_numeric:
+                plot_df["_x_clean"] = x_num
+                plot_df = plot_df.dropna(subset=["_x_clean"])
             else:
-                plot_df["_time_key"] = plot_df[x_col].astype(str)
+                # Check for datetime
+                dt_series = pd.to_datetime(plot_df[x_col], errors="coerce")
+                if dt_series.notna().mean() >= 0.5:
+                    is_valid_datetime = True
+                    plot_df["_dt"] = dt_series
+                    plot_df = plot_df.dropna(subset=["_dt"])
+                    time_grain = str(time_grain).lower()
+                    if time_grain == "year":
+                        plot_df["_x_clean"] = plot_df["_dt"].dt.strftime("%Y")
+                    elif time_grain == "quarter":
+                        plot_df["_x_clean"] = plot_df["_dt"].dt.to_period("Q").astype(str)
+                    elif time_grain == "week":
+                        plot_df["_x_clean"] = plot_df["_dt"].dt.strftime("%Y-W%W")
+                    elif time_grain == "day":
+                        plot_df["_x_clean"] = plot_df["_dt"].dt.strftime("%Y-%m-%d")
+                    else:
+                        plot_df["_x_clean"] = plot_df["_dt"].dt.strftime("%Y-%m")
+                else:
+                    plot_df["_x_clean"] = plot_df[x_col].astype(str)
 
-            # Ensure numeric val_col for aggregation
-            plot_df[val_col] = pd.to_numeric(plot_df[val_col], errors="coerce")
+            # 2. Determine and parse value column (val_col)
+            # Check if val_col is a range category (e.g. Expect '10-20%', '20-30%')
+            val_is_range = (
+                plot_df[val_col].astype(str).str.contains(r"\d+\s*[-–—to]\s*\d+").mean() >= 0.6
+                or "expect" in str(val_col).lower()
+                or "return" in str(val_col).lower()
+            ) and pd.to_numeric(plot_df[val_col], errors="coerce").isna().sum() > 0
 
-            # Multi-series line chart
+            if val_is_range:
+                plot_df["_val_clean"] = plot_df[val_col].apply(cls.parse_range_midpoint)
+                parameters_used.append("Calculated numeric midpoints for range categories (e.g. 10-20% → 15%, 20-30% → 25%)")
+            else:
+                plot_df["_val_clean"] = pd.to_numeric(plot_df[val_col], errors="coerce")
+
+            plot_df = plot_df.dropna(subset=["_val_clean"])
+            agg_fn = "mean" if meas_type in ("mean", "avg", "average") else ("count" if meas_type == "count" else meas_type)
+
+            # 3. Multi-series vs Single-line
             has_multi_series = bool(color_col and color_col in plot_df.columns and color_col != x_col)
-            if has_multi_series:
-                # Limit top categories to top 6 to prevent visual clutter
-                top_categories = (
-                    plot_df.groupby(color_col)[val_col]
-                    .sum()
-                    .nlargest(6)
-                    .index.tolist()
-                )
-                plot_df["_series_clean"] = plot_df[color_col].apply(
-                    lambda c: str(c) if c in top_categories else "Other"
-                )
 
-                agg_fn = "count" if meas_type == "count" else meas_type
+            if has_multi_series:
+                # Group by [X, series_dim] and aggregate
                 prepared_df = (
-                    plot_df.groupby(["_time_key", "_series_clean"])[val_col]
+                    plot_df.groupby(["_x_clean", color_col])["_val_clean"]
                     .agg(agg_fn)
                     .reset_index(name=val_col)
                 )
-                prepared_df = prepared_df.rename(
-                    columns={"_time_key": x_col, "_series_clean": color_col}
-                )
-                prepared_df = prepared_df.sort_values(by=x_col, ascending=True)
+                prepared_df = prepared_df.rename(columns={"_x_clean": x_col})
+                
+                # Sort numerically if X is numeric, chronologically if datetime, else standard
+                if x_is_numeric:
+                    prepared_df[x_col] = pd.to_numeric(prepared_df[x_col], errors="coerce")
+                    prepared_df = prepared_df.sort_values(by=[x_col, color_col], ascending=[True, True])
+                else:
+                    prepared_df = prepared_df.sort_values(by=[x_col, color_col], ascending=[True, True])
 
-                parameters_used.append(f"Time Dimension (X-Axis): {x_col}")
-                parameters_used.append(f"Time Grain: {time_grain.capitalize()}")
+                # Validate: exactly 1-D series for all Plotly axes
+                assert ensure_1d(prepared_df[x_col]).ndim == 1, "X axis must be 1-D Series"
+                assert ensure_1d(prepared_df[val_col]).ndim == 1, "Y axis must be 1-D Series"
+                assert ensure_1d(prepared_df[color_col]).ndim == 1, "Color series must be 1-D Series"
+
+                series_vals = prepared_df[color_col].unique()
+                parameters_used.append(f"X-Axis: {x_col}")
                 parameters_used.append(f"Metric (Y-Axis): {val_col}")
                 parameters_used.append(f"Aggregation: {meas_type.upper()}")
-                parameters_used.append(f"Series (Lines): {color_col} (Top {len(top_categories)} categories + Other)")
-                parameters_used.append("Sort: Chronological Ascending")
+                parameters_used.append(f"Series (Lines): {color_col} ({len(series_vals)} lines: {', '.join(str(s) for s in series_vals[:5])})")
+                parameters_used.append(f"Sort: {x_col} Ascending ({'Numeric' if x_is_numeric else 'Chronological'})")
 
                 applied_params = {
                     "chart_type": "Multi-Series Line Chart",
                     "x_axis": x_col,
-                    "time_granularity": time_grain.capitalize(),
                     "y_axis": val_col,
                     "aggregation": meas_type.upper(),
                     "series": color_col,
-                    "sorting": "Chronological Ascending",
+                    "sorting": "Numeric Ascending" if x_is_numeric else "Chronological Ascending",
                     "filters": [f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters],
                 }
                 insights.append(
-                    f"Multi-series trajectory of {val_col.replace('_', ' ').title()} by {color_col.replace('_', ' ').title()} across {len(prepared_df[x_col].unique())} time periods ({time_grain})."
+                    f"Multi-line trajectory of {val_col.replace('_', ' ').title()} across {x_col} grouped by {color_col}."
                 )
                 return prepared_df, applied_params, insights
 
             # Single line chart
-            agg_fn = "count" if meas_type == "count" else meas_type
             prepared_df = (
-                plot_df.groupby("_time_key")[val_col]
+                plot_df.groupby("_x_clean")["_val_clean"]
                 .agg(agg_fn)
                 .reset_index(name=val_col)
             )
-            prepared_df = prepared_df.rename(columns={"_time_key": x_col})
-            prepared_df = prepared_df.sort_values(by=x_col, ascending=True)
+            prepared_df = prepared_df.rename(columns={"_x_clean": x_col})
+            if x_is_numeric:
+                prepared_df[x_col] = pd.to_numeric(prepared_df[x_col], errors="coerce")
+                prepared_df = prepared_df.sort_values(by=x_col, ascending=True)
+            else:
+                prepared_df = prepared_df.sort_values(by=x_col, ascending=True)
 
-            parameters_used.append(f"Time Dimension (X-Axis): {x_col}")
-            parameters_used.append(f"Time Grain: {time_grain.capitalize()}")
+            # Validate: strictly 1-D
+            assert ensure_1d(prepared_df[x_col]).ndim == 1, "X axis must be 1-D Series"
+            assert ensure_1d(prepared_df[val_col]).ndim == 1, "Y axis must be 1-D Series"
+
+            parameters_used.append(f"X-Axis: {x_col}")
             parameters_used.append(f"Metric (Y-Axis): {val_col}")
             parameters_used.append(f"Aggregation: {meas_type.upper()}")
-            parameters_used.append("Sort: Chronological Ascending")
+            parameters_used.append(f"Sort: {x_col} Ascending ({'Numeric' if x_is_numeric else 'Chronological'})")
 
             if not prepared_df.empty:
                 first_pt = prepared_df.iloc[0]
@@ -472,16 +560,15 @@ class DataPreparer:
                 vf_str = f"{v_first:,.2f}" if isinstance(v_first, (int, float)) else str(v_first)
                 vl_str = f"{v_last:,.2f}" if isinstance(v_last, (int, float)) else str(v_last)
                 insights.append(
-                    f"{val_col.replace('_', ' ').title()} trajectory from {first_pt[x_col]} ({vf_str}) to {last_pt[x_col]} ({vl_str}) across {len(prepared_df)} time points ({time_grain})."
+                    f"{val_col.replace('_', ' ').title()} trajectory from {first_pt[x_col]} ({vf_str}) to {last_pt[x_col]} ({vl_str}) across {len(prepared_df)} observations."
                 )
 
             applied_params = {
-                "chart_type": "Line Chart (Time Series)",
+                "chart_type": "Line Chart",
                 "x_axis": x_col,
-                "time_granularity": time_grain.capitalize(),
                 "y_axis": val_col,
                 "aggregation": meas_type.upper(),
-                "sorting": "Chronological Ascending",
+                "sorting": "Numeric Ascending" if x_is_numeric else "Chronological Ascending",
                 "filters": [f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters],
             }
             return prepared_df, applied_params, insights
@@ -659,3 +746,114 @@ class DataPreparer:
 
         # Fallback raw data
         return work_df, {"chart_type": "Raw Preview"}, ["Data displayed without aggregation."]
+
+    @classmethod
+    def prepare_visualization_data(
+        cls,
+        df: pd.DataFrame,
+        spec: dict[str, Any],
+        question: str = "",
+        query_id: str = "",
+        dataset_id: str = "",
+    ) -> tuple[pd.DataFrame, dict[str, Any], list[str], dict[str, Any]]:
+        """
+        Dedicated Chart Data Preparation Layer adhering to AI-MADAC Specification:
+        1. Validates tabular query result.
+        2. Normalizes column types, resolves midpoints, applies filters, sorts.
+        3. Enforces strictly 1-D structures for all Plotly axes (x, y, color, size).
+        4. Logs full Section 46 debugging metrics.
+        Returns: (prepared_df, applied_parameters, key_insights, chart_data)
+        """
+        prepared_df, applied_params, insights = cls.prepare(df, spec)
+
+        fields = spec.get("fields") or {}
+        chart = spec.get("chart") or {}
+        chart_type = chart.get("type", "bar")
+        x_col = fields.get("x")
+        y_col = fields.get("y")
+        color_col = fields.get("color")
+
+        # Build normalized 1-D chart_data structure (Section 29)
+        chart_data: dict[str, Any] = {
+            "x": None,
+            "y": None,
+            "color": None,
+            "size": None,
+            "hover_data": None,
+        }
+
+        if not prepared_df.empty:
+            cols = prepared_df.columns.tolist()
+            real_x = x_col if (x_col and x_col in cols) else (cols[0] if cols else None)
+            if real_x:
+                chart_data["x"] = ensure_1d(prepared_df[real_x], str(real_x))
+
+            real_y = y_col if (isinstance(y_col, str) and y_col in cols) else (
+                applied_params.get("value") if applied_params.get("value") in cols else (
+                    cols[1] if len(cols) > 1 and cols[1] != real_x else None
+                )
+            )
+            if real_y:
+                chart_data["y"] = ensure_1d(prepared_df[real_y], str(real_y))
+
+            real_color = color_col if (color_col and color_col in cols) else (
+                applied_params.get("series") if applied_params.get("series") in cols else None
+            )
+            if real_color:
+                chart_data["color"] = ensure_1d(prepared_df[real_color], str(real_color))
+
+        x_s = chart_data.get("x")
+        y_s = chart_data.get("y")
+        c_s = chart_data.get("color")
+
+        x_type = type(x_s).__name__ if x_s is not None else "None"
+        x_shape = str(x_s.shape) if x_s is not None else "None"
+        y_type = type(y_s).__name__ if y_s is not None else "None"
+        y_shape = str(y_s.shape) if y_s is not None else "None"
+        c_type = type(c_s).__name__ if c_s is not None else "None"
+        c_shape = str(c_s.shape) if c_s is not None else "None"
+
+        nulls_removed = int(df.isna().any(axis=1).sum() - prepared_df.isna().any(axis=1).sum()) if df is not None and not df.empty else 0
+        nulls_removed = max(0, nulls_removed)
+
+        trace_cnt = len(c_s.unique()) if (c_s is not None and hasattr(c_s, "unique")) else 1
+
+        logger.info(
+            f"\n========== VISUALIZATION PIPELINE DEBUG ==========\n"
+            f"QUERY_ID: {query_id or spec.get('query_id', 'N/A')}\n"
+            f"QUESTION: {question}\n"
+            f"DATASET_ID: {dataset_id}\n"
+            f"INTENT: {spec.get('query_interpretation', {}).get('intent', 'VISUALIZATION')}\n"
+            f"CHART_TYPE: {chart_type}\n"
+            f"X_COLUMN: {x_col}\n"
+            f"Y_COLUMN: {y_col}\n"
+            f"SERIES_COLUMN: {color_col}\n"
+            f"MEASURE: {spec.get('measure', {}).get('column')}\n"
+            f"AGGREGATION: {spec.get('measure', {}).get('type')}\n"
+            f"GROUP_BY: {[x_col, color_col] if color_col else [x_col]}\n"
+            f"RESULT_COLUMNS: {prepared_df.columns.tolist()}\n"
+            f"RESULT_ROW_COUNT: {len(prepared_df)}\n"
+            f"PREPARED_X_TYPE: {x_type}\n"
+            f"PREPARED_X_SHAPE: {x_shape}\n"
+            f"PREPARED_Y_TYPE: {y_type}\n"
+            f"PREPARED_Y_SHAPE: {y_shape}\n"
+            f"PREPARED_COLOR_TYPE: {c_type}\n"
+            f"PREPARED_COLOR_SHAPE: {c_shape}\n"
+            f"NULL_ROWS_REMOVED: {nulls_removed}\n"
+            f"FINAL_PLOTLY_TRACE_COUNT: {trace_cnt}\n"
+            f"=================================================="
+        )
+        prepared_df.attrs["chart_data"] = chart_data
+        return prepared_df, applied_params, insights, chart_data
+
+
+def prepare_visualization_data(
+    df: pd.DataFrame,
+    spec: dict[str, Any],
+    question: str = "",
+    query_id: str = "",
+    dataset_id: str = "",
+) -> tuple[pd.DataFrame, dict[str, Any], list[str], dict[str, Any]]:
+    """Standalone chart data preparation layer."""
+    return DataPreparer.prepare_visualization_data(df, spec, question, query_id, dataset_id)
+

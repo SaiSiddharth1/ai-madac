@@ -338,13 +338,20 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
                       rInfo.response_type === "UNRELATED"
                       || rInfo.answer?.toLowerCase().includes("not related to the currently loaded dataset")
                     );
+                    const hasChart = chartPaths.length > 0;
+                    const isVisualization = (
+                      rInfo.response_type === "VISUALIZATION"
+                      || Boolean(rInfo.visualization?.should_visualize)
+                      || hasChart
+                    );
                     const isScalar = (
-                      rInfo.response_type === "SCALAR"
-                      || Boolean(rInfo.kpi)
-                      || (rInfo.data_used?.rows?.length === 1 && rInfo.data_used?.columns?.length === 1)
+                      !isVisualization && (
+                        rInfo.response_type === "SCALAR"
+                        || Boolean(rInfo.kpi)
+                        || (rInfo.data_used?.rows?.length === 1 && rInfo.data_used?.columns?.length === 1)
+                      )
                     );
                     const hasTableData = Boolean(rInfo.data_used?.rows && rInfo.data_used.rows.length > 0);
-                    const hasChart = chartPaths.length > 0;
                     const currentView = activeViews[msgKey] || (hasChart ? "chart" : "table");
 
                     if (isUnrelated) {

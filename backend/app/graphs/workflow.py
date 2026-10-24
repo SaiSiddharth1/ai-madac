@@ -111,9 +111,16 @@ async def visualization_node(state: AgentState) -> dict[str, Any]:
         return _record_agent_completion(state, res, "visualization_agent")
     else:
         res = visualization_agent.run(state)
+        viz_res = res.get("visualization_result") or {}
+        is_avail = viz_res.get("visualization_available", False)
+        has_chart = bool(viz_res.get("chart_path") or viz_res.get("chart_paths"))
         await workflow_event_manager.emit(query_id, "visualization_agent", "completed", "Visualization specification created")
         await workflow_event_manager.emit(query_id, "visualization_validator", "completed", "Specification validated against Query Contract")
-        await workflow_event_manager.emit(query_id, "chart_renderer", "completed", "Interactive Plotly chart generated")
+        if not is_avail or not has_chart:
+            reason = viz_res.get("reason") or "Interactive Plotly chart could not be generated."
+            await workflow_event_manager.emit(query_id, "chart_renderer", "failed", reason)
+        else:
+            await workflow_event_manager.emit(query_id, "chart_renderer", "completed", "Interactive Plotly chart generated")
         return _record_agent_completion(state, res, "visualization_agent")
 
 
@@ -136,8 +143,15 @@ async def chart_renderer_node(state: AgentState) -> dict[str, Any]:
     await workflow_event_manager.emit(query_id, "chart_renderer", "running", "Preparing Pandas data and rendering interactive Plotly figure")
     res = visualization_agent.run_rendering(state)
     errors = res.get("errors", [])
+    viz_res = res.get("visualization_result") or {}
+    is_avail = viz_res.get("visualization_available", False)
+    has_chart = bool(viz_res.get("chart_path") or viz_res.get("chart_paths"))
+
     if errors:
         await workflow_event_manager.emit(query_id, "chart_renderer", "failed", f"Rendering error: {errors[0]}")
+    elif not is_avail or not has_chart:
+        reason = viz_res.get("reason") or "Interactive Plotly chart could not be generated."
+        await workflow_event_manager.emit(query_id, "chart_renderer", "failed", reason)
     else:
         await workflow_event_manager.emit(query_id, "chart_renderer", "completed", "Interactive Plotly chart generated successfully")
     return _record_agent_completion(state, res, "chart_renderer")
