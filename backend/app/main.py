@@ -73,7 +73,13 @@ app.include_router(reports_router)
 
 
 
+import os
+
 @app.get("/api/health", tags=["Health"])
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "service": "AI MADAC Backend"}
+    return {
+        "status": "healthy",
+        "service": "AI MADAC Backend",
+        "commit": os.environ.get("RENDER_GIT_COMMIT") or "6723776",
+    }
