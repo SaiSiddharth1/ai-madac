@@ -299,15 +299,18 @@ USER QUESTION:
 
         # 1. Prevent unwanted grouping, EXCEPT for time-series / temporal queries:
         is_temporal = bool(re.search(
-            r"\b(?:over time|changed over time|change over time|trend|trend over time|historical trend|daily|weekly|monthly|quarterly|yearly|annually|month by month|day by day|year by year|sales trend|revenue trend|quantity trend)\b",
+            r"\b(?:over time|changed over time|change over time|trend|trend over time|historical trend|month by month|day by day|year by year|sales trend|revenue trend|quantity trend)\b",
             q_lower
-        ))
+        )) or (
+            bool(re.search(r"\b(?:daily|weekly|monthly|quarterly|yearly|annually)\b", q_lower))
+            and not any(m_word in q_lower for m_word in ("monthly income", "monthly salary", "monthly charges", "monthly rate", "monthly expense", "monthly cost", "daily rate", "hourly rate"))
+        )
         is_explicit_line = bool(re.search(r"\b(?:line chart|line graph|plot as a line|in line chart|as a line chart|as line)\b", q_lower))
 
         asks_grouping = bool(re.search(r"\b(?:by|per|across|for each|each|breakdown by)\b", q_lower)) or is_temporal
         asks_ranking = bool(re.search(r"\b(?:top|bottom|highest|lowest)\s+\d*\b", q_lower))
         if not asks_grouping and not asks_ranking and not is_temporal:
-            if any(term in q_lower for term in ("total revenue", "total units", "total quantity", "average unit price", "average age", "unique customers", "total sales")):
+            if not contract.group_by or any(term in q_lower for term in ("total revenue", "total units", "total quantity", "average unit price", "average age", "unique customers", "total sales", "monthly income", "monthly salary", "max", "maximum", "min", "minimum")):
                 contract.group_by = []
                 contract.answer_type = "SCALAR"
                 contract.should_visualize = contract.requested_visualization  # only visualize if user explicitly asked
@@ -433,7 +436,8 @@ USER QUESTION:
             # Generic time column resolution from dataset schema
             time_col = next((
                 real for low, real in cols.items()
-                if any(k in low for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day", "created_at", "saledate", "purchasedate"))
+                if not any(ex in low for ex in ("income", "salary", "rate", "cost", "price", "fee", "expense", "charges", "sales", "revenue", "amount", "profit", "balance", "limit"))
+                and any(k in low for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "created_at", "saledate", "purchasedate"))
             ), None)
             if time_col:
                 contract.intent = "TIME_SERIES"
@@ -619,10 +623,11 @@ USER QUESTION:
             if not c_name:
                 continue
             name_low = c_name.lower()
-            if any(dt in c_dtype for dt in ("date", "time", "timestamp")) or any(k in name_low for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day")):
-                datetime_cols.append(c_name)
-            elif any(nt in c_dtype for nt in ("int", "float", "real", "double", "num", "dec")) or any(k in name_low for k in ("sales", "profit", "revenue", "quantity", "unitprice", "price", "amount", "margin", "cost", "discount", "age", "salary")):
+            is_currency_or_rate = any(k in name_low for k in ("income", "salary", "rate", "cost", "price", "fee", "expense", "charges", "sales", "revenue", "amount", "profit", "balance", "limit", "age", "quantity"))
+            if is_currency_or_rate or any(nt in c_dtype for nt in ("int", "float", "real", "double", "num", "dec", "bigint")):
                 numeric_cols.append(c_name)
+            elif any(dt in c_dtype for dt in ("date", "time", "timestamp")) or any(k in name_low for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "created_at", "saledate", "purchasedate")):
+                datetime_cols.append(c_name)
             elif any(k in name_low for k in ("_id", "row_id", "customer_id", "product_id", "order_id", "code", "_no", "key", "uuid", "guid")) and not any(k in name_low for k in ("category", "sub_category", "segment", "region", "country", "state", "city")):
                 pass
             else:
@@ -657,7 +662,7 @@ USER QUESTION:
         price_col = next((real for low, real in cols.items() if any(k in low for k in ("unitprice", "unit_price", "price"))), None)
         cust_col = next((real for low, real in cols.items() if any(k in low for k in ("customer", "client", "user_id"))), None)
         country_col = next((real for low, real in cols.items() if any(k in low for k in ("country", "nation", "region", "location"))), None)
-        date_col = datetime_cols[0] if datetime_cols else next((real for low, real in cols.items() if any(k in low for k in ("date", "time", "year", "month", "invoicedate"))), None)
+        date_col = datetime_cols[0] if datetime_cols else next((real for low, real in cols.items() if not any(ex in low for ex in ("income", "salary", "rate", "cost", "price", "fee", "expense", "charges", "sales", "revenue", "amount", "profit", "balance", "limit")) and any(k in low for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "created_at", "saledate", "purchasedate"))), None)
         inv_col = next((real for low, real in cols.items() if any(k in low for k in ("invoiceno", "invoice", "orderid", "order_id", "transaction", "id"))), None)
 
         matched_cat_col = matched_cat[0] if matched_cat else None
@@ -844,10 +849,13 @@ USER QUESTION:
             )
 
         # 3. LINE & MULTI-LINE (Temporal or Numeric X)
-        is_trend = bool(re.search(
-            r"\b(?:over time|changed over time|change over time|trend|trend over time|historical trend|daily|weekly|monthly|quarterly|yearly|annually|month by month|day by day|year by year|sales trend|revenue trend|quantity trend|timeline|trajectory)\b",
-            q_lower
-        ))
+        is_trend = (
+            bool(re.search(r"\b(?:over time|changed over time|change over time|trend|trend over time|historical trend|month by month|day by day|year by year|sales trend|revenue trend|quantity trend|timeline|trajectory)\b", q_lower))
+            or (
+                bool(re.search(r"\b(?:daily|weekly|monthly|quarterly|yearly|annually)\b", q_lower))
+                and not any(m_word in q_lower for m_word in ("monthly income", "monthly salary", "monthly charges", "monthly rate", "monthly expense", "monthly cost", "daily rate", "hourly rate"))
+            )
+        )
         is_line_q = bool(re.search(r"\b(?:multi[-_\s]line|line chart|line graph|plot as a line|as a line chart|as line)\b", q_lower))
         is_multi_q = bool(re.search(r"\bmulti[-_\s]line\b", q_lower)) or any(w in q_lower for w in ("male and female", "female and male", "both genders"))
         if is_line_q or (is_trend and (date_col or group_by)):

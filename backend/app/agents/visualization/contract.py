@@ -422,10 +422,11 @@ def extract_query_contract(
 
     for c in matched_cols:
         col_type = dtypes_map.get(c, "")
-        if any(dt in col_type for dt in ("date", "time", "timestamp")) or any(k in c.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day")):
-            datetime_matched.append(c)
-        elif any(nt in col_type for nt in ("int", "float", "double", "number", "real", "numeric", "decimal")) or "age" in c.lower() or "income" in c.lower() or "salary" in c.lower() or "sales" in c.lower() or "profit" in c.lower() or "revenue" in c.lower() or "quantity" in c.lower() or "price" in c.lower():
+        is_currency_or_rate = any(k in c.lower() for k in ("income", "salary", "rate", "cost", "price", "fee", "expense", "charges", "sales", "revenue", "amount", "profit", "balance", "limit", "age", "quantity"))
+        if is_currency_or_rate or any(nt in col_type for nt in ("int", "float", "double", "number", "real", "numeric", "decimal", "bigint")):
             numeric_matched.append(c)
+        elif any(dt in col_type for dt in ("date", "time", "timestamp")) or any(k in c.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "created_at", "saledate", "purchasedate")):
+            datetime_matched.append(c)
         elif any(rt in c.lower() for rt in ("expect", "return", "range", "bracket")) and not any(nt in col_type for nt in ("int", "float", "double")):
             range_matched.append(c)
         else:
@@ -559,7 +560,13 @@ def extract_query_contract(
     elif explicit_chart in ("pie", "donut") or re.search(r"\b(?:proportion|percentage|share|ratio|contribution|contributions)\b", q):
         intent = "proportion"
         explicit_chart = "pie"
-    elif explicit_chart in ("line", "multi_line") or re.search(r"\b(?:trend|over time|growth|over the years|monthly|yearly)\b", q):
+    elif explicit_chart in ("line", "multi_line") or (
+        bool(re.search(r"\b(?:trend|over time|growth|over the years)\b", q))
+        or (
+            bool(re.search(r"\b(?:monthly|yearly)\b", q))
+            and not any(m_word in q.lower() for m_word in ("monthly income", "monthly salary", "monthly charges", "monthly rate", "monthly expense", "monthly cost", "daily rate", "hourly rate"))
+        )
+    ):
         intent = "trend"
         explicit_chart = explicit_chart or "line"
     elif re.search(r"\b(?:rank|ranking|top|bottom|most popular|least popular)\b", q):
@@ -572,7 +579,14 @@ def extract_query_contract(
     series_dim = None
     sec_measure = None
 
-    is_temporal = bool(re.search(r"\b(?:trend|over time|growth|over the years|monthly|yearly|annually|daily|weekly|quarterly|timeline|trajectory)\b", q)) or (datetime_matched and len(datetime_matched) > 0)
+    is_temporal = (
+        bool(re.search(r"\b(?:trend|over time|growth|over the years|timeline|trajectory|month by month|year by year)\b", q))
+        or (
+            bool(re.search(r"\b(?:daily|weekly|monthly|quarterly|yearly|annually)\b", q))
+            and not any(k in q.lower() for k in ("monthly income", "monthly salary", "monthly charges", "monthly rate", "monthly expense", "monthly cost", "daily rate", "hourly rate"))
+        )
+        or (datetime_matched and len(datetime_matched) > 0 and not any(k in q.lower() for k in ("min", "max", "average", "avg", "sum", "total") if not any(w in q.lower() for w in ("by", "per", "across", "trend"))))
+    )
     if is_temporal:
         intent = "trend"
         explicit_chart = explicit_chart or "line"
