@@ -55,6 +55,7 @@ from app.agents.visualization.plotly_renderer import PlotlyRenderer
 from app.agents.visualization.quality_gate import VisualizationQualityGate
 from app.core.llm_provider import get_llm
 from app.db.database import sync_engine
+from app.utils.serialization import to_json_safe
 
 logger = logging.getLogger(__name__)
 
@@ -419,7 +420,7 @@ class VisualizationAgent:
             "category": applied_params.get("category") or spec.get("fields", {}).get("x"),
             "value": applied_params.get("value") or spec.get("fields", {}).get("y"),
             "parameters": applied_params,
-            "data": prepared_df.head(50).to_dict(orient="records"),
+            "data": to_json_safe(prepared_df.head(50).to_dict(orient="records")),
             "plotly_options": spec.get("plotly_options", {}),
         }
 
@@ -439,7 +440,7 @@ class VisualizationAgent:
         }
 
         return {
-            "visualization_result": viz_result,
+            "visualization_result": to_json_safe(viz_result),
             "agents_used": list(set(state.get("agents_used", []) + ["chart_renderer"])),
         }
 
@@ -522,7 +523,7 @@ class VisualizationAgent:
             }
             messages = [
                 SystemMessage(content=VISUALIZATION_AGENT_SYSTEM_PROMPT),
-                HumanMessage(content=json.dumps(prompt_data, indent=2)),
+                HumanMessage(content=json.dumps(prompt_data, default=str, indent=2)),
             ]
             response = self.llm.invoke(messages)
             content = self._extract_text(response.content)
@@ -556,7 +557,7 @@ class VisualizationAgent:
             }
             messages = [
                 SystemMessage(content=VISUALIZATION_AGENT_SYSTEM_PROMPT),
-                HumanMessage(content=json.dumps(prompt_data, indent=2)),
+                HumanMessage(content=json.dumps(prompt_data, default=str, indent=2)),
             ]
             response = self.llm.invoke(messages)
             content = self._extract_text(response.content)

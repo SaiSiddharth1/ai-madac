@@ -14,6 +14,14 @@ class FilterSpec(BaseModel):
     value: Any
 
 
+class HavingSpec(BaseModel):
+    column: Optional[str] = None
+    aggregation: Optional[str] = None  # COUNT, AVG, SUM, MIN, MAX
+    expression: Optional[str] = None   # e.g. "COUNT(*)" or 'AVG("Profit")'
+    operator: str = ">"                # '>', '<', '>=', '<=', '=', '!='
+    value: Any
+
+
 class SortSpec(BaseModel):
     field: str
     direction: str = "desc"  # 'asc' or 'desc'
@@ -43,8 +51,9 @@ class QueryContract(BaseModel):
     dimensions: list[str] = Field(default_factory=list)
     group_by: list[str] = Field(default_factory=list)
 
-    # Filters, sort, limit
+    # Filters, having, sort, limit
     filters: list[FilterSpec] = Field(default_factory=list)
+    having: list[HavingSpec] = Field(default_factory=list)
     sort: Optional[SortSpec] = None
     limit: Optional[int] = None
 
@@ -92,3 +101,7 @@ class QueryContract(BaseModel):
         if self.bin_width:
             return {"mode": "fixed", "size": self.bin_width, "bin_size": self.bin_width}
         return None
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
+

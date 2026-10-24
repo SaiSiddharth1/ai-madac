@@ -4,18 +4,22 @@ Translates structured Query Contracts and natural language questions into safe,
 deterministic SQL queries, executes them against PostgreSQL/SQLite, and validates the result shape.
 """
 
+import datetime
+from decimal import Decimal
 import json
 import logging
 import re
 from typing import Any, Optional
 
 import pandas as pd
+import sqlalchemy as sa
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.agents.state import AgentState
 from app.core.llm_provider import get_llm
 from app.db.database import sync_engine
 from app.schemas.query_contract import QueryContract
+from app.utils.serialization import to_json_safe
 from app.utils.sql_validator import sanitize_table_name, validate_sql
 
 logger = logging.getLogger(__name__)
@@ -176,15 +180,15 @@ class SQLAgent:
 
         # Execute Query
         try:
-            df = pd.read_sql(sql_query, con=sync_engine)
+            escaped_sql = sql_query.replace("%", "%%") if ("%" in sql_query and not re.search(r"%\([a-zA-Z0-9_]+\)s", sql_query)) else sql_query
+            df = pd.read_sql(sa.text(escaped_sql), con=sync_engine)
 
             # Phase 6: Strict Result Validation against Query Contract
             df, sql_query = self._validate_and_repair_result(df, contract, schema, safe_table, sql_query)
 
             columns = df.columns.tolist()
-            # Clean missing values for JSON serialization
-            serializable_df = df.astype(object).where(pd.notna(df), None)
-            rows = serializable_df.to_dict(orient="records")
+            # Clean missing values and deeply convert datetimes/timestamps/decimals to JSON-serializable primitives
+            rows = to_json_safe(df)
 
             # Extract scalar properties if scalar result
             scalar_value = None
@@ -194,15 +198,16 @@ class SQLAgent:
             if contract.answer_type == "SCALAR" and len(rows) >= 1 and len(columns) >= 1:
                 col = columns[0]
                 raw_val = rows[0].get(col)
-                scalar_value = raw_val
+                scalar_value = to_json_safe(raw_val)
                 metric_name = col.replace("_", " ").title()
-                if isinstance(raw_val, (int, float)):
+                if isinstance(raw_val, (int, float, Decimal)):
+                    num_val = float(raw_val)
                     if "revenue" in col.lower() or "price" in col.lower() or "sales" in col.lower():
-                        formatted_value = f"{raw_val:,.2f}"
-                    elif isinstance(raw_val, float):
-                        formatted_value = f"{raw_val:,.2f}"
+                        formatted_value = f"{num_val:,.2f}"
+                    elif isinstance(raw_val, (float, Decimal)):
+                        formatted_value = f"{num_val:,.2f}"
                     else:
-                        formatted_value = f"{raw_val:,}"
+                        formatted_value = f"{int(num_val):,}"
                 else:
                     formatted_value = str(raw_val)
 
@@ -390,7 +395,10 @@ class SQLAgent:
             if contract.secondary_measure_column:
                 sec_expr = quote_expr(contract.secondary_measure_column)
                 sec_alias = self._sanitize_alias(contract.secondary_measure or "secondary_metric")
-                agg_select += f', ROUND(CAST(SUM({sec_expr}) AS NUMERIC), 2) AS total_{sec_alias}'
+                if any(k in contract.secondary_measure_column.lower() for k in ("id", "code", "no", "number", "name")):
+                    agg_select += f', COUNT(DISTINCT {sec_expr}) AS total_{sec_alias}'
+                else:
+                    agg_select += f', ROUND(CAST(SUM({sec_expr}) AS NUMERIC), 2) AS total_{sec_alias}'
 
             # Ordering and grouping:
             # 1. Genuine temporal time-series queries
@@ -404,14 +412,54 @@ class SQLAgent:
                 or contract.suggested_chart_type in ("line", "multi_line")
             )
 
+            is_pg = (sync_engine.dialect.name == "postgresql")
+
+            # Build HAVING clause if specified
+            having_conditions = []
+            if hasattr(contract, "having") and contract.having:
+                for h in contract.having:
+                    op = getattr(h, "operator", ">") or ">"
+                    val = h.value
+                    if getattr(h, "expression", None):
+                        having_conditions.append(f"{h.expression} {op} {val}")
+                    elif getattr(h, "column", None):
+                        col_q = quote_col(h.column)
+                        h_agg = (getattr(h, "aggregation", None) or "COUNT").upper()
+                        if h_agg == "COUNT":
+                            having_conditions.append(f"COUNT(*) {op} {val}")
+                        elif h_agg == "COUNT_DISTINCT":
+                            having_conditions.append(f"COUNT(DISTINCT {col_q}) {op} {val}")
+                        elif h_agg in ("AVG", "SUM", "MIN", "MAX"):
+                            having_conditions.append(f"{h_agg}({col_q}) {op} {val}")
+                    elif getattr(h, "aggregation", None):
+                        having_conditions.append(f"COUNT(*) {op} {val}")
+
+            having_sql = f" HAVING {' AND '.join(having_conditions)}" if having_conditions else ""
+
             if temporal_col:
-                grain = contract.time_granularity or "month"
-                if grain == "year":
-                    time_sql_expr = f"COALESCE(strftime('%Y', {quote_col(temporal_col)}), SUBSTR({quote_col(temporal_col)}, 1, 4))"
-                elif grain == "day":
-                    time_sql_expr = f"COALESCE(strftime('%Y-%m-%d', {quote_col(temporal_col)}), SUBSTR({quote_col(temporal_col)}, 1, 10))"
-                else:  # month default
-                    time_sql_expr = f"COALESCE(strftime('%Y-%m', {quote_col(temporal_col)}), SUBSTR({quote_col(temporal_col)}, 1, 7))"
+                grain = (contract.time_granularity or "month").lower()
+                if is_pg:
+                    if grain == "year":
+                        time_sql_expr = f"TO_CHAR(CAST({quote_col(temporal_col)} AS TIMESTAMP), 'YYYY')"
+                    elif grain == "quarter":
+                        time_sql_expr = f"TO_CHAR(CAST({quote_col(temporal_col)} AS TIMESTAMP), 'YYYY-\"Q\"Q')"
+                    elif grain == "week":
+                        time_sql_expr = f"TO_CHAR(CAST({quote_col(temporal_col)} AS TIMESTAMP), 'IYYY-\"W\"IW')"
+                    elif grain == "day":
+                        time_sql_expr = f"TO_CHAR(CAST({quote_col(temporal_col)} AS TIMESTAMP), 'YYYY-MM-DD')"
+                    else:  # month default
+                        time_sql_expr = f"TO_CHAR(CAST({quote_col(temporal_col)} AS TIMESTAMP), 'YYYY-MM')"
+                else:
+                    if grain == "year":
+                        time_sql_expr = f"COALESCE(strftime('%Y', {quote_col(temporal_col)}), SUBSTR({quote_col(temporal_col)}, 1, 4))"
+                    elif grain == "quarter":
+                        time_sql_expr = f"printf('%s-Q%d', SUBSTR({quote_col(temporal_col)}, 1, 4), (CAST(SUBSTR({quote_col(temporal_col)}, 6, 2) AS INTEGER) + 2) / 3)"
+                    elif grain == "week":
+                        time_sql_expr = f"strftime('%Y-W%W', {quote_col(temporal_col)})"
+                    elif grain == "day":
+                        time_sql_expr = f"COALESCE(strftime('%Y-%m-%d', {quote_col(temporal_col)}), SUBSTR({quote_col(temporal_col)}, 1, 10))"
+                    else:  # month default
+                        time_sql_expr = f"COALESCE(strftime('%Y-%m', {quote_col(temporal_col)}), SUBSTR({quote_col(temporal_col)}, 1, 7))"
 
                 other_group_cols = [quote_col(g) for g in contract.group_by if g != temporal_col]
                 if other_group_cols:
@@ -429,7 +477,7 @@ class SQLAgent:
 
                 return (
                     f'SELECT {group_select_sql}, {agg_select} FROM "{safe_table}"'
-                    f'{where_sql} GROUP BY {group_clause_sql} ORDER BY {order_col} {direction}{limit_sql}'
+                    f'{where_sql} GROUP BY {group_clause_sql}{having_sql} ORDER BY {order_col} {direction}{limit_sql}'
                 )
             elif is_line_or_trend:
                 # Non-temporal numeric or ordinal line chart (e.g. Age, or Age + Gender)
@@ -444,7 +492,7 @@ class SQLAgent:
 
                 return (
                     f'SELECT {group_sql}, {agg_select} FROM "{safe_table}"'
-                    f'{where_sql} GROUP BY {group_sql} ORDER BY {order_clause}{limit_sql}'
+                    f'{where_sql} GROUP BY {group_sql}{having_sql} ORDER BY {order_clause}{limit_sql}'
                 )
             else:
                 direction = "DESC"
@@ -452,9 +500,12 @@ class SQLAgent:
                     direction = contract.sort.direction.upper()
                 limit_sql = f" LIMIT {contract.limit}" if contract.limit else " LIMIT 15"
 
+                if any("COUNT" in hc for hc in having_conditions) and "total_orders" not in agg_select and "total_records" not in agg_select:
+                    agg_select += ", COUNT(*) AS total_orders"
+
                 return (
                     f'SELECT {group_sql}, {agg_select} FROM "{safe_table}"'
-                    f'{where_sql} GROUP BY {group_sql} ORDER BY {order_col} {direction}{limit_sql}'
+                    f'{where_sql} GROUP BY {group_sql}{having_sql} ORDER BY {order_col} {direction}{limit_sql}'
                 )
 
         # 3. DISTRIBUTION / HISTOGRAM (Raw observations)

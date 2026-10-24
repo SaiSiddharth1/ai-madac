@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.state import AgentState
 from app.db.models import Dataset, DatasetProfile, Query, AgentRun, Report, ConversationResult
 from app.graphs.workflow import workflow_graph
+from app.utils.serialization import to_json_safe
 
 logger = logging.getLogger(__name__)
 
@@ -172,12 +173,12 @@ async def execute_query(
         answer=report_dict.get("answer", ""),
         insights=report_dict.get("insights", []),
         chart_paths=report_dict.get("chart_paths", []),
-        data_used=report_dict.get("data_used"),
+        data_used=to_json_safe(report_dict.get("data_used")),
         agents_used=agents_invoked,
     )
     db.add(report_record)
     if final_state.get("validated_result"):
-        await save_validated_result(db, user_id, dataset_id, session_id, final_state["validated_result"])
+        await save_validated_result(db, user_id, dataset_id, session_id, to_json_safe(final_state["validated_result"]))
     await db.commit()
     await db.refresh(report_record)
 

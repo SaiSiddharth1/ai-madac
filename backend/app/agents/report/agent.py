@@ -12,6 +12,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from app.agents.state import AgentState
 from app.core.llm_provider import get_llm
+from app.utils.serialization import to_json_safe
 
 logger = logging.getLogger(__name__)
 
@@ -162,15 +163,15 @@ class ReportAgent:
         context_parts = []
 
         if analysis_result:
-            context_parts.append(f"Data Analyst Statistical Analysis: {json.dumps(analysis_result)}")
+            context_parts.append(f"Data Analyst Statistical Analysis: {json.dumps(analysis_result, default=str)}")
 
         if sql_result:
             sample_rows = sql_result.get("rows", [])[:10]
             context_parts.append(f"SQL Query Executed: {sql_result.get('query')}")
-            context_parts.append(f"Data Retrieved ({sql_result.get('row_count')} total rows): {json.dumps(sample_rows)}")
+            context_parts.append(f"Data Retrieved ({sql_result.get('row_count')} total rows): {json.dumps(sample_rows, default=str)}")
 
         if ml_result:
-            context_parts.append(f"ML Model Results: {json.dumps(ml_result)}")
+            context_parts.append(f"ML Model Results: {json.dumps(ml_result, default=str)}")
 
         context_str = "\n\n".join(context_parts) if context_parts else "No tabular data returned."
 
@@ -353,7 +354,7 @@ class ReportAgent:
             "response_type": final_response_type,
             "kpi": kpi_data if not has_chart else None,
             "explanation": explanation_data,
-            "data_used": data_used_payload,
+            "data_used": to_json_safe(data_used_payload),
             "agents_used": list(set(agents_used)),
         }
         logger.info(
@@ -362,7 +363,7 @@ class ReportAgent:
         )
 
         return {
-            "final_report": final_report,
+            "final_report": to_json_safe(final_report),
             "agents_used": list(set(agents_used)),
         }
 

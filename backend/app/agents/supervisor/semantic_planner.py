@@ -12,7 +12,7 @@ from typing import Any, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.core.llm_provider import get_llm
-from app.schemas.query_contract import FilterSpec, QueryContract, SortSpec
+from app.schemas.query_contract import FilterSpec, HavingSpec, QueryContract, SortSpec
 from app.agents.visualization.contract import resolve_column_semantically
 
 logger = logging.getLogger(__name__)
@@ -193,6 +193,19 @@ USER QUESTION:
                     value=f.get("value"),
                 ))
 
+        # Having
+        raw_having = data.get("having", [])
+        having = []
+        for h in raw_having:
+            if isinstance(h, dict):
+                having.append(HavingSpec(
+                    column=h.get("column"),
+                    aggregation=h.get("aggregation"),
+                    expression=h.get("expression"),
+                    operator=h.get("operator", ">"),
+                    value=h.get("value"),
+                ))
+
         # Sort
         sort = None
         raw_sort = data.get("sort")
@@ -247,6 +260,7 @@ USER QUESTION:
             dimensions=dimensions,
             group_by=group_by,
             filters=filters,
+            having=having,
             sort=sort,
             limit=limit,
             requested_visualization=explicit_vis,
@@ -647,6 +661,75 @@ USER QUESTION:
             time_grain = "week"
         elif any(w in q_lower for w in ("daily", "day by day", "per day", "day")):
             time_grain = "day"
+
+        # 0. GROUPED ENTITIES WITH AGGREGATE THRESHOLDS (HAVING queries)
+        # e.g. "Show categories with more than 100 orders and average profit above 20"
+        having_pattern = re.search(r"\b(?:show|find|list|get|which)\s+([a-zA-Z_]+)\s+(?:with|having|where|that have)\s+(.+)", q_lower)
+        if having_pattern:
+            entity_cand = having_pattern.group(1).strip()
+            cond_str = having_pattern.group(2).strip()
+            entity_dim = resolve_column_semantically(entity_cand, list(cols.values()))
+            if not entity_dim and matched_cat:
+                entity_dim = matched_cat[0]
+            if not entity_dim and cat_cols:
+                entity_dim = cat_cols[0]
+
+            if entity_dim:
+                having_list = []
+                cond_parts = [p.strip() for p in re.split(r"\b(?:and|,)\b", cond_str) if p.strip()]
+                meas_found = None
+                meas_agg = "AVG"
+                has_count = False
+
+                for part in cond_parts:
+                    # Check count condition: "more than 100 orders", "> 100 orders"
+                    cnt_m = re.search(r"\b(?:more than|greater than|above|>|>=)\s*(\d+)\s*(?:orders|transactions|invoices|records|items|rows|sales|customers)?\b", part)
+                    if not cnt_m:
+                        cnt_m = re.search(r"\b(?:orders|transactions|invoices|records|items|rows|sales|customers)\s*(?:more than|greater than|above|>|>=)\s*(\d+)\b", part)
+                    if cnt_m and not any(k in part for k in ("profit", "sales", "revenue", "price", "discount", "margin", "cost", "salary")):
+                        op = ">=" if (">=" in cnt_m.group(0) or "at least" in cnt_m.group(0)) else ">"
+                        val = int(cnt_m.group(1))
+                        having_list.append(HavingSpec(expression="COUNT(*)", operator=op, value=val))
+                        has_count = True
+                        continue
+
+                    # Check metric condition: "average profit above 20"
+                    for phrase in ("profit", "sales", "revenue", "quantity", "discount", "margin", "cost", "price", "unitprice"):
+                        if phrase in part:
+                            res_meas = resolve_column_semantically(phrase, list(cols.values()))
+                            if res_meas and res_meas != entity_dim:
+                                meas_found = res_meas
+                                break
+
+                    part_agg = "AVG" if ("average" in part or "avg" in part or "mean" in part) else "SUM"
+                    num_m = re.search(r"\b(?:above|greater than|more than|>|>=|<|<=|below|less than)\s*(-?\d+(?:\.\d+)?)\b", part)
+                    if num_m and meas_found:
+                        op = ">=" if ">=" in num_m.group(0) else ("<=" if "<=" in num_m.group(0) else (">" if any(w in num_m.group(0) for w in ("above", "greater", "more", ">")) else "<"))
+                        val = float(num_m.group(1))
+                        having_list.append(HavingSpec(column=meas_found, aggregation=part_agg, operator=op, value=val))
+                        meas_agg = part_agg
+
+                if having_list:
+                    primary_m = meas_found or (matched_numeric[0] if matched_numeric else (numeric_cols[0] if numeric_cols else list(cols.values())[0]))
+                    return QueryContract(
+                        query_id=query_id,
+                        dataset_id=dataset_id,
+                        original_query=question,
+                        intent="AGGREGATION",
+                        answer_type="GROUPED",
+                        measure=primary_m,
+                        measure_column=primary_m,
+                        measure_expression=primary_m,
+                        aggregation=meas_agg,
+                        dimensions=[entity_dim],
+                        group_by=[entity_dim],
+                        having=having_list,
+                        secondary_measure=None,
+                        secondary_measure_column=None,
+                        sort=SortSpec(field=f"{meas_agg.lower()}_{primary_m.lower()}", direction="desc"),
+                        limit=15,
+                        should_visualize=False,
+                    )
 
         # 1. SCATTER / RELATIONSHIP
         is_scatter = bool(re.search(r"\b(?:relationship|versus|vs\.?|against|correlation|scatter)\b", q_lower))
