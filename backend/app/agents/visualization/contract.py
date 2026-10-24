@@ -282,11 +282,23 @@ def resolve_column_semantically(term: str, available_columns: list[str]) -> Opti
             return col
 
     # 2. Singular / plural variations
-    singular_t = t_norm[:-1] if t_norm.endswith("s") else t_norm
-    plural_t = (t_norm[:-1] + "ies") if t_norm.endswith("y") else (t_norm + "s")
+    candidates = {t_norm}
+    if t_norm.endswith("ies"):
+        candidates.add(t_norm[:-3] + "y")
+    elif t_norm.endswith("es") and any(t_norm.endswith(x) for x in ("shes", "ches", "xes", "sses", "zes")):
+        candidates.add(t_norm[:-2])
+    elif t_norm.endswith("s") and not t_norm.endswith("ss"):
+        candidates.add(t_norm[:-1])
+
+    if t_norm.endswith("y"):
+        candidates.add(t_norm[:-1] + "ies")
+    elif not t_norm.endswith("s"):
+        candidates.add(t_norm + "s")
+        candidates.add(t_norm + "es")
+
     for col in available_columns:
         col_norm = normalize_term(col)
-        if col_norm in (singular_t, plural_t):
+        if col_norm in candidates:
             return col
 
     # 3. Known semantic aliases

@@ -623,12 +623,35 @@ USER QUESTION:
                 datetime_cols.append(c_name)
             elif any(nt in c_dtype for nt in ("int", "float", "real", "double", "num", "dec")) or any(k in name_low for k in ("sales", "profit", "revenue", "quantity", "unitprice", "price", "amount", "margin", "cost", "discount", "age", "salary")):
                 numeric_cols.append(c_name)
+            elif any(k in name_low for k in ("_id", "row_id", "customer_id", "product_id", "order_id", "code", "_no", "key", "uuid", "guid")) and not any(k in name_low for k in ("category", "sub_category", "segment", "region", "country", "state", "city")):
+                pass
             else:
                 cat_cols.append(c_name)
 
+        def _get_word_variants(s: str) -> set[str]:
+            v = {s}
+            if s.endswith("ies"):
+                v.add(s[:-3] + "y")
+            elif s.endswith("es") and any(s.endswith(x) for x in ("shes", "ches", "xes", "sses", "zes")):
+                v.add(s[:-2])
+            elif s.endswith("s") and not s.endswith("ss"):
+                v.add(s[:-1])
+            elif s.endswith("y"):
+                v.add(s[:-1] + "ies")
+            else:
+                v.add(s + "s")
+            return v
+
+        q_tokens = set(re.findall(r"\b[a-zA-Z_]+\b", q_lower))
+
         # Matched columns in order of appearance in question
         matched_numeric = [col for col in numeric_cols if col.lower() in q_lower or col.lower().replace("_", " ") in q_lower]
-        matched_cat = [col for col in cat_cols if col.lower() in q_lower or col.lower().replace("_", " ") in q_lower or col.lower().rstrip("s") in q_lower]
+        matched_cat = [
+            col for col in cat_cols
+            if col.lower() in q_lower
+            or col.lower().replace("_", " ") in q_lower
+            or any(var in q_tokens for var in _get_word_variants(col.lower()))
+        ]
 
         qty_col = next((real for low, real in cols.items() if any(k in low for k in ("quantity", "qty", "units", "sales_volume"))), None)
         price_col = next((real for low, real in cols.items() if any(k in low for k in ("unitprice", "unit_price", "price"))), None)
@@ -669,6 +692,9 @@ USER QUESTION:
             entity_cand = having_pattern.group(1).strip()
             cond_str = having_pattern.group(2).strip()
             entity_dim = resolve_column_semantically(entity_cand, list(cols.values()))
+            if not entity_dim:
+                sing_cand = (entity_cand[:-3] + "y") if entity_cand.endswith("ies") else (entity_cand[:-1] if entity_cand.endswith("s") and not entity_cand.endswith("ss") else entity_cand)
+                entity_dim = resolve_column_semantically(sing_cand, list(cols.values()))
             if not entity_dim and matched_cat:
                 entity_dim = matched_cat[0]
             if not entity_dim and cat_cols:
