@@ -342,9 +342,9 @@ class SQLAgent:
             elif agg == "AVG":
                 return f'SELECT ROUND(CAST(AVG({expr}) AS NUMERIC), 2) AS average_{alias_name} FROM "{safe_table}"{where_sql}'
             elif agg == "MIN":
-                return f'SELECT MIN({expr}) AS minimum_{alias_name} FROM "{safe_table}"{where_sql}'
+                return f'SELECT ROUND(CAST(MIN({expr}) AS NUMERIC), 2) AS minimum_{alias_name} FROM "{safe_table}"{where_sql}'
             elif agg == "MAX":
-                return f'SELECT MAX({expr}) AS maximum_{alias_name} FROM "{safe_table}"{where_sql}'
+                return f'SELECT ROUND(CAST(MAX({expr}) AS NUMERIC), 2) AS maximum_{alias_name} FROM "{safe_table}"{where_sql}'
             else:  # SUM
                 return f'SELECT ROUND(CAST(SUM({expr}) AS NUMERIC), 2) AS total_{alias_name} FROM "{safe_table}"{where_sql}'
 
@@ -378,10 +378,10 @@ class SQLAgent:
                 agg_select = f"ROUND(CAST(AVG({expr}) AS NUMERIC), 2) AS average_{alias_name}"
                 order_col = f"average_{alias_name}"
             elif agg == "MIN":
-                agg_select = f"MIN({expr}) AS minimum_{alias_name}"
+                agg_select = f"ROUND(CAST(MIN({expr}) AS NUMERIC), 2) AS minimum_{alias_name}"
                 order_col = f"minimum_{alias_name}"
             elif agg == "MAX":
-                agg_select = f"MAX({expr}) AS maximum_{alias_name}"
+                agg_select = f"ROUND(CAST(MAX({expr}) AS NUMERIC), 2) AS maximum_{alias_name}"
                 order_col = f"maximum_{alias_name}"
             else:  # SUM
                 agg_select = f"ROUND(CAST(SUM({expr}) AS NUMERIC), 2) AS total_{alias_name}"

@@ -310,13 +310,28 @@ USER QUESTION:
         if not sales_col:
             sales_col = resolve_column_semantically("sales", list(cols.values()))
 
+        # Check explicit aggregation keyword in query
+        is_explicit_min = bool(re.search(r"\b(?:min|minimum|lowest|smallest|least)\b", q_lower))
+        is_explicit_max = bool(re.search(r"\b(?:max|maximum|highest|largest|peak|greatest)\b", q_lower))
+        is_explicit_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
+        is_explicit_count = bool(re.search(r"\b(?:count|number of|how many)\b", q_lower))
+
+        if is_explicit_min:
+            contract.aggregation = "MIN"
+        elif is_explicit_max:
+            contract.aggregation = "MAX"
+        elif is_explicit_avg:
+            contract.aggregation = "AVG"
+        elif is_explicit_count:
+            contract.aggregation = "COUNT"
+
         # If user asked for sales and dataset has a direct Sales column, direct column MUST take precedence
         if is_sales_question and sales_col:
             contract.measure = sales_col
             contract.measure_column = sales_col
             contract.measure_expression = sales_col
             if not contract.aggregation:
-                contract.aggregation = "SUM"
+                contract.aggregation = "MIN" if is_explicit_min else ("MAX" if is_explicit_max else ("AVG" if is_explicit_avg else "SUM"))
 
         if is_units_question and not is_price_question and not is_revenue_question and not is_sales_question:
             # Measure MUST NOT be UnitPrice or any price column!
@@ -997,6 +1012,8 @@ USER QUESTION:
             if not cat_dim:
                 cat_dim = cat_cols[0] if cat_cols else list(cols.values())[0]
 
+            is_min = bool(re.search(r"\b(?:min|minimum|lowest|smallest|least)\b", q_lower))
+            is_max = bool(re.search(r"\b(?:max|maximum|highest|largest|peak|greatest)\b", q_lower))
             is_count = bool(re.search(r"\b(?:number of|count of|how many|records|investors)\b", q_lower))
             is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
             meas_col = None
@@ -1007,7 +1024,16 @@ USER QUESTION:
                         meas_col = res
                         break
 
-            agg = "COUNT" if is_count or not meas_col else ("AVG" if is_avg else "SUM")
+            if is_min:
+                agg = "MIN"
+            elif is_max:
+                agg = "MAX"
+            elif is_avg:
+                agg = "AVG"
+            elif is_count or not meas_col:
+                agg = "COUNT"
+            else:
+                agg = "SUM"
             meas = cat_dim if agg == "COUNT" else meas_col
 
             return QueryContract(
@@ -1100,8 +1126,20 @@ USER QUESTION:
                         metric_col = real
                         break
         if metric_col:
+            is_min = bool(re.search(r"\b(?:min|minimum|lowest|smallest|least)\b", q_lower))
+            is_max = bool(re.search(r"\b(?:max|maximum|highest|largest|peak|greatest)\b", q_lower))
             is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
-            agg = "AVG" if is_avg else ("COUNT" if "count" in q_lower else "SUM")
+            is_count = bool(re.search(r"\b(?:count|number of|how many)\b", q_lower))
+            if is_min:
+                agg = "MIN"
+            elif is_max:
+                agg = "MAX"
+            elif is_avg:
+                agg = "AVG"
+            elif is_count:
+                agg = "COUNT"
+            else:
+                agg = "SUM"
             ans_type = "GROUPED" if group_by else "SCALAR"
             return QueryContract(
                 query_id=query_id,
