@@ -191,6 +191,12 @@ def route_next(state: AgentState) -> str:
     plan = state.get("execution_plan", [])
     agents_used = state.get("agents_used", [])
 
+    # LangGraph Failure Rule: If SQL Agent ran and failed, STOP downstream data-dependent agents
+    if "sql_agent" in agents_used and bool(state.get("errors")) and not state.get("sql_result"):
+        if "report_agent" not in agents_used:
+            return "report_agent"
+        return END
+
     logger.debug(f"Routing check: plan={plan}, agents_used={agents_used}")
 
     for agent in plan:

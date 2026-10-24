@@ -102,7 +102,7 @@ class AgentRun(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=generate_uuid)
     query_id = Column(UUID(as_uuid=True), ForeignKey("queries.id", ondelete="CASCADE"), nullable=False, index=True)
     agent_name = Column(String(100), nullable=False)
-    status = Column(String(20), nullable=False, default="pending")  # pending, running, success, error
+    status = Column(String(50), nullable=False, default="pending")  # pending, running, success, error, completed_with_errors
     input_data = Column(JSON, nullable=True)
     output_data = Column(JSON, nullable=True)
     execution_time_ms = Column(Float, nullable=True)

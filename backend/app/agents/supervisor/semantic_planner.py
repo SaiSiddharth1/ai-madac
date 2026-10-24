@@ -304,9 +304,21 @@ USER QUESTION:
             bool(re.search(r"\b(?:quantity|items?|units?\s+sold|items?\s+sold)\b", q_lower))
             or (bool(re.search(r"\bunits?\b", q_lower)) and not is_price_question)
         )
-        is_revenue_question = bool(re.search(r"\b(?:revenue|turnover|total sales)\b", q_lower))
+        is_revenue_question = bool(re.search(r"\b(?:revenue|turnover)\b", q_lower))
+        is_sales_question = bool(re.search(r"\b(?:sales|total sales|gross sales)\b", q_lower))
+        sales_col = next((real for low, real in cols.items() if low in ("sales", "gross_sales")), None)
+        if not sales_col:
+            sales_col = resolve_column_semantically("sales", list(cols.values()))
 
-        if is_units_question and not is_price_question and not is_revenue_question:
+        # If user asked for sales and dataset has a direct Sales column, direct column MUST take precedence
+        if is_sales_question and sales_col:
+            contract.measure = sales_col
+            contract.measure_column = sales_col
+            contract.measure_expression = sales_col
+            if not contract.aggregation:
+                contract.aggregation = "SUM"
+
+        if is_units_question and not is_price_question and not is_revenue_question and not is_sales_question:
             # Measure MUST NOT be UnitPrice or any price column!
             if contract.measure_column and any(p in contract.measure_column.lower() for p in ("price", "cost", "unitprice")):
                 # Find the true quantity column
@@ -316,7 +328,7 @@ USER QUESTION:
                     contract.measure_expression = true_qty
                     contract.measure = "Quantity"
 
-        if is_price_question and not is_revenue_question:
+        if is_price_question and not is_revenue_question and not is_sales_question:
             # Measure MUST NOT be Quantity!
             if contract.measure_column and any(q in contract.measure_column.lower() for q in ("quantity", "qty", "units")):
                 true_price = next((real for low, real in cols.items() if any(k in low for k in ("unitprice", "price", "unit_price", "rate"))), None)
@@ -325,11 +337,19 @@ USER QUESTION:
                     contract.measure_expression = true_price
                     contract.measure = "UnitPrice"
 
-        # 3. Handle Derived Revenue:
-        if is_revenue_question:
+        # 3. Handle Derived Revenue (only when no direct sales/revenue column exists):
+        if is_revenue_question or (is_sales_question and not sales_col):
             # Check if dataset has a direct revenue column
-            direct_rev = next((real for low, real in cols.items() if "revenue" in low or "turnover" in low), None)
+            direct_rev = next((real for low, real in cols.items() if low in ("revenue", "turnover", "sales", "gross_sales")), None)
             if not direct_rev:
+                direct_rev = resolve_column_semantically("revenue", list(cols.values()))
+            if direct_rev:
+                contract.measure = direct_rev
+                contract.measure_column = direct_rev
+                contract.measure_expression = direct_rev
+                if not contract.aggregation:
+                    contract.aggregation = "SUM"
+            else:
                 # Derived from Quantity * UnitPrice
                 qty_col = next((real for low, real in cols.items() if any(k in low for k in ("quantity", "qty", "units"))), None)
                 price_col = next((real for low, real in cols.items() if any(k in low for k in ("unitprice", "price", "unit_price"))), None)
@@ -582,7 +602,7 @@ USER QUESTION:
         matched_cat = [col for col in cat_cols if col.lower() in q_lower or col.lower().replace("_", " ") in q_lower or col.lower().rstrip("s") in q_lower]
 
         qty_col = next((real for low, real in cols.items() if any(k in low for k in ("quantity", "qty", "units", "sales_volume"))), None)
-        price_col = next((real for low, real in cols.items() if any(k in low for k in ("unitprice", "price", "unit_price", "rate", "cost"))), None)
+        price_col = next((real for low, real in cols.items() if any(k in low for k in ("unitprice", "unit_price", "price"))), None)
         cust_col = next((real for low, real in cols.items() if any(k in low for k in ("customer", "client", "user_id"))), None)
         country_col = next((real for low, real in cols.items() if any(k in low for k in ("country", "nation", "region", "location"))), None)
         date_col = datetime_cols[0] if datetime_cols else next((real for low, real in cols.items() if any(k in low for k in ("date", "time", "year", "month", "invoicedate"))), None)
@@ -1008,9 +1028,13 @@ USER QUESTION:
                 y_axis=f"{agg.lower()}_{meas.lower()}",
             )
 
-        # 8. RETAIL-SPECIFIC ONLY IF COLUMNS EXIST IN SCHEMA
-        is_revenue = bool(re.search(r"\b(?:revenue|turnover|total sales)\b", q_lower))
-        if is_revenue and qty_col and price_col:
+        # 8. DERIVED REVENUE ONLY IF NO DIRECT SALES/REVENUE COLUMN EXISTS IN SCHEMA
+        direct_sales_col = next((real for low, real in cols.items() if low in ("sales", "revenue", "turnover", "gross_sales")), None)
+        if not direct_sales_col:
+            direct_sales_col = resolve_column_semantically("sales", list(cols.values()))
+
+        is_revenue = bool(re.search(r"\b(?:revenue|turnover)\b", q_lower)) or (not direct_sales_col and "sales" in q_lower)
+        if is_revenue and not direct_sales_col and qty_col and price_col:
             expr = f'"{qty_col}" * "{price_col}"'
             sort = SortSpec(field="total_revenue", direction="desc") if (top_match or "highest" in q_lower) else None
             return QueryContract(
@@ -1062,11 +1086,19 @@ USER QUESTION:
         if "units sold" in q_lower and qty_col:
             metric_col = qty_col
         else:
-            q_nospace = q_lower.replace(" ", "")
-            for low, real in cols.items():
-                if low in q_lower or low.replace("_", " ") in q_lower or low in q_nospace:
-                    metric_col = real
-                    break
+            # Check semantic resolution for question keywords first
+            for phrase in ("sales", "profit", "revenue", "quantity", "discount", "price"):
+                if phrase in q_lower:
+                    res = resolve_column_semantically(phrase, list(cols.values()))
+                    if res:
+                        metric_col = res
+                        break
+            if not metric_col:
+                q_nospace = q_lower.replace(" ", "")
+                for low, real in cols.items():
+                    if low in q_lower or low.replace("_", " ") in q_lower or low in q_nospace:
+                        metric_col = real
+                        break
         if metric_col:
             is_avg = bool(re.search(r"\b(?:average|mean|avg)\b", q_lower))
             agg = "AVG" if is_avg else ("COUNT" if "count" in q_lower else "SUM")

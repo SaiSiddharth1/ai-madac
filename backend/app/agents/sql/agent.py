@@ -340,13 +340,13 @@ class SQLAgent:
             elif agg == "COUNT":
                 return f'SELECT COUNT(*) AS total_records FROM "{safe_table}"{where_sql}'
             elif agg == "AVG":
-                return f'SELECT ROUND(AVG({expr}), 2) AS average_{alias_name} FROM "{safe_table}"{where_sql}'
+                return f'SELECT ROUND(CAST(AVG({expr}) AS NUMERIC), 2) AS average_{alias_name} FROM "{safe_table}"{where_sql}'
             elif agg == "MIN":
                 return f'SELECT MIN({expr}) AS minimum_{alias_name} FROM "{safe_table}"{where_sql}'
             elif agg == "MAX":
                 return f'SELECT MAX({expr}) AS maximum_{alias_name} FROM "{safe_table}"{where_sql}'
             else:  # SUM
-                return f'SELECT ROUND(SUM({expr}), 2) AS total_{alias_name} FROM "{safe_table}"{where_sql}'
+                return f'SELECT ROUND(CAST(SUM({expr}) AS NUMERIC), 2) AS total_{alias_name} FROM "{safe_table}"{where_sql}'
 
         # 2. GROUPED AGGREGATION: Grouping strictly by requested group_by columns
         if contract.answer_type == "GROUPED" or contract.group_by:
@@ -375,7 +375,7 @@ class SQLAgent:
                 agg_select = "COUNT(*) AS total_records"
                 order_col = "total_records"
             elif agg == "AVG":
-                agg_select = f"ROUND(AVG({expr}), 2) AS average_{alias_name}"
+                agg_select = f"ROUND(CAST(AVG({expr}) AS NUMERIC), 2) AS average_{alias_name}"
                 order_col = f"average_{alias_name}"
             elif agg == "MIN":
                 agg_select = f"MIN({expr}) AS minimum_{alias_name}"
@@ -384,13 +384,13 @@ class SQLAgent:
                 agg_select = f"MAX({expr}) AS maximum_{alias_name}"
                 order_col = f"maximum_{alias_name}"
             else:  # SUM
-                agg_select = f"ROUND(SUM({expr}), 2) AS total_{alias_name}"
+                agg_select = f"ROUND(CAST(SUM({expr}) AS NUMERIC), 2) AS total_{alias_name}"
                 order_col = f"total_{alias_name}"
 
             if contract.secondary_measure_column:
                 sec_expr = quote_expr(contract.secondary_measure_column)
                 sec_alias = self._sanitize_alias(contract.secondary_measure or "secondary_metric")
-                agg_select += f', ROUND(SUM({sec_expr}), 2) AS total_{sec_alias}'
+                agg_select += f', ROUND(CAST(SUM({sec_expr}) AS NUMERIC), 2) AS total_{sec_alias}'
 
             # Ordering and grouping:
             # 1. Genuine temporal time-series queries
@@ -532,11 +532,11 @@ class SQLAgent:
                 if "by country" in q_lower:
                     country_col = next((n for n in names if "country" in n.lower()), "Country")
                     return (
-                        f'SELECT "{country_col}", ROUND(SUM("{qty_col}" * "{price_col}"), 2) AS total_revenue '
+                        f'SELECT "{country_col}", ROUND(CAST(SUM("{qty_col}" * "{price_col}") AS NUMERIC), 2) AS total_revenue '
                         f'FROM "{safe_table}" WHERE "{country_col}" IS NOT NULL '
                         f'GROUP BY "{country_col}" ORDER BY total_revenue DESC LIMIT 10'
                     )
-                return f'SELECT ROUND(SUM("{qty_col}" * "{price_col}"), 2) AS total_revenue FROM "{safe_table}"'
+                return f'SELECT ROUND(CAST(SUM("{qty_col}" * "{price_col}") AS NUMERIC), 2) AS total_revenue FROM "{safe_table}"'
 
         return f'SELECT * FROM "{safe_table}" LIMIT 50'
 

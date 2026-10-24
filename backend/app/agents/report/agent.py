@@ -199,6 +199,22 @@ class ReportAgent:
             }
             return {"final_report": final_report, "agents_used": list(set(agents_used))}
 
+        # Handle SQL execution failure: ensure no fake chart or key insights are produced
+        if "sql_agent" in agents_used and not sql_result and state.get("errors"):
+            sql_err = state["errors"][0] if state.get("errors") else "SQL execution failed."
+            final_report = {
+                "answer": f"I couldn't complete your request because of an execution error: {sql_err}",
+                "insights": ["No data could be retrieved from the database."],
+                "chart_paths": [],
+                "chart_json": None,
+                "parameters": None,
+                "visualization_result": None,
+                "response_type": "ERROR",
+                "data_used": {"response_type": "ERROR", "error": sql_err},
+                "agents_used": list(set(agents_used)),
+            }
+            return {"final_report": final_report, "agents_used": list(set(agents_used))}
+
         # Handle SCALAR results
         is_scalar = (
             (sql_result and sql_result.get("response_type") == "SCALAR")
