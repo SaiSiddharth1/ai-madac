@@ -145,10 +145,15 @@ class AnalysisSpecValidator:
                     errors.append("Multi-line chart requires an X-axis dimension.")
 
             elif chart == "scatter":
-                if contract.x_axis and not SchemaResolver.is_numeric_column(contract.x_axis, schema):
-                    errors.append(f"Scatter plot X-axis '{contract.x_axis}' must be numeric.")
-                if contract.y_axis and not SchemaResolver.is_numeric_column(contract.y_axis, schema):
-                    errors.append(f"Scatter plot Y-axis '{contract.y_axis}' must be numeric.")
+                x_num = SchemaResolver.is_numeric_column(contract.x_axis, schema) if contract.x_axis else False
+                y_num = SchemaResolver.is_numeric_column(contract.y_axis, schema) if contract.y_axis else False
+                if not contract.x_axis or not contract.y_axis or not x_num or not y_num:
+                    if not x_num and not y_num:
+                        errors.append("Scatter plot requires numeric X and Y axes.")
+                    elif not x_num:
+                        errors.append(f"Scatter plot X-axis '{contract.x_axis}' must be numeric.")
+                    elif not y_num:
+                        errors.append(f"Scatter plot Y-axis '{contract.y_axis}' must be numeric.")
 
         return len(errors) == 0, errors
 
@@ -240,6 +245,33 @@ class AnalysisSpecValidator:
                         contract.measure = res
                         contract.measure_expression = res
                         repairs.append(f"Resolved measure '{mc}' -> '{res}'.")
+
+        # X and Y Axis Alignment
+        if contract.x_axis:
+            if contract.x_axis in schema_col_names:
+                pass
+            elif contract.x_axis.lower() in cols_lower:
+                canonical = cols_lower[contract.x_axis.lower()]
+                contract.x_axis = canonical
+                repairs.append(f"Aligned x_axis casing '{contract.x_axis}' -> '{canonical}'.")
+            else:
+                res = SchemaResolver.resolve_column(contract.x_axis, schema_col_names, schema)
+                if res:
+                    contract.x_axis = res
+                    repairs.append(f"Resolved x_axis '{contract.x_axis}' -> '{res}'.")
+
+        if contract.y_axis:
+            if contract.y_axis in schema_col_names:
+                pass
+            elif contract.y_axis.lower() in cols_lower:
+                canonical = cols_lower[contract.y_axis.lower()]
+                contract.y_axis = canonical
+                repairs.append(f"Aligned y_axis casing '{contract.y_axis}' -> '{canonical}'.")
+            else:
+                res = SchemaResolver.resolve_column(contract.y_axis, schema_col_names, schema)
+                if res:
+                    contract.y_axis = res
+                    repairs.append(f"Resolved y_axis '{contract.y_axis}' -> '{res}'.")
 
         # Filters Casing & Value Alignment
         for f in contract.filters:

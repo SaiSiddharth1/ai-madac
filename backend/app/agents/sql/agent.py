@@ -21,6 +21,7 @@ from app.db.database import sync_engine
 from app.schemas.query_contract import QueryContract, AnalysisSpec
 from app.schemas.analysis_spec_validator import AnalysisSpecValidator
 from app.agents.sql.result_validator import SQLResultValidator
+from app.utils.schema_resolver import SchemaResolver
 from app.utils.serialization import to_json_safe
 from app.utils.sql_validator import sanitize_table_name, validate_sql
 from app.utils.temporal import is_temporal_column
@@ -600,15 +601,24 @@ class SQLAgent:
 
         # 3. DISTRIBUTION / HISTOGRAM (Raw observations)
         if contract.answer_type == "DISTRIBUTION":
-            target_col = contract.measure_column or (contract.x_axis or "Quantity")
+            target_col = contract.measure_column or contract.x_axis
+            if not target_col:
+                num_cols = [c for c in cols_map.values() if SchemaResolver.is_numeric_column(c, schema)]
+                target_col = num_cols[0] if num_cols else list(cols_map.values())[0]
             target_q = quote_col(target_col)
             where_sql = f" WHERE {target_q} IS NOT NULL"
             return f'SELECT {target_q} FROM "{safe_table}"{where_sql} LIMIT 5000'
 
         # 4. RELATIONSHIP / SCATTER (Raw observations)
         if contract.answer_type == "RELATIONSHIP":
-            x_col = contract.x_axis or "Quantity"
-            y_col = contract.y_axis or "UnitPrice"
+            x_col = contract.x_axis
+            y_col = contract.y_axis
+            if not x_col or not y_col:
+                num_cols = [c for c in cols_map.values() if SchemaResolver.is_numeric_column(c, schema)]
+                if not x_col:
+                    x_col = num_cols[0] if num_cols else list(cols_map.values())[0]
+                if not y_col:
+                    y_col = num_cols[1] if len(num_cols) > 1 else x_col
             x_q, y_q = quote_col(x_col), quote_col(y_col)
             where_conds = [f"{x_q} IS NOT NULL", f"{y_q} IS NOT NULL"]
             select_cols = [x_q, y_q]

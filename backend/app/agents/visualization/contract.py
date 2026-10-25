@@ -433,7 +433,7 @@ def extract_query_contract(
         explicit_chart = "bar"
     elif re.search(r"\bhistogram\b", q):
         explicit_chart = "histogram"
-    elif re.search(r"\bscatter\b|\bscatter plot\b", q):
+    elif re.search(r"\bscatter\s*(?:plot|chart|graph)?\b", q):
         explicit_chart = "scatter"
     elif re.search(r"\bbox plot\b|\bboxplot\b", q):
         explicit_chart = "box"

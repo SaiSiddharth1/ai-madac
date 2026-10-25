@@ -370,19 +370,21 @@ USER QUESTION:
             explicit_chart = "grouped_bar"
         elif re.search(r"\bhorizontal\s*bar\b", q_lower):
             explicit_chart = "horizontal_bar"
-        elif re.search(r"\bpie\b|\bdonut\b", q_lower):
+        elif re.search(r"\bpie\s*(?:chart|plot)?\b|\bdonut\b", q_lower):
             explicit_chart = "pie"
         elif re.search(r"\bhistogram\b", q_lower):
             explicit_chart = "histogram"
-        elif re.search(r"\bscatter\b", q_lower):
+        elif re.search(r"\bscatter\s*(?:plot|chart|graph)?\b", q_lower):
             explicit_chart = "scatter"
-        elif re.search(r"\bbox\s*plot\b|\bbox\b", q_lower):
+        elif re.search(r"\bbox\s*plot\b|\bboxplot\b|\bbox\b", q_lower):
             explicit_chart = "box"
-        elif re.search(r"\bbar\s*chart\b|\bbar\s*graph\b|\bas a bar\b|\bin a bar\b|\bbar\b", q_lower):
+        elif re.search(r"\bheat\s*map\b|\bheatmap\b", q_lower):
+            explicit_chart = "heatmap"
+        elif re.search(r"\bbar\s*(?:chart|plot|graph)?\b|\bas a bar\b|\bin a bar\b", q_lower):
             explicit_chart = "bar"
-        elif re.search(r"\bline\s*chart\b|\bline\s*graph\b|\bas a line\b|\bin a line\b|\bline\b", q_lower):
+        elif re.search(r"\bline\s*(?:chart|plot|graph)?\b|\bas a line\b|\bin a line\b", q_lower):
             explicit_chart = "line"
-        elif re.search(r"\barea\b", q_lower):
+        elif re.search(r"\barea\s*(?:chart|plot)?\b", q_lower):
             explicit_chart = "area"
 
         if explicit_chart:
@@ -527,8 +529,8 @@ USER QUESTION:
                 contract.should_visualize = True
                 contract.requested_visualization = True
 
-        # 6. SCATTER PLOT SEMANTICS: "X versus Y" -> X is first, Y is second
-        is_scatter = bool(re.search(r"\b(?:relationship|versus|vs\.?|against|correlation|scatter)\b", q_lower))
+        # 6. SCATTER PLOT SEMANTICS: "X versus Y", "between X and Y", "scatter of X and Y"
+        is_scatter = bool(re.search(r"\b(?:relationship|versus|vs\.?|against|correlation|scatter)\b", q_lower)) or explicit_chart == "scatter"
         if is_scatter:
             contract.intent = "RELATIONSHIP"
             contract.answer_type = "RELATIONSHIP"
@@ -538,21 +540,74 @@ USER QUESTION:
             contract.requested_visualization = True
             contract.suggested_chart_type = "scatter"
 
-            vs_m = re.search(r"\b([a-zA-Z0-9_\s]+?)\s+(?:versus|vs\.?|against)\s+([a-zA-Z0-9_\s]+?)(?:\s+as\s+|\s+in\s+|$)", q_lower)
-            if vs_m:
-                var1_str = vs_m.group(1).strip()
-                var2_str = vs_m.group(2).strip()
-                col1 = SchemaResolver.resolve_column(var1_str, schema_col_names, schema)
-                col2 = SchemaResolver.resolve_column(var2_str, schema_col_names, schema)
-                if col1 and col2:
-                    contract.x_axis = col1
-                    contract.y_axis = col2
-                    contract.measure = col1
-                    contract.measure_column = col1
+            col1 = None
+            col2 = None
+
+            # Pattern 1: between X and Y
+            between_m = re.search(r"\b(?:relationship\s+)?between\s+([a-zA-Z0-9_\s]+?)\s+and\s+([a-zA-Z0-9_\s]+?)(?:\s+(?:in|as|with|using|for)\b|$)", q_lower)
+            if between_m:
+                c1 = SchemaResolver.resolve_column(between_m.group(1).strip(), schema_col_names, schema)
+                c2 = SchemaResolver.resolve_column(between_m.group(2).strip(), schema_col_names, schema)
+                if c1 and c2:
+                    col1, col2 = c1, c2
+
+            # Pattern 2: X versus / vs / against Y
+            if not (col1 and col2):
+                vs_m = re.search(r"\b([a-zA-Z0-9_\s]+?)\s+(?:versus|vs\.?|against)\s+([a-zA-Z0-9_\s]+?)(?:\s+(?:in|as|with|using|for)\b|$)", q_lower)
+                if vs_m:
+                    c1 = SchemaResolver.resolve_column(vs_m.group(1).strip(), schema_col_names, schema)
+                    c2 = SchemaResolver.resolve_column(vs_m.group(2).strip(), schema_col_names, schema)
+                    if c1 and c2:
+                        col1, col2 = c1, c2
+
+            # Pattern 3: scatter of X and Y / scatter plot of X and Y
+            if not (col1 and col2):
+                of_m = re.search(r"\bscatter\s*(?:plot|chart)?\s*of\s+([a-zA-Z0-9_\s]+?)\s+and\s+([a-zA-Z0-9_\s]+?)(?:\s+(?:in|as|with|using|for)\b|$)", q_lower)
+                if of_m:
+                    c1 = SchemaResolver.resolve_column(of_m.group(1).strip(), schema_col_names, schema)
+                    c2 = SchemaResolver.resolve_column(of_m.group(2).strip(), schema_col_names, schema)
+                    if c1 and c2:
+                        col1, col2 = c1, c2
+
+            # Pattern 4: X and Y in a scatter / as a scatter
+            if not (col1 and col2):
+                in_m = re.search(r"\b([a-zA-Z0-9_\s]+?)\s+and\s+([a-zA-Z0-9_\s]+?)\s+(?:in|as)\s+(?:a\s+)?scatter\b", q_lower)
+                if in_m:
+                    c1 = SchemaResolver.resolve_column(in_m.group(1).strip(), schema_col_names, schema)
+                    c2 = SchemaResolver.resolve_column(in_m.group(2).strip(), schema_col_names, schema)
+                    if c1 and c2:
+                        col1, col2 = c1, c2
+
+            # Pattern 5: Direct mention of numeric schema columns in question
+            if not (col1 and col2):
+                mentioned = []
+                for sc in schema_col_names:
+                    pattern = r"\b" + re.escape(sc.lower().replace("_", " ")) + r"\b|\b" + re.escape(sc.lower()) + r"\b"
+                    m = re.search(pattern, q_lower)
+                    if m:
+                        mentioned.append((m.start(), sc))
+                mentioned.sort(key=lambda x: x[0])
+                if len(mentioned) >= 2:
+                    col1 = mentioned[0][1]
+                    col2 = mentioned[1][1]
+                elif len(mentioned) == 1:
+                    col1 = mentioned[0][1]
+
+            if col1 and col2:
+                contract.x_axis = col1
+                contract.y_axis = col2
+                contract.measure = col2
+                contract.measure_column = col2
+                contract.dimensions = [col1, col2]
+            elif col1:
+                contract.x_axis = col1
+                contract.measure = col1
+                contract.measure_column = col1
+                contract.dimensions = [col1]
 
         # 7. DISTRIBUTION SEMANTICS (Numeric Histogram vs Categorical Bar/Pie):
         is_dist = bool(re.search(r"\b(?:distribution|histogram|spread)\b", q_lower))
-        if is_dist:
+        if is_dist and not is_scatter and explicit_chart != "scatter":
             target_c = None
             if contract.group_by:
                 target_c = contract.group_by[0]
@@ -584,7 +639,7 @@ USER QUESTION:
                 contract.dimensions = [target_c]
                 contract.x_axis = target_c
                 card = SchemaResolver.get_column_cardinality(target_c, schema)
-                contract.suggested_chart_type = "pie" if (card and card <= 4) else "bar"
+                contract.suggested_chart_type = explicit_chart or ("pie" if (card and card <= 4) else "bar")
                 contract.should_visualize = True
                 contract.requested_visualization = True
             else:
@@ -595,7 +650,7 @@ USER QUESTION:
                 contract.group_by = []
                 contract.should_visualize = True
                 contract.requested_visualization = True
-                contract.suggested_chart_type = "histogram"
+                contract.suggested_chart_type = explicit_chart or "histogram"
                 if target_c:
                     contract.measure = target_c
                     contract.measure_column = target_c
@@ -687,7 +742,7 @@ USER QUESTION:
 
         # 11b. DYNAMIC GROUPING & MEASURE RESOLUTION:
         asks_grouping = bool(re.search(r"\b(?:by|per|across|for each|in each|each|broken down by|grouped by|compare|comparison|versus|vs)\b", q_lower))
-        if asks_grouping and not is_genuine_time_series:
+        if asks_grouping and not is_genuine_time_series and not is_scatter and explicit_chart != "scatter":
             group_cols = SchemaResolver.resolve_grouping_columns(
                 q_lower,
                 schema_col_names,
@@ -714,7 +769,8 @@ USER QUESTION:
                 elif len(group_cols) >= 2:
                     contract.x_axis = group_cols[0]
                     contract.series_dimension = group_cols[1]
-                    contract.suggested_chart_type = "multi_line"
+                    if not explicit_chart:
+                        contract.suggested_chart_type = "multi_line"
 
         # Resolve measure column if still missing on aggregation query
         if not contract.measure_column and not is_row_count and not is_distinct:
@@ -740,12 +796,17 @@ USER QUESTION:
 
         # 12. PREVENT UNWANTED GROUPING:
         asks_ranking = bool(re.search(r"\b(?:top|bottom|highest|lowest)\s+\d*\b", q_lower))
-        if not explicit_chart and not asks_grouping and not asks_ranking and not is_genuine_time_series and not is_dist and contract.intent != "DISTRIBUTION":
+        if not explicit_chart and not asks_grouping and not asks_ranking and not is_genuine_time_series and not is_dist and contract.intent != "DISTRIBUTION" and not is_scatter:
             contract.group_by = []
             contract.dimensions = []
             contract.answer_type = "SCALAR"
             contract.should_visualize = False
             contract.suggested_chart_type = None
+
+        if explicit_chart:
+            contract.suggested_chart_type = explicit_chart
+            contract.should_visualize = True
+            contract.requested_visualization = True
 
         return contract
 
@@ -994,18 +1055,92 @@ USER QUESTION:
         explicit_chart = None
         if re.search(r"\bmulti[-_\s]line\b", q_lower):
             explicit_chart = "multi_line"
-        elif re.search(r"\bhistogram\b", q_lower):
-            explicit_chart = "histogram"
-        elif re.search(r"\bscatter\b", q_lower):
-            explicit_chart = "scatter"
+        elif re.search(r"\bgrouped\s*bar\b|\bclustered\s*bar\b", q_lower):
+            explicit_chart = "grouped_bar"
         elif re.search(r"\bhorizontal\s*bar\b", q_lower):
             explicit_chart = "horizontal_bar"
-        elif re.search(r"\bpie\b|\bdonut\b", q_lower):
+        elif re.search(r"\bpie\s*(?:chart|plot)?\b|\bdonut\b", q_lower):
             explicit_chart = "pie"
-        elif re.search(r"\bbar\b", q_lower):
+        elif re.search(r"\bhistogram\b", q_lower):
+            explicit_chart = "histogram"
+        elif re.search(r"\bscatter\s*(?:plot|chart|graph)?\b", q_lower):
+            explicit_chart = "scatter"
+        elif re.search(r"\bbox\s*plot\b|\bboxplot\b|\bbox\b", q_lower):
+            explicit_chart = "box"
+        elif re.search(r"\bheat\s*map\b|\bheatmap\b", q_lower):
+            explicit_chart = "heatmap"
+        elif re.search(r"\bbar\s*(?:chart|plot|graph)?\b|\bas a bar\b|\bin a bar\b", q_lower):
             explicit_chart = "bar"
-        elif re.search(r"\bline\b", q_lower):
+        elif re.search(r"\bline\s*(?:chart|plot|graph)?\b|\bas a line\b|\bin a line\b", q_lower):
             explicit_chart = "line"
+        elif re.search(r"\barea\s*(?:chart|plot)?\b", q_lower):
+            explicit_chart = "area"
+
+        # Check scatter / relationship questions
+        is_scatter = (
+            explicit_chart == "scatter"
+            or bool(re.search(r"\b(?:relationship|versus|vs\.?|against|correlation|scatter)\b", q_lower))
+        )
+        if is_scatter:
+            col1 = None
+            col2 = None
+            between_m = re.search(r"\b(?:relationship\s+)?between\s+([a-zA-Z0-9_\s]+?)\s+and\s+([a-zA-Z0-9_\s]+?)(?:\s+(?:in|as|with|using|for)\b|$)", q_lower)
+            if between_m:
+                c1 = SchemaResolver.resolve_column(between_m.group(1).strip(), schema_cols, schema)
+                c2 = SchemaResolver.resolve_column(between_m.group(2).strip(), schema_cols, schema)
+                if c1 and c2:
+                    col1, col2 = c1, c2
+            if not (col1 and col2):
+                vs_m = re.search(r"\b([a-zA-Z0-9_\s]+?)\s+(?:versus|vs\.?|against)\s+([a-zA-Z0-9_\s]+?)(?:\s+(?:in|as|with|using|for)\b|$)", q_lower)
+                if vs_m:
+                    c1 = SchemaResolver.resolve_column(vs_m.group(1).strip(), schema_cols, schema)
+                    c2 = SchemaResolver.resolve_column(vs_m.group(2).strip(), schema_cols, schema)
+                    if c1 and c2:
+                        col1, col2 = c1, c2
+            if not (col1 and col2):
+                of_m = re.search(r"\bscatter\s*(?:plot|chart)?\s*of\s+([a-zA-Z0-9_\s]+?)\s+and\s+([a-zA-Z0-9_\s]+?)(?:\s+(?:in|as|with|using|for)\b|$)", q_lower)
+                if of_m:
+                    c1 = SchemaResolver.resolve_column(of_m.group(1).strip(), schema_cols, schema)
+                    c2 = SchemaResolver.resolve_column(of_m.group(2).strip(), schema_cols, schema)
+                    if c1 and c2:
+                        col1, col2 = c1, c2
+            if not (col1 and col2):
+                in_m = re.search(r"\b([a-zA-Z0-9_\s]+?)\s+and\s+([a-zA-Z0-9_\s]+?)\s+(?:in|as)\s+(?:a\s+)?scatter\b", q_lower)
+                if in_m:
+                    c1 = SchemaResolver.resolve_column(in_m.group(1).strip(), schema_cols, schema)
+                    c2 = SchemaResolver.resolve_column(in_m.group(2).strip(), schema_cols, schema)
+                    if c1 and c2:
+                        col1, col2 = c1, c2
+            if not (col1 and col2):
+                mentioned = []
+                for sc in schema_cols:
+                    pattern = r"\b" + re.escape(sc.lower().replace("_", " ")) + r"\b|\b" + re.escape(sc.lower()) + r"\b"
+                    m = re.search(pattern, q_lower)
+                    if m:
+                        mentioned.append((m.start(), sc))
+                mentioned.sort(key=lambda x: x[0])
+                if len(mentioned) >= 2:
+                    col1 = mentioned[0][1]
+                    col2 = mentioned[1][1]
+
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="RELATIONSHIP",
+                answer_type="RELATIONSHIP",
+                measure=col2 or col1 or "value",
+                measure_column=col2 or col1,
+                measure_expression=col2 or col1,
+                aggregation=None,
+                dimensions=[col1, col2] if (col1 and col2) else ([col1] if col1 else []),
+                group_by=[],
+                x_axis=col1,
+                y_axis=col2,
+                suggested_chart_type="scatter",
+                should_visualize=True,
+                requested_visualization=True,
+            )
 
         # Check distribution questions
         is_dist_query = bool(re.search(r"\b(?:distribution|histogram|spread)\b", q_lower))
@@ -1154,6 +1289,14 @@ USER QUESTION:
                 requested_visualization=True,
             )
 
+        auto_chart = explicit_chart
+        if not auto_chart:
+            if series_dim:
+                auto_chart = "multi_line"
+            elif group_by:
+                is_num_or_time = SchemaResolver.is_numeric_column(group_by[0], schema) or is_temporal_column(group_by[0])
+                auto_chart = "line" if is_num_or_time else "bar"
+
         return QueryContract(
             query_id=query_id,
             dataset_id=dataset_id,
@@ -1170,8 +1313,8 @@ USER QUESTION:
             filters=resolved_filters,
             x_axis=x_col if explicit_chart != "horizontal_bar" else meas_col,
             y_axis=meas_col if explicit_chart != "horizontal_bar" else x_col,
-            suggested_chart_type=explicit_chart or ("multi_line" if series_dim else None),
-            should_visualize=bool(explicit_chart or group_by),
+            suggested_chart_type=auto_chart,
+            should_visualize=bool(auto_chart or group_by),
             requested_visualization=bool(explicit_chart),
             limit=limit_val,
             sort=SortSpec(field=sort_col, direction=sort_dir),

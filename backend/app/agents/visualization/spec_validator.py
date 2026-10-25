@@ -377,12 +377,10 @@ class SpecValidator:
                     x_col = x_col or requested[0]
                     y_col = y_col or requested[1]
                 else:
-                    num_cols = [
-                        c for c in requested + avail
-                        if any(k in c.lower() for k in ("income", "age", "quantity", "price", "sales", "profit", "cost", "value", "rate", "amount"))
-                    ]
-                    x_col = x_col or (num_cols[0] if len(num_cols) > 0 else (requested[0] if requested else avail[0]))
-                    y_col = y_col or (num_cols[1] if len(num_cols) > 1 else (requested[1] if len(requested) > 1 else x_col))
+                    cand_cols = [c for c in requested + avail if c not in (x_col, y_col)]
+                    x_col = x_col or (cand_cols[0] if cand_cols else (avail[0] if avail else "X"))
+                    remaining = [c for c in cand_cols if c != x_col]
+                    y_col = y_col or (remaining[0] if remaining else (avail[1] if len(avail) > 1 else x_col))
 
             color_col = getattr(contract, "color_by", None) or getattr(contract, "series_dimension", None)
             if not color_col and len(dims) > 0 and dims[0] not in (x_col, y_col):
