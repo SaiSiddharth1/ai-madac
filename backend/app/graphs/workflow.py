@@ -3,6 +3,7 @@ LangGraph Multi-Agent Workflow Definition.
 Builds and compiles the StateGraph orchestrating Supervisor, SQL, Analyst, ML, Visualization, RAG, and Report agents.
 """
 
+import json
 import logging
 from typing import Any
 
@@ -58,6 +59,27 @@ async def supervisor_node(state: AgentState) -> dict[str, Any]:
     await workflow_event_manager.emit(
         query_id, "supervisor_agent", "completed", selected_msg, intent=intent, execution_plan=plan
     )
+
+    spec = res.get("query_contract") or res.get("analysis_spec") or {}
+    logger.info(
+        "\n==================== [AI-MADAC PIPELINE DEBUG] ====================\n"
+        "[USER QUESTION]\n%s\n\n"
+        "[DATASET SCHEMA]\nTable: %s, Columns: %s\n\n"
+        "[ANALYSIS SPEC / VALIDATED ANALYSIS SPEC]\n"
+        "intent=%s, answer_type=%s, measure=%s, aggregation=%s, group_by=%s, series_dimension=%s, filters=%s, chart_type=%s\n"
+        "====================================================================",
+        state.get("question", ""),
+        state.get("table_name", ""),
+        [c.get("name") for c in (state.get("schema") or {}).get("columns", [])],
+        spec.get("intent"),
+        spec.get("answer_type"),
+        spec.get("measure") or spec.get("measure_column"),
+        spec.get("aggregation"),
+        spec.get("group_by"),
+        spec.get("series_dimension"),
+        spec.get("filters"),
+        spec.get("suggested_chart_type"),
+    )
     return res
 
 
@@ -66,6 +88,21 @@ async def sql_node(state: AgentState) -> dict[str, Any]:
     query_id = state.get("query_id", "")
     await workflow_event_manager.emit(query_id, "sql_agent", "running", "Generating SQL and fetching records")
     res = _record_agent_completion(state, sql_agent.run(state), "sql_agent")
+
+    sql_q = res.get("sql_query", "")
+    sql_res = res.get("sql_result") or {}
+    logger.info(
+        "\n==================== [AI-MADAC PIPELINE DEBUG] ====================\n"
+        "[GENERATED SQL]\n%s\n\n"
+        "[SQL RESULT SHAPE]\nRows: %s, Columns: %s\n\n"
+        "[SQL RESULT SAMPLE]\n%s\n"
+        "====================================================================",
+        sql_q,
+        sql_res.get("row_count", 0),
+        sql_res.get("columns", []),
+        json.dumps((sql_res.get("rows") or [])[:3], indent=2, default=str),
+    )
+
     errors = res.get("errors", [])
     if errors:
         await workflow_event_manager.emit(query_id, "sql_agent", "failed", f"SQL execution error: {errors[0]}")
@@ -76,6 +113,7 @@ async def sql_node(state: AgentState) -> dict[str, Any]:
     else:
         await workflow_event_manager.emit(query_id, "sql_agent", "completed", "Data retrieved successfully")
     return res
+
 
 
 async def data_analyst_node(state: AgentState) -> dict[str, Any]:
@@ -133,6 +171,15 @@ async def visualization_validator_node(state: AgentState) -> dict[str, Any]:
     query_id = state.get("query_id", "")
     await workflow_event_manager.emit(query_id, "visualization_validator", "running", "Validating specification against Query Contract and schema")
     res = visualization_agent.run_validation(state)
+
+    v_spec = res.get("_validated_spec") or {}
+    logger.info(
+        "\n==================== [AI-MADAC PIPELINE DEBUG] ====================\n"
+        "[VALIDATED VISUALIZATION SPEC]\n%s\n"
+        "====================================================================",
+        json.dumps(v_spec, indent=2, default=str),
+    )
+
     errors = res.get("errors", [])
     if errors:
         await workflow_event_manager.emit(query_id, "visualization_validator", "failed", f"Validation error: {errors[0]}")
@@ -151,6 +198,15 @@ async def chart_renderer_node(state: AgentState) -> dict[str, Any]:
     is_avail = viz_res.get("visualization_available", False)
     has_chart = bool(viz_res.get("chart_path") or viz_res.get("chart_paths"))
 
+    logger.info(
+        "\n==================== [AI-MADAC PIPELINE DEBUG] ====================\n"
+        "[FINAL CHART]\nAvailable: %s, Chart Type: %s, Path: %s\n"
+        "====================================================================",
+        is_avail,
+        viz_res.get("chart_type"),
+        viz_res.get("chart_path") or viz_res.get("chart_paths"),
+    )
+
     if errors:
         await workflow_event_manager.emit(query_id, "chart_renderer", "failed", f"Rendering error: {errors[0]}")
     elif not is_avail or not has_chart:
@@ -159,6 +215,7 @@ async def chart_renderer_node(state: AgentState) -> dict[str, Any]:
     else:
         await workflow_event_manager.emit(query_id, "chart_renderer", "completed", "Interactive Plotly chart generated successfully")
     return _record_agent_completion(state, res, "chart_renderer")
+
 
 
 async def rag_node(state: AgentState) -> dict[str, Any]:

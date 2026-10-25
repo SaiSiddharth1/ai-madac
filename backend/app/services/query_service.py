@@ -102,32 +102,18 @@ async def execute_query(
     # Context is read by key, but it is only eligible for an explicit
     # follow-up. Every new question still starts with empty execution fields.
     previous = await get_previous_validated_result(db, user_id, dataset_id, session_id)
-    # 4. Construct initial AgentState
-    initial_state: AgentState = {
-        "user_id": str(user_id),
-        "dataset_id": str(dataset_id),
-        "query_id": str(query_record.id),
-        "session_id": session_id or "",
-        "question": question,
-        "table_name": dataset.table_name,
-        "schema": dataset.schema_info or {},
-        "dataset_profile": profile_json,
-        "previous_validated_result": previous,
-        "validated_result": None,
-        "intent": "",
-        "query_contract": None,
-        "structured_intent": {},
-        "execution_plan": [],
-        "sql_query": None,
-        "sql_result": None,
-        "analysis_result": None,
-        "ml_result": None,
-        "visualization_result": None,
-        "rag_result": None,
-        "final_report": None,
-        "errors": [],
-        "agents_used": [],
-    }
+    from app.agents.state import create_fresh_question_state
+    initial_state = create_fresh_question_state(
+        user_id=str(user_id),
+        dataset_id=str(dataset_id),
+        query_id=str(query_record.id),
+        session_id=session_id or "",
+        question=question,
+        table_name=dataset.table_name,
+        schema=dataset.schema_info or {},
+        dataset_profile=profile_json,
+        previous_validated_result=previous,
+    )
 
     # 5. Execute LangGraph workflow
     start_time = time.time()

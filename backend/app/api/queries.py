@@ -154,32 +154,19 @@ async def run_query_stream(
     async def event_generator() -> AsyncGenerator[str, None]:
         async def run_workflow():
             try:
-                # Construct initial AgentState
-                initial_state = {
-                    "user_id": str(current_user.id),
-                    "dataset_id": str(dataset_id),
-                    "query_id": query_id_str,
-                    "session_id": body.session_id or "",
-                    "question": body.question,
-                    "table_name": dataset.table_name,
-                    "schema": dataset.schema_info or {},
-                    "dataset_profile": profile_json,
-                    "previous_validated_result": previous,
-                    "validated_result": None,
-                    "intent": "",
-                    "query_contract": None,
-                    "structured_intent": {},
-                    "execution_plan": [],
-                    "sql_query": None,
-                    "sql_result": None,
-                    "analysis_result": None,
-                    "ml_result": None,
-                    "visualization_result": None,
-                    "rag_result": None,
-                    "final_report": None,
-                    "errors": [],
-                    "agents_used": [],
-                }
+                # Construct initial AgentState using fresh question context factory
+                from app.agents.state import create_fresh_question_state
+                initial_state = create_fresh_question_state(
+                    user_id=str(current_user.id),
+                    dataset_id=str(dataset_id),
+                    query_id=query_id_str,
+                    session_id=body.session_id or "",
+                    question=body.question,
+                    table_name=dataset.table_name,
+                    schema=dataset.schema_info or {},
+                    dataset_profile=profile_json,
+                    previous_validated_result=previous,
+                )
                 
                 # Execute LangGraph workflow
                 final_state = await workflow_graph.ainvoke(initial_state)

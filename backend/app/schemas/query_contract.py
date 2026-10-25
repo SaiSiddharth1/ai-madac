@@ -127,3 +127,7 @@ class QueryContract(BaseModel):
     def to_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json")
 
+
+# Canonical alias
+AnalysisSpec = QueryContract
+

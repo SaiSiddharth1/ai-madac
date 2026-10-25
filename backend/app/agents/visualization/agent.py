@@ -88,7 +88,7 @@ CRITICAL RULES:
    - If comparing a continuous numerical variable (e.g. Age) against a range category (e.g. Expected Return '10-20%', '20-30%', '30-40%'), choose chart = "box" (Box plot) to show distribution across brackets.
    - If the user explicitly asks for scatter plot, set y = "Expected Return Midpoint (%)" with transparent midpoint transformation.
 6. AGGREGATIONS:
-   - "count" / "number of investors" -> count
+   - "count" / "number of records" -> count
    - "average" / "mean" -> mean
    Never substitute count when user asked for average, or average when user asked for count.
 7. NEVER invent columns. Only select from CURRENT DATASET COLUMNS.
@@ -99,12 +99,12 @@ RETURN ONLY VALID JSON WITH THIS EXACT STRUCTURE:
     "visualization_available": true,
     "query_interpretation": {
         "intent": "categorical_comparison",
-        "requested_fields": ["objective", "gender"]
+        "requested_fields": ["category", "segment"]
     },
     "fields": {
-        "x": "objective",
+        "x": "category",
         "y": null,
-        "color": "gender",
+        "color": "segment",
         "facet": null
     },
     "measure": {
@@ -123,14 +123,14 @@ RETURN ONLY VALID JSON WITH THIS EXACT STRUCTURE:
         "orientation": "vertical",
         "mode": "grouped"
     },
-    "title": "Investors by Gender and Investment Objective",
+    "title": "Records by Category and Segment",
     "axis_labels": {
-        "x": "Investment Objective",
-        "y": "Number of Investors"
+        "x": "Category",
+        "y": "Count"
     },
     "legend": {
         "show": true,
-        "title": "Gender"
+        "title": "Segment"
     }
 }
 """
@@ -417,18 +417,21 @@ class VisualizationAgent:
         x_field = spec.get("fields", {}).get("x")
         y_field = spec.get("fields", {}).get("y")
         color_field = spec.get("fields", {}).get("color")
+        x_in_df = isinstance(x_field, str) and x_field in prepared_df
+        y_in_df = isinstance(y_field, str) and y_field in prepared_df
+        color_in_df = isinstance(color_field, str) and color_field in prepared_df
         logger.info(
             "Plotly input telemetry: query_id=%s, chart_type=%s, x=%s (type=%s, shape=%s), y=%s (type=%s, shape=%s), series=%s (series_count=%s), row_count=%s",
             state.get("query_id"),
             spec.get("chart", {}).get("type"),
             x_field,
-            str(prepared_df[x_field].dtype) if x_field in prepared_df else "N/A",
-            prepared_df[x_field].shape if x_field in prepared_df else "N/A",
+            str(prepared_df[x_field].dtype) if x_in_df else "N/A",
+            prepared_df[x_field].shape if x_in_df else "N/A",
             y_field,
-            str(prepared_df[y_field].dtype) if y_field in prepared_df else "N/A",
-            prepared_df[y_field].shape if y_field in prepared_df else "N/A",
+            str(prepared_df[y_field].dtype) if y_in_df else "N/A",
+            prepared_df[y_field].shape if y_in_df else "N/A",
             color_field,
-            prepared_df[color_field].nunique() if color_field in prepared_df else 0,
+            prepared_df[color_field].nunique() if color_in_df else 0,
             len(prepared_df),
         )
 

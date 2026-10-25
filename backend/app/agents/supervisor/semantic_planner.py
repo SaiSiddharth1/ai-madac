@@ -14,6 +14,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.core.llm_provider import get_llm
 from app.schemas.query_contract import CalculationSpec, FilterSpec, HavingSpec, OperandSpec, QueryContract, SortSpec
+from app.schemas.analysis_spec_validator import AnalysisSpecValidator
 from app.utils.schema_resolver import SchemaResolver, normalize_term
 from app.utils.temporal import find_temporal_column, is_temporal_column, is_temporal_intent
 
@@ -161,12 +162,15 @@ USER QUESTION:
             contract = self._build_contract_from_data(data, question, dataset_id, query_id, schema)
             # Apply semantic guardrails
             contract = self._validate_and_sanitize_contract(contract, schema)
+            contract, _ = AnalysisSpecValidator.validate_and_repair(contract, schema)
             return contract
 
         except Exception as e:
             logger.error("Gemini semantic planning failed: %s. Using deterministic fallback.", e, exc_info=True)
             fallback = self._heuristic_contract_fallback(question, schema, dataset_id, query_id)
-            return self._validate_and_sanitize_contract(fallback, schema)
+            contract = self._validate_and_sanitize_contract(fallback, schema)
+            contract, _ = AnalysisSpecValidator.validate_and_repair(contract, schema)
+            return contract
 
     def _build_contract_from_data(
         self,
@@ -334,12 +338,17 @@ USER QUESTION:
 
         # 1. CROSS-DATASET PROTECTION:
         # Check if question is asking for domain fields not in active dataset
-        asks_sales = bool(re.search(r"\b(?:sales|total sales|gross sales|revenue|turnover)\b", q_lower))
+        dept_col = SchemaResolver.resolve_column("department", schema_col_names, schema)
+        is_sales_dept_or_role = bool(re.search(r"\b(?:sales\s+(?:department|dept|executive|rep|representative|team)|in\s+sales|from\s+sales)\b", q_lower)) and bool(dept_col)
+
+        asks_sales_metric = bool(re.search(r"\b(?:total sales|gross sales|sales volume|revenue|turnover)\b", q_lower)) or (
+            bool(re.search(r"\bsales\b", q_lower)) and not is_sales_dept_or_role
+        )
         asks_products = bool(re.search(r"\b(?:products?|item|sku)\b", q_lower))
         has_sales = bool(SchemaResolver.resolve_column("sales", schema_col_names, schema))
         has_product = bool(SchemaResolver.resolve_column("product", schema_col_names, schema))
 
-        if (asks_sales and not has_sales) or (asks_products and not has_product):
+        if (asks_sales_metric and not has_sales) or (asks_products and not has_product):
             contract.is_related_to_dataset = False
             contract.intent = "UNRELATED"
             contract.answer_type = "UNRELATED"
@@ -401,6 +410,9 @@ USER QUESTION:
                 contract.aggregation = "COUNT"
         elif is_explicit_sum:
             contract.aggregation = "SUM"
+
+        if not contract.measure_column and contract.aggregation in ("SUM", "AVG", "MIN", "MAX"):
+            contract.aggregation = "COUNT"
 
         # 4. TEMPORAL DETECTION & TIME-SERIES INTENT:
         temporal_col = find_temporal_column(schema)
@@ -538,29 +550,56 @@ USER QUESTION:
                     contract.measure = col1
                     contract.measure_column = col1
 
-        # 7. HISTOGRAM SEMANTICS: Raw observations of requested measure
+        # 7. DISTRIBUTION SEMANTICS (Numeric Histogram vs Categorical Bar/Pie):
         is_dist = bool(re.search(r"\b(?:distribution|histogram|spread)\b", q_lower))
         if is_dist:
-            contract.intent = "DISTRIBUTION"
-            contract.answer_type = "DISTRIBUTION"
-            contract.aggregation = None
-            contract.group_by = []
-            contract.should_visualize = True
-            contract.requested_visualization = True
-            contract.suggested_chart_type = "histogram"
+            target_c = None
+            if contract.group_by:
+                target_c = contract.group_by[0]
+            elif contract.dimensions:
+                target_c = contract.dimensions[0]
+            elif contract.x_axis:
+                target_c = contract.x_axis
+            elif contract.measure_column:
+                target_c = contract.measure_column
 
-            dist_m = re.search(r"\b(?:distribution|histogram|spread)\s+of\s+([a-zA-Z0-9_\s]+?)(?:\s+using|\s+as|\s+in|$)", q_lower)
-            if dist_m:
-                target_str = dist_m.group(1).strip()
-                target_c = SchemaResolver.resolve_column(target_str, schema_col_names, schema)
-                if target_c:
-                    contract.measure = target_c
-                    contract.measure_column = target_c
-                    contract.x_axis = target_c
+            if not target_c:
+                target_c = SchemaResolver.resolve_distribution_column(contract.original_query, schema_col_names, schema)
 
             bin_match = re.search(r"\b(?:bin\s*width|bin\s*size|bins?\s*of)\s*(\d+(?:\.\d+)?)\b", q_lower)
             if bin_match:
                 contract.bin_width = float(bin_match.group(1))
+
+            is_numeric = SchemaResolver.is_numeric_column(target_c, schema) if target_c else False
+
+            if target_c and not is_numeric:
+                # Categorical Distribution: COUNT(*) GROUP BY target_c (Bar / Pie)
+                contract.intent = "AGGREGATION"
+                contract.answer_type = "GROUPED"
+                contract.aggregation = "COUNT"
+                contract.measure = "total_records"
+                contract.measure_column = None
+                contract.measure_expression = None
+                contract.group_by = [target_c]
+                contract.dimensions = [target_c]
+                contract.x_axis = target_c
+                card = SchemaResolver.get_column_cardinality(target_c, schema)
+                contract.suggested_chart_type = "pie" if (card and card <= 4) else "bar"
+                contract.should_visualize = True
+                contract.requested_visualization = True
+            else:
+                # Numeric Distribution: raw continuous observations (Histogram)
+                contract.intent = "DISTRIBUTION"
+                contract.answer_type = "DISTRIBUTION"
+                contract.aggregation = None
+                contract.group_by = []
+                contract.should_visualize = True
+                contract.requested_visualization = True
+                contract.suggested_chart_type = "histogram"
+                if target_c:
+                    contract.measure = target_c
+                    contract.measure_column = target_c
+                    contract.x_axis = target_c
 
         # 8. DISTINCT COUNTING:
         is_distinct = bool(re.search(r"\b(?:unique|distinct)\b", q_lower))
@@ -576,22 +615,45 @@ USER QUESTION:
                     contract.measure_expression = entity_col
 
         # 9. ROW COUNTING:
-        is_row_count = bool(re.search(r"\b(?:how many\s+(?:employees|records|rows|orders|transactions|invoices|people|items|customers|investors)?\s*(?:are there|in total|total)?|count of records|total count)\b", q_lower))
+        is_row_count = bool(re.search(r"\b(?:how many\s+(?:employees|records|rows|orders|transactions|invoices|people|items|customers|investors)?\s*(?:are there|in total|total)?|count of records|total count|number of employees)\b", q_lower))
         if is_row_count and not is_distinct and not any(k in q_lower for k in ("sales", "profit", "revenue", "income", "salary", "price", "quantity", "discount", "margin", "cost", "return")):
             contract.intent = "AGGREGATION"
-            contract.answer_type = "SCALAR"
             contract.aggregation = "COUNT"
             contract.measure = "total_records"
             contract.measure_column = None
             contract.measure_expression = None
-            contract.group_by = []
-            contract.should_visualize = False
+            asks_grouping_hint = bool(re.search(r"\b(?:by|per|across|for each|in each|each|broken down by|grouped by)\b", q_lower))
+            if not asks_grouping_hint and not contract.group_by:
+                contract.answer_type = "SCALAR"
+                contract.group_by = []
+                contract.should_visualize = False
+            else:
+                contract.answer_type = "GROUPED"
+                contract.should_visualize = True
 
-        # 10. ROW-LEVEL FILTERS (e.g. employees who work overtime):
-        if bool(re.search(r"\b(?:who work overtime|working overtime|with overtime|who have overtime)\b", q_lower)):
-            overtime_col = SchemaResolver.resolve_column("overtime", schema_col_names, schema)
-            if overtime_col and not any(f.column == overtime_col for f in contract.filters):
-                contract.filters.append(FilterSpec(column=overtime_col, operator="=", value="Yes"))
+        # 10. ROW-LEVEL FILTERS (Attrition, Overtime, Department, etc.):
+        if contract.intent != "CALCULATION" and not contract.calculation:
+            resolved_filters = SchemaResolver.resolve_filters(
+                q_lower,
+                schema_col_names,
+                schema,
+                existing_group_by=contract.group_by,
+            )
+            for rf in resolved_filters:
+                if not any(f.column == rf.column for f in contract.filters):
+                    contract.filters.append(rf)
+
+            # If attrition filter is present, ensure row counting aggregation
+            attr_col = SchemaResolver.resolve_column("attrition", schema_col_names, schema)
+            if attr_col and any(f.column == attr_col for f in contract.filters):
+                if contract.measure_column == attr_col or contract.measure == attr_col:
+                    contract.measure = "total_records"
+                    contract.measure_column = None
+                    contract.measure_expression = None
+                    contract.aggregation = "COUNT"
+                if not re.search(r"\b(?:by|for each|each|across)\s+attrition\b", q_lower):
+                    contract.group_by = [g for g in contract.group_by if g != attr_col]
+                    contract.dimensions = [d for d in contract.dimensions if d != attr_col]
 
         # 11. BAR CHART SEMANTICS:
         if explicit_chart in ("bar", "horizontal_bar") and not is_genuine_time_series:
@@ -623,10 +685,62 @@ USER QUESTION:
                         contract.should_visualize = True
                         contract.requested_visualization = True
 
+        # 11b. DYNAMIC GROUPING & MEASURE RESOLUTION:
+        asks_grouping = bool(re.search(r"\b(?:by|per|across|for each|in each|each|broken down by|grouped by|compare|comparison|versus|vs)\b", q_lower))
+        if asks_grouping and not is_genuine_time_series:
+            group_cols = SchemaResolver.resolve_grouping_columns(
+                q_lower,
+                schema_col_names,
+                schema,
+                exclude_columns=[contract.measure_column] if contract.measure_column else None,
+            )
+            if group_cols:
+                contract.group_by = group_cols
+                contract.dimensions = group_cols
+                contract.answer_type = "GROUPED"
+                contract.should_visualize = True
+                if len(group_cols) == 1:
+                    contract.x_axis = group_cols[0]
+                    if not contract.suggested_chart_type:
+                        dim_dtype = ""
+                        if isinstance(schema, dict):
+                            for col_info in schema.get("columns", []):
+                                if isinstance(col_info, dict) and col_info.get("name") == group_cols[0]:
+                                    dim_dtype = str(col_info.get("dtype", "")).lower()
+                        if any(num_t in dim_dtype for num_t in ("int", "float", "real", "num")):
+                            contract.suggested_chart_type = "line"
+                        else:
+                            contract.suggested_chart_type = "bar"
+                elif len(group_cols) >= 2:
+                    contract.x_axis = group_cols[0]
+                    contract.series_dimension = group_cols[1]
+                    contract.suggested_chart_type = "multi_line"
+
+        # Resolve measure column if still missing on aggregation query
+        if not contract.measure_column and not is_row_count and not is_distinct:
+            resolved_meas = SchemaResolver.resolve_measure_column(
+                q_lower,
+                schema_col_names,
+                schema,
+                exclude_columns=contract.group_by,
+            )
+            if resolved_meas:
+                contract.measure = resolved_meas
+                contract.measure_column = resolved_meas
+                contract.measure_expression = resolved_meas
+                if not contract.aggregation or contract.aggregation == "COUNT":
+                    if bool(re.search(r"\b(?:average|mean|avg)\b", q_lower)):
+                        contract.aggregation = "AVG"
+                    elif bool(re.search(r"\b(?:maximum|max|highest value|peak)\b", q_lower)):
+                        contract.aggregation = "MAX"
+                    elif bool(re.search(r"\b(?:minimum|min|lowest)\b", q_lower)):
+                        contract.aggregation = "MIN"
+                    else:
+                        contract.aggregation = "SUM"
+
         # 12. PREVENT UNWANTED GROUPING:
-        asks_grouping = bool(re.search(r"\b(?:by|per|across|for each|each|breakdown by)\b", q_lower)) or is_genuine_time_series
         asks_ranking = bool(re.search(r"\b(?:top|bottom|highest|lowest)\s+\d*\b", q_lower))
-        if not explicit_chart and not asks_grouping and not asks_ranking and not is_genuine_time_series:
+        if not explicit_chart and not asks_grouping and not asks_ranking and not is_genuine_time_series and not is_dist and contract.intent != "DISTRIBUTION":
             contract.group_by = []
             contract.dimensions = []
             contract.answer_type = "SCALAR"
@@ -646,14 +760,97 @@ USER QUESTION:
         """Detect mathematical / derived metric queries with strict schema validation."""
         is_diff = bool(re.search(r"\b(?:difference between|how much higher|how much more|gap between)\b", q_lower))
         is_margin = bool(re.search(r"\b(?:profit margin|margin based on)\b", q_lower))
-        is_pct = bool(re.search(r"\b(?:what percentage of|what percent of|percentage of total|share of total)\b", q_lower))
+        is_pct = bool(re.search(r"\b(?:what percentage of|what percent of|percentage of|percent of|pct of|share of total)\b", q_lower))
+        is_rate = bool(re.search(r"\b(?:attrition rates?|turnover rates?|churn rates?|rates? of|overall attrition rates?)\b", q_lower))
         is_ratio = bool(re.search(r"\b(?:ratio of)\b", q_lower))
         is_sum = bool(re.search(r"\b(?:sum of total)\b", q_lower))
 
-        if not (is_diff or is_margin or is_pct or is_ratio or is_sum):
+        if not (is_diff or is_margin or is_pct or is_ratio or is_sum or is_rate):
             return None
 
         schema_cols = [c.get("name", "") if isinstance(c, dict) else str(c) for c in schema.get("columns", [])]
+
+        # 1. Attrition Rate or Row-Condition Ratio/Percentage
+        if is_rate or (is_pct and any(k in q_lower for k in ("attrition", "left", "turnover", "churn", "overtime", "employees", "people"))):
+            attr_col = SchemaResolver.resolve_column("attrition", schema_cols, schema)
+            ot_col = SchemaResolver.resolve_column("overtime", schema_cols, schema)
+
+            # Check if this is a grouped attrition rate query (e.g., across age, for male and female)
+            group_cols = SchemaResolver.resolve_grouping_columns(q_lower, schema_cols, schema)
+            if (is_rate or is_pct) and group_cols and attr_col:
+                calc_spec = CalculationSpec(
+                    operator="PERCENTAGE",
+                    operands=[
+                        OperandSpec(name="Employees Left", measure="total_records", measure_column=None, aggregation="COUNT", filters=[FilterSpec(column=attr_col, operator="=", value="Yes")]),
+                        OperandSpec(name="Total Employees", measure="total_records", measure_column=None, aggregation="COUNT", filters=[]),
+                    ],
+                    label="Attrition Rate",
+                )
+                x_dim = group_cols[0]
+                s_dim = group_cols[1] if len(group_cols) > 1 else None
+                return QueryContract(
+                    query_id=query_id,
+                    dataset_id=dataset_id,
+                    original_query=question,
+                    intent="CALCULATION",
+                    answer_type="GROUPED",
+                    measure="Attrition Rate",
+                    dimensions=group_cols,
+                    group_by=group_cols,
+                    x_axis=x_dim,
+                    series_dimension=s_dim,
+                    calculation=calc_spec,
+                    should_visualize=True,
+                    suggested_chart_type="multi_line" if len(group_cols) >= 2 else "line",
+                )
+
+            # Check if this is an overall attrition rate query: "overall attrition rate"
+            is_overall_attrition = not bool(group_cols) and bool(re.search(r"\b(?:overall\s+attrition\s+rate|attrition\s+rate)\b", q_lower)) and not bool(re.search(r"\b(?:overtime|sales|department)\b", q_lower))
+            if is_overall_attrition and attr_col:
+                calc_spec = CalculationSpec(
+                    operator="PERCENTAGE",
+                    operands=[
+                        OperandSpec(name="Employees Left", measure="total_records", measure_column=None, aggregation="COUNT", filters=[FilterSpec(column=attr_col, operator="=", value="Yes")]),
+                        OperandSpec(name="Total Employees", measure="total_records", measure_column=None, aggregation="COUNT", filters=[]),
+                    ],
+                    label="Overall Attrition Rate",
+                )
+                return QueryContract(
+                    query_id=query_id,
+                    dataset_id=dataset_id,
+                    original_query=question,
+                    intent="CALCULATION",
+                    answer_type="SCALAR",
+                    measure="Overall Attrition Rate",
+                    calculation=calc_spec,
+                    should_visualize=False,
+                )
+
+            # Check if overtime percentage: "percentage of employees who work overtime have left"
+            if attr_col and ot_col and ("overtime" in q_lower or "left" in q_lower):
+                base_filters = [FilterSpec(column=ot_col, operator="=", value="Yes")] if "overtime" in q_lower else []
+                num_filters = list(base_filters)
+                if any(w in q_lower for w in ("left", "attrition", "churn", "turnover")):
+                    num_filters.append(FilterSpec(column=attr_col, operator="=", value="Yes"))
+
+                calc_spec = CalculationSpec(
+                    operator="PERCENTAGE",
+                    operands=[
+                        OperandSpec(name="Overtime Employees Left", measure="total_records", measure_column=None, aggregation="COUNT", filters=num_filters),
+                        OperandSpec(name="Total Overtime Employees", measure="total_records", measure_column=None, aggregation="COUNT", filters=base_filters),
+                    ],
+                    label="Percentage of Overtime Employees Who Left",
+                )
+                return QueryContract(
+                    query_id=query_id,
+                    dataset_id=dataset_id,
+                    original_query=question,
+                    intent="CALCULATION",
+                    answer_type="SCALAR",
+                    measure="Percentage of Overtime Employees Who Left",
+                    calculation=calc_spec,
+                    should_visualize=False,
+                )
 
         if is_pct:
             sales_col = SchemaResolver.resolve_column("sales", schema_cols, schema)
@@ -810,28 +1007,35 @@ USER QUESTION:
         elif re.search(r"\bline\b", q_lower):
             explicit_chart = "line"
 
+        # Check distribution questions
+        is_dist_query = bool(re.search(r"\b(?:distribution|histogram|spread)\b", q_lower))
+        if is_dist_query and explicit_chart != "histogram":
+            dist_cand = SchemaResolver.resolve_distribution_column(question, schema_cols, schema)
+            if dist_cand:
+                if SchemaResolver.is_numeric_column(dist_cand, schema):
+                    explicit_chart = "histogram"
+                else:
+                    card = SchemaResolver.get_column_cardinality(dist_cand, schema)
+                    explicit_chart = "pie" if (card and card <= 4) else "bar"
+
         # Limit and ranking
         limit_m = re.search(r"\b(?:top|bottom|first|last|limit)\s+(\d+)\b", q_lower)
         limit_val = int(limit_m.group(1)) if limit_m else None
 
-        # Resolve measure from query
-        meas_col = None
-        for phrase in (
-            "monthly income", "monthly salary", "daily rate", "hourly rate", "monthly rate",
-            "annual income", "salary", "age", "sales", "total sales", "revenue", "profit",
-            "quantity", "units sold", "price", "unit price", "cost", "expected return"
-        ):
-            if phrase in q_lower:
-                res = SchemaResolver.resolve_column(phrase, schema_cols, schema)
-                if res:
-                    meas_col = res
-                    break
-
-        # Resolve dimensions
+        # Check top N ranking pattern: top N <entity> by <measure>
         x_col = None
         series_dim = None
+        meas_col = None
 
-        # Pattern: top N <entity> by <measure>
+        if is_dist_query:
+            dist_cand = SchemaResolver.resolve_distribution_column(question, schema_cols, schema)
+            if dist_cand:
+                if SchemaResolver.is_numeric_column(dist_cand, schema):
+                    meas_col = dist_cand
+                else:
+                    x_col = dist_cand
+
+
         top_m = re.search(r"\b(?:top|bottom|first|last)\s+\d+\s+([a-zA-Z0-9_\s]+?)\s+by\s+([a-zA-Z0-9_\s]+?)(?:\s+as\s+|\s+in\s+|$)", q_lower)
         if top_m:
             entity_phrase = top_m.group(1).strip()
@@ -843,50 +1047,78 @@ USER QUESTION:
             if meas_res:
                 meas_col = meas_res
 
-        # Pattern: by <dim1> and <dim2> or by <dim>
+        # Resolve grouping columns dynamically
         if not x_col:
-            by_and_m = re.search(r"\bby\s+([a-zA-Z0-9_\s]+?)\s+(?:and|&)\s+([a-zA-Z0-9_\s]+?)(?:\s+as\s+|\s+in\s+|$)", q_lower)
-            by_single_m = re.search(r"\bby\s+([a-zA-Z0-9_\s]+?)(?:\s+as\s+|\s+in\s+|$)", q_lower)
+            group_cols = SchemaResolver.resolve_grouping_columns(
+                q_lower,
+                schema_cols,
+                schema,
+            )
+            if group_cols:
+                x_col = group_cols[0]
+                if len(group_cols) > 1:
+                    series_dim = group_cols[1]
 
-            if by_and_m:
-                cand_x = SchemaResolver.resolve_column(by_and_m.group(1).strip(), schema_cols, schema)
-                cand_s = SchemaResolver.resolve_column(by_and_m.group(2).strip(), schema_cols, schema)
-                if cand_x and cand_x != meas_col:
-                    x_col = cand_x
-                if cand_s and cand_s != meas_col:
-                    series_dim = cand_s
-            elif by_single_m:
-                cand_x = SchemaResolver.resolve_column(by_single_m.group(1).strip(), schema_cols, schema)
-                if cand_x and cand_x != meas_col:
-                    x_col = cand_x
+        # Resolve measure column dynamically
+        if not meas_col:
+            meas_col = SchemaResolver.resolve_measure_column(
+                q_lower,
+                schema_cols,
+                schema,
+                exclude_columns=[x_col, series_dim] if x_col else None,
+            )
 
-        # If dimension still not found, check known categorical phrases
-        if not x_col:
+        # Fallback check known categorical phrases ONLY if grouping is explicitly requested
+        asks_grouping_fallback = bool(re.search(r"\b(?:by|per|across|for each|in each|each|broken down by|grouped by)\b", q_lower))
+        if not x_col and not meas_col and asks_grouping_fallback:
             for phrase in ("product", "products", "category", "region", "department", "gender", "job role", "job level", "segment"):
                 if re.search(rf"\b{phrase}\b", q_lower):
                     cand_dim = SchemaResolver.resolve_column(phrase, schema_cols, schema)
-                    if cand_dim and cand_dim != meas_col:
+                    if cand_dim:
                         x_col = cand_dim
                         break
 
         # Aggregation
-        agg = "SUM"
-        if bool(re.search(r"\b(?:average|mean|avg)\b", q_lower)):
+        agg = "COUNT" if not meas_col else "SUM"
+        if bool(re.search(r"\b(?:average|mean|avg)\b", q_lower)) and meas_col:
             agg = "AVG"
-        elif bool(re.search(r"\b(?:maximum|max|highest value|peak)\b", q_lower)):
+        elif bool(re.search(r"\b(?:maximum|max|highest value|peak)\b", q_lower)) and meas_col:
             agg = "MAX"
-        elif bool(re.search(r"\b(?:minimum|min|lowest)\b", q_lower)):
+        elif bool(re.search(r"\b(?:minimum|min|lowest)\b", q_lower)) and meas_col:
             agg = "MIN"
         elif bool(re.search(r"\b(?:unique|distinct)\b", q_lower)):
             agg = "COUNT_DISTINCT"
-        elif bool(re.search(r"\b(?:count|how many|number of)\b", q_lower)):
+        elif bool(re.search(r"\b(?:count|how many|number of)\b", q_lower)) or not meas_col:
             agg = "COUNT"
+
+        # Ranking questions like 'which job role has the highest number of employees'
+        which_m = re.search(r"\b(?:which|what)\s+([a-zA-Z_\s]+?)\s+has\s+(?:the\s+)?(?:highest|most|lowest|least)\b", q_lower)
+        if which_m:
+            limit_val = 1
+            if not meas_col:
+                agg = "COUNT"
+            if not x_col:
+                cand_entity = which_m.group(1).strip()
+                res_col = SchemaResolver.resolve_column(cand_entity, schema_cols, schema)
+                if res_col:
+                    x_col = res_col
 
         group_by = []
         if x_col:
             group_by.append(x_col)
         if series_dim:
             group_by.append(series_dim)
+
+        # Resolve filters
+        resolved_filters = SchemaResolver.resolve_filters(question, schema_cols, schema, existing_group_by=group_by)
+        attr_col = SchemaResolver.resolve_column("attrition", schema_cols, schema)
+        if attr_col and any(f.column == attr_col for f in resolved_filters):
+            if meas_col == attr_col:
+                meas_col = None
+            agg = "COUNT"
+            if x_col == attr_col and not re.search(r"\b(?:by|for each|each|across)\s+attrition\b", q_lower):
+                x_col = None
+                group_by = [g for g in group_by if g != attr_col]
 
         # Sort direction
         if limit_val or bool(re.search(r"\b(?:top|highest|most|greatest|best)\b", q_lower)):
@@ -902,6 +1134,26 @@ USER QUESTION:
             sort_dir = "desc"
             sort_col = x_col or (meas_col or "metric")
 
+        if is_dist_query and meas_col and not group_by and SchemaResolver.is_numeric_column(meas_col, schema):
+            return QueryContract(
+                query_id=query_id,
+                dataset_id=dataset_id,
+                original_query=question,
+                intent="DISTRIBUTION",
+                answer_type="DISTRIBUTION",
+                measure=meas_col,
+                measure_column=meas_col,
+                measure_expression=meas_col,
+                aggregation=None,
+                dimensions=[],
+                group_by=[],
+                filters=resolved_filters,
+                x_axis=meas_col,
+                suggested_chart_type="histogram",
+                should_visualize=True,
+                requested_visualization=True,
+            )
+
         return QueryContract(
             query_id=query_id,
             dataset_id=dataset_id,
@@ -912,12 +1164,13 @@ USER QUESTION:
             measure_column=meas_col,
             measure_expression=meas_col,
             aggregation=agg,
-            dimensions=[x_col] if x_col else [],
+            dimensions=list(group_by) if group_by else ([x_col] if x_col else []),
             group_by=group_by,
             series_dimension=series_dim,
+            filters=resolved_filters,
             x_axis=x_col if explicit_chart != "horizontal_bar" else meas_col,
             y_axis=meas_col if explicit_chart != "horizontal_bar" else x_col,
-            suggested_chart_type=explicit_chart,
+            suggested_chart_type=explicit_chart or ("multi_line" if series_dim else None),
             should_visualize=bool(explicit_chart or group_by),
             requested_visualization=bool(explicit_chart),
             limit=limit_val,

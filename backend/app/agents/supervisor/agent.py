@@ -6,7 +6,7 @@ Classifies user question intent and constructs an execution plan routing to spec
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Optional
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -79,7 +79,7 @@ class SupervisorAgent:
 
         # Check explicit follow up ONLY if question refers directly to previous result
         # without introducing fresh domain queries
-        follow_up = self._follow_up_intent(question, bool(state.get("previous_validated_result")))
+        follow_up = self._follow_up_intent(question, bool(state.get("previous_validated_result")), schema)
         if follow_up:
             prev = state.get("previous_validated_result") or {}
             prev_rows = prev.get("result", [])
@@ -160,21 +160,35 @@ class SupervisorAgent:
         return {
             "intent": intent,
             "query_contract": contract_dict,
+            "analysis_spec": contract_dict,
             "execution_plan": plan,
             "structured_intent": structured_intent,
             "agents_used": ["supervisor_agent"],
         }
 
     @staticmethod
-    def _follow_up_intent(question: str, has_previous: bool) -> str | None:
+    def _follow_up_intent(question: str, has_previous: bool, schema: Optional[dict[str, Any]] = None) -> str | None:
         """Reuse context only for an explicit anaphoric reference, never because state exists."""
         if not has_previous:
             return None
         q = f" {question.lower().strip()} "
+
+        # An explicit follow-up MUST contain a clear anaphoric reference to previous result
+        anaphoric_tokens = (" it ", " that ", " this ", " same result", " same data", " same as ", " the same ", " previous result")
+        has_anaphoric = any(token in q for token in anaphoric_tokens)
+        if not has_anaphoric:
+            return None
+
+        # If user explicitly mentions any column in current dataset schema, treat as fresh query
+        if schema and isinstance(schema, dict):
+            for c in schema.get("columns", []):
+                col_name = str(c.get("name", "")).lower()
+                if col_name and len(col_name) > 2 and re.search(r"\b" + re.escape(col_name) + r"\b", q):
+                    return None
+
         chart_keywords = ("bar chart", "pie chart", "line chart", "scatter", "histogram", "box plot", "heatmap", "visualize", "plot", "graph", "chart")
         asks_chart = any(token in q for token in chart_keywords)
 
-        # Explicit filter follow-ups modifying the prior query
         filter_refinement_phrases = (
             "only the results", "only for ", "filter for ", "filter by ",
             "now show only", "just the ", "just for ", "restricted to ", "for only"
@@ -183,24 +197,8 @@ class SupervisorAgent:
         if is_filter_followup:
             return "FOLLOW_UP_FILTER"
 
-        # Explicit sort follow-ups
         if any(token in q for token in ("sort by", "sort it", "highest to lowest", "lowest to highest", "order by")):
             return "FOLLOW_UP_SORT"
-
-        # An explicit visualization follow-up must contain clear anaphoric reference to the previous result
-        has_anaphoric = any(token in q for token in (" it ", " that ", " this ", " same result", " same data", " same as ", " the same ", " previous result"))
-
-        # If user explicitly mentions domain entities/columns, it is an independent new query
-        explicit_entities = (
-            "gender", "male", "female", "objective", "avenue", "age", "return", "expected",
-            "income", "duration", "department", "salary", "sales", "product", "region", "country"
-        )
-        matched_entities = [token for token in explicit_entities if token in q]
-        if matched_entities and not any(phrase in q for phrase in ("same result", "same data", "the same")):
-            return None
-
-        if not has_anaphoric:
-            return None
 
         if asks_chart:
             return "FOLLOW_UP_VISUALIZATION"
@@ -212,7 +210,7 @@ class SupervisorAgent:
     def _parse_structured_intent(question: str, schema: dict[str, Any]) -> dict[str, Any]:
         """Extract the analytical operation without relying on an LLM.
 
-        This intentionally uses only schema names and question wording.  It is
+        This intentionally uses only schema names and question wording. It is
         shared state, so every downstream agent reasons about the same current
         question rather than guessing from a prior result shape.
         """
@@ -223,8 +221,6 @@ class SupervisorAgent:
             words = column.lower().replace("_", " ")
             singular = words[:-1] if words.endswith("s") else words
             plural = words[:-1] + "ies" if words.endswith("y") else words + "s"
-            # Exact column phrases beat partial component matches; this makes
-            # "Avenue" win over the similarly named Investment_Avenues.
             if re.search(r"\b" + re.escape(words) + r"\b", q) or re.search(r"\b" + re.escape(singular) + r"\b", q) or re.search(r"\b" + re.escape(plural) + r"\b", q):
                 return 100 + len(words)
             parts = [p for p in words.split() if p not in {"id", "of", "the"}]
@@ -246,23 +242,17 @@ class SupervisorAgent:
             requested_aggregate = next(("AVG" if word in q and word in {"average", "mean"} else "SUM"
                                         for word in numeric_words if word in q), None)
 
-        # For a grouped numeric total, prefer the mentioned categorical/date
-        # dimension over the mentioned numeric measure.
         dimension_matches = [(value, column) for value, column in matches if column not in numeric_names]
         dimension = (dimension_matches[0][1] if requested_aggregate and dimension_matches
                      else matches[0][1] if matches else None)
-        # This dataset contains both a multi-select Investment_Avenues field
-        # and the requested primary Avenue field.  Prefer the exact dimension
-        # when the user says "avenue" (or explicitly names the Avenue column).
-        avenue_column = next((column for column in columns if column.lower() == "avenue"), None)
-        if "avenue" in q and avenue_column:
-            dimension = avenue_column
+
         gender_column = next((column for column in columns if column.lower() == "gender"), None)
         has_male = bool(re.search(r"\bmales?\b", q))
         has_female = bool(re.search(r"\bfemales?\b", q))
         has_gender_word = bool(re.search(r"\bgenders?\b", q))
         is_gender_both = bool(gender_column and has_male and has_female)
         if gender_column and (is_gender_both or (has_gender_word and not dimension)):
+            dimension = gender_column
             dimension = gender_column
         limit_match = re.search(r"\b(?:top|bottom)\s+(\d+)", q)
         limit_n = int(limit_match.group(1)) if limit_match else 0

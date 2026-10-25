@@ -52,8 +52,13 @@ def validate_sql(sql: str) -> tuple[bool, Optional[str]]:
             keyword = re.search(pattern, sql_upper).group()
             return False, f"Forbidden SQL keyword detected: {keyword}"
 
+    # Check for invalid aggregate functions on *
+    for invalid_fn in (r"\bSUM\s*\(\s*\*\s*\)", r"\bAVG\s*\(\s*\*\s*\)", r"\bMAX\s*\(\s*\*\s*\)", r"\bMIN\s*\(\s*\*\s*\)"):
+        if re.search(invalid_fn, sql_upper):
+            matched = re.search(invalid_fn, sql_upper).group()
+            return False, f"Invalid aggregation detected: {matched}. Only COUNT(*) is valid; SUM, AVG, MAX, and MIN require a real column."
+
     # Check for multiple statements
-    # Remove string literals before checking for semicolons
     sql_no_strings = re.sub(r"'[^']*'", "", sql)
     statements = [s.strip() for s in sql_no_strings.split(";") if s.strip()]
     if len(statements) > 1:

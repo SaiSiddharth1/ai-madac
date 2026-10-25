@@ -191,13 +191,17 @@ class CalculationEngine:
         op_b = calc_spec.operands[1]
 
         # Find matching column names for A and B
-        meas_a = (op_a.measure or op_a.measure_column or "").lower()
-        meas_b = (op_b.measure or op_b.measure_column or "").lower()
-        name_a = (op_a.name or "").lower()
-        name_b = (op_b.name or "").lower()
+        meas_a = (op_a.measure or op_a.measure_column or "").lower().replace("_", " ")
+        meas_b = (op_b.measure or op_b.measure_column or "").lower().replace("_", " ")
+        name_a = (op_a.name or "").lower().replace("_", " ")
+        name_b = (op_b.name or "").lower().replace("_", " ")
 
-        col_a = next((c for c in cols if (name_a and name_a in c.lower()) or (meas_a and meas_a in c.lower())), None)
-        col_b = next((c for c in cols if c != col_a and ((name_b and name_b in c.lower()) or (meas_b and meas_b in c.lower()))), None)
+        def _col_matches(col: str, name: str, meas: str) -> bool:
+            c_norm = col.lower().replace("_", " ")
+            return bool((name and (name in c_norm or c_norm in name)) or (meas and (meas in c_norm or c_norm in meas)))
+
+        col_a = next((c for c in cols if _col_matches(c, name_a, meas_a)), None)
+        col_b = next((c for c in cols if c != col_a and _col_matches(c, name_b, meas_b)), None)
 
         if not col_a or not col_b or col_a == col_b:
             logger.warning(f"Calculation operands could not be resolved from DataFrame columns: {cols}. Required: A={name_a or meas_a}, B={name_b or meas_b}")

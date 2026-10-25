@@ -18,7 +18,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.agents.state import AgentState
 from app.core.llm_provider import get_llm
 from app.db.database import sync_engine
-from app.schemas.query_contract import QueryContract
+from app.schemas.query_contract import QueryContract, AnalysisSpec
+from app.schemas.analysis_spec_validator import AnalysisSpecValidator
+from app.agents.sql.result_validator import SQLResultValidator
 from app.utils.serialization import to_json_safe
 from app.utils.sql_validator import sanitize_table_name, validate_sql
 from app.utils.temporal import is_temporal_column
@@ -75,8 +77,8 @@ class SQLAgent:
                 "sql_result": None,
             }
 
-        # Retrieve or construct Query Contract
-        contract_data = state.get("query_contract")
+        # Retrieve or construct Query Contract / AnalysisSpec
+        contract_data = state.get("query_contract") or state.get("analysis_spec")
         if not contract_data:
             from app.agents.supervisor.semantic_planner import semantic_planner
             contract = semantic_planner.plan_query(
@@ -89,6 +91,9 @@ class SQLAgent:
             contract_data = contract.model_dump()
         else:
             contract = QueryContract(**contract_data)
+
+        # Enforce AnalysisSpec validation & repair against current schema
+        contract, repairs = AnalysisSpecValidator.validate_and_repair(contract, schema)
 
         # Check for unrelated question
         if not contract.is_related_to_dataset or contract.intent == "UNRELATED":
@@ -353,9 +358,15 @@ class SQLAgent:
 
             for i, op in enumerate(calc.operands):
                 op_meas = op.measure_column or op.measure
-                op_q = quote_col(op_meas) if op_meas else "*"
                 op_agg = (op.aggregation or "SUM").upper()
                 op_alias = self._sanitize_alias(op.name or f"operand_{i+1}")
+
+                if not op_meas or op_meas in ("total_records", "*") or op_agg == "COUNT":
+                    op_val_expr = "1"
+                    op_q = "*"
+                else:
+                    op_val_expr = quote_col(op_meas)
+                    op_q = op_val_expr
 
                 # Check if this operand has specific filters (e.g. Technology category)
                 if op.filters:
@@ -365,7 +376,7 @@ class SQLAgent:
                         safe_v = str(f.value).replace("'", "''")
                         conds.append(f"{fq} = '{safe_v}'")
                     cond_str = " AND ".join(conds)
-                    case_expr = f"CASE WHEN {cond_str} THEN {op_q} ELSE 0 END"
+                    case_expr = f"CASE WHEN {cond_str} THEN {op_val_expr} ELSE 0 END"
                     select_items.append(f"ROUND(CAST(SUM({case_expr}) AS NUMERIC), 2) AS {op_alias}")
                 else:
                     if op_agg == "COUNT_DISTINCT":
@@ -376,7 +387,7 @@ class SQLAgent:
                         select_items.append(f"ROUND(CAST(AVG({op_q}) AS NUMERIC), 2) AS {op_alias}")
                     else:
                         select_items.append(f"ROUND(CAST(SUM({op_q}) AS NUMERIC), 2) AS {op_alias}")
-                    if op_meas and op_agg != "COUNT":
+                    if op_meas and op_agg != "COUNT" and op_meas not in ("total_records", "*"):
                         not_nulls.append(f"{op_q} IS NOT NULL")
 
             all_where = where_conditions + not_nulls
@@ -390,13 +401,17 @@ class SQLAgent:
 
         # 1. SCALAR AGGREGATION: GROUPING MUST NEVER BE INVENTED
         if contract.answer_type == "SCALAR":
-            agg = (contract.aggregation or "SUM").upper()
+            agg = (contract.aggregation or "COUNT").upper()
             expr = quote_expr(contract.measure_expression or contract.measure_column)
+
+            # Rule: SUM, AVG, MIN, MAX require an actual column; if no column or *, enforce COUNT(*)
+            if (not contract.measure_column or expr == "*") and agg in ("SUM", "AVG", "MIN", "MAX"):
+                logger.warning("Invalid scalar aggregation %s on '*' or missing column. Forcing COUNT(*).", agg)
+                agg = "COUNT"
 
             # Not-null check on measure columns
             not_null_cols = []
-            if contract.measure_column:
-                # check if multi-column expression
+            if contract.measure_column and agg != "COUNT":
                 for part in re.findall(r'[a-zA-Z_]\w*', contract.measure_column):
                     if part.lower() in cols_map:
                         not_null_cols.append(f'"{cols_map[part.lower()]}" IS NOT NULL')
@@ -425,11 +440,16 @@ class SQLAgent:
             group_cols = [quote_col(g) for g in contract.group_by]
             group_sql = ", ".join(group_cols)
 
-            agg = (contract.aggregation or "SUM").upper()
+            agg = (contract.aggregation or "COUNT").upper()
             expr = quote_expr(contract.measure_expression or contract.measure_column)
 
+            # Rule: SUM, AVG, MIN, MAX require an actual column; if no column or *, enforce COUNT(*)
+            if (not contract.measure_column or expr == "*") and agg in ("SUM", "AVG", "MIN", "MAX"):
+                logger.warning("Invalid grouped aggregation %s on '*' or missing column. Forcing COUNT(*).", agg)
+                agg = "COUNT"
+
             not_null_conds = [f"{g} IS NOT NULL" for g in group_cols]
-            if contract.measure_column:
+            if contract.measure_column and agg != "COUNT":
                 for part in re.findall(r'[a-zA-Z_]\w*', contract.measure_column):
                     if part.lower() in cols_map:
                         not_null_conds.append(f'"{cols_map[part.lower()]}" IS NOT NULL')
@@ -565,7 +585,10 @@ class SQLAgent:
                 direction = "DESC"
                 if contract.sort:
                     direction = contract.sort.direction.upper()
-                limit_sql = f" LIMIT {contract.limit}" if contract.limit else " LIMIT 15"
+                limit_val = contract.limit
+                if not limit_val and re.search(r"\b(?:which|what)\s+[a-zA-Z_]+\s+has\s+(?:the\s+)?(?:highest|most|lowest|least|maximum|minimum)\b", contract.original_query.lower()):
+                    limit_val = 1
+                limit_sql = f" LIMIT {limit_val}" if limit_val else " LIMIT 15"
 
                 if any("COUNT" in hc for hc in having_conditions) and "total_orders" not in agg_select and "total_records" not in agg_select:
                     agg_select += ", COUNT(*) AS total_orders"
@@ -609,23 +632,45 @@ class SQLAgent:
         current_sql: str,
     ) -> tuple[pd.DataFrame, str]:
         """
-        Validate executed DataFrame against Query Contract.
-        If result contains unwanted grouping or incorrect shape, repair deterministically.
+        Validate executed DataFrame against AnalysisSpec (QueryContract).
+        If result contains incorrect shape, scalar collapse when grouped, or unwanted grouping,
+        repair and re-execute deterministically.
         """
-        if contract.answer_type == "SCALAR":
-            # SCALAR must have exactly 1 row (multiple columns allowed for multi-operand calculations)
-            if (len(df) > 1) or (len(df.columns) > 1 and not contract.calculation):
-                logger.warning(
-                    "Result validation failed for SCALAR: got %d rows, %d columns. Re-executing pure scalar query.",
-                    len(df), len(df.columns),
-                )
-                # Force pure scalar query
+        is_valid, reason = SQLResultValidator.validate(df, contract, schema)
+        if not is_valid:
+            logger.warning(
+                "[SQL RESULT VALIDATOR] %s. Regenerating SQL query from AnalysisSpec.",
+                reason,
+            )
+            if "EXPECTED GROUPED RESULT" in (reason or ""):
+                # Ensure group_by columns and answer_type are intact
+                contract.answer_type = "GROUPED"
+                repaired_sql = self._build_query_from_contract(contract, schema, safe_table)
+                logger.info("[SQL RESULT VALIDATOR] Re-executing grouped query:\n%s", repaired_sql)
+                escaped_sql = repaired_sql.replace("%", "%%") if ("%" in repaired_sql and not re.search(r"%\([a-zA-Z0-9_]+\)s", repaired_sql)) else repaired_sql
+                repaired_df = pd.read_sql(sa.text(escaped_sql), con=sync_engine)
+                return repaired_df, repaired_sql
+
+            elif "EXPECTED SCALAR RESULT" in (reason or ""):
                 contract.group_by = []
-                scalar_sql = self._build_query_from_contract(contract, schema, safe_table)
-                repaired_df = pd.read_sql(scalar_sql, con=sync_engine)
-                return repaired_df, scalar_sql
+                contract.answer_type = "SCALAR"
+                repaired_sql = self._build_query_from_contract(contract, schema, safe_table)
+                logger.info("[SQL RESULT VALIDATOR] Re-executing scalar query:\n%s", repaired_sql)
+                escaped_sql = repaired_sql.replace("%", "%%") if ("%" in repaired_sql and not re.search(r"%\([a-zA-Z0-9_]+\)s", repaired_sql)) else repaired_sql
+                repaired_df = pd.read_sql(sa.text(escaped_sql), con=sync_engine)
+                return repaired_df, repaired_sql
+
+            elif "EXPECTED DISTRIBUTION" in (reason or ""):
+                contract.answer_type = "DISTRIBUTION"
+                contract.group_by = []
+                repaired_sql = self._build_query_from_contract(contract, schema, safe_table)
+                logger.info("[SQL RESULT VALIDATOR] Re-executing distribution query:\n%s", repaired_sql)
+                escaped_sql = repaired_sql.replace("%", "%%") if ("%" in repaired_sql and not re.search(r"%\([a-zA-Z0-9_]+\)s", repaired_sql)) else repaired_sql
+                repaired_df = pd.read_sql(sa.text(escaped_sql), con=sync_engine)
+                return repaired_df, repaired_sql
 
         return df, current_sql
+
 
     def _build_fallback_query(
         self,

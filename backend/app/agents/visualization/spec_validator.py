@@ -75,6 +75,8 @@ class SpecValidator:
         normalized["chart"] = chart_obj
 
         fields = dict(spec.get("fields") or {})
+        if "dimension" in spec and "x" not in fields:
+            fields["x"] = spec["dimension"]
         if "x" in spec and "x" not in fields:
             fields["x"] = spec["x"]
         if "y" in spec and "y" not in fields:
@@ -86,6 +88,22 @@ class SpecValidator:
         if "series_dimension" in spec and "color" not in fields:
             fields["color"] = spec["series_dimension"]
         normalized["fields"] = fields
+
+        if chart_obj.get("type") == "histogram":
+            normalized["chart_type"] = "HISTOGRAM"
+            if fields.get("x"):
+                normalized["dimension"] = fields.get("x")
+            raw_bin = spec.get("binning") or {}
+            if isinstance(raw_bin, dict):
+                bin_sz = raw_bin.get("size") or raw_bin.get("bin_size")
+                normalized["binning"] = {
+                    "enabled": raw_bin.get("enabled", True),
+                    "method": "FIXED" if bin_sz else str(raw_bin.get("method", "AUTO")).upper(),
+                    "size": bin_sz,
+                    "bin_size": bin_sz,
+                }
+            else:
+                normalized["binning"] = {"enabled": True, "method": "AUTO"}
 
         measure = dict(spec.get("measure") or {})
         if "aggregation" in spec and "type" not in measure:
@@ -139,7 +157,7 @@ class SpecValidator:
                     spec_cols.add(item)
 
         # 1. Verify all spec columns exist in dataset schema (no hallucinated columns)
-        MEASURE_ALIASES = {"count", "investor_count", "frequency", "percentage", "share", "records", "total_investors", "value"}
+        MEASURE_ALIASES = {"count", "total_records", "record_count", "frequency", "percentage", "share", "records", "value"}
 
         for col in spec_cols:
             if col.lower() in MEASURE_ALIASES:
@@ -175,8 +193,9 @@ class SpecValidator:
                 return False, "Cross-tabulation queries require both an x dimension and a color grouping dimension."
             if x_field == color_field:
                 return False, "x dimension and color grouping dimension must be distinct."
-            if chart_type not in ("bar", "grouped_bar", "stacked_bar", "heatmap"):
-                return False, f"Cross-tabulation requires a grouped bar or heatmap, not '{chart_type}'."
+            allowed_multi_types = {"bar", "grouped_bar", "stacked_bar", "heatmap", "line", "multi_line"}
+            if chart_type not in allowed_multi_types:
+                return False, f"Multi-dimensional query requires a grouped bar, multi-line, or heatmap, not '{chart_type}'."
 
         # 5. Histogram Validation:
         if contract.intent == "distribution" or contract.explicit_chart_type == "histogram":
@@ -194,6 +213,46 @@ class SpecValidator:
         if contract.explicit_chart_type in ("box", "box_plot"):
             if chart_type not in ("box", "box_plot"):
                 return False, f"Box plot was explicitly requested, but specification returned '{chart_type}'."
+
+        # 8. Issue 12: Semantic Measure & Aggregation Lock (No Reinterpreting the Question)
+        canonical_meas = getattr(contract, "measure_column", None) or (
+            contract.measure.get("column") if isinstance(contract.measure, dict) else getattr(contract, "measure", None)
+        )
+        if canonical_meas and canonical_meas not in ("*", "total_records"):
+            spec_y = fields.get("y")
+            spec_meas = (spec.get("measure") or {}).get("column")
+            active_y = spec_y or spec_meas
+            if active_y and isinstance(active_y, str) and active_y.lower() not in MEASURE_ALIASES:
+                if canonical_meas.lower() not in active_y.lower() and active_y.lower() not in canonical_meas.lower():
+                    return False, f"Visualization specification altered canonical measure '{canonical_meas}' to '{active_y}'."
+
+        canonical_agg = getattr(contract, "aggregation", None) or (
+            contract.measure.get("type") if isinstance(contract.measure, dict) else None
+        )
+        if canonical_agg:
+            spec_agg = (spec.get("measure") or {}).get("type")
+            if spec_agg and isinstance(spec_agg, str):
+                c_agg = canonical_agg.lower()
+                if c_agg in ("average", "mean"):
+                    c_agg = "avg"
+                s_agg = spec_agg.lower()
+                if s_agg in ("average", "mean"):
+                    s_agg = "avg"
+                if c_agg != s_agg and s_agg not in ("raw", "none", ""):
+                    return False, f"Visualization specification altered canonical aggregation '{canonical_agg}' to '{spec_agg}'."
+
+        # 9. Issue 12: Semantic Dimension & Series Lock
+        canonical_series = getattr(contract, "series_dimension", None)
+        if canonical_series:
+            spec_color = fields.get("color")
+            if spec_color and spec_color.lower() != canonical_series.lower():
+                return False, f"Visualization specification altered series dimension '{canonical_series}' to '{spec_color}'."
+
+        canonical_x = getattr(contract, "x_axis", None) or (contract.dimensions[0] if contract.dimensions else None)
+        if canonical_x and chart_type not in ("kpi", "card"):
+            spec_x = fields.get("x")
+            if spec_x and spec_x.lower() != canonical_x.lower():
+                return False, f"Visualization specification altered X-axis dimension '{canonical_x}' to '{spec_x}'."
 
         return True, None
 
@@ -377,8 +436,30 @@ class SpecValidator:
                 or (contract.measure.get("column") if isinstance(contract.measure, dict) else getattr(contract, "measure", None))
                 or (requested[0] if requested else (dims[0] if dims else (avail[0] if avail else "Value")))
             )
+
+            raw_binning = getattr(contract, "binning", None) or {}
+            bin_size = (
+                (raw_binning.get("size") if isinstance(raw_binning, dict) else None)
+                or (raw_binning.get("bin_size") if isinstance(raw_binning, dict) else None)
+                or getattr(contract, "bin_width", None)
+            )
+            if bin_size:
+                binning_spec = {
+                    "enabled": True,
+                    "method": "FIXED",
+                    "size": bin_size,
+                    "bin_size": bin_size,
+                }
+            else:
+                binning_spec = {
+                    "enabled": True,
+                    "method": "AUTO",
+                }
+
             return {
                 "visualization_available": True,
+                "chart_type": "HISTOGRAM",
+                "dimension": target_col,
                 "query_interpretation": {
                     "intent": "distribution",
                     "requested_fields": [target_col],
@@ -396,7 +477,7 @@ class SpecValidator:
                 "filters": contract.filters,
                 "sorting": contract.sorting,
                 "limit": contract.limit or 5000,
-                "binning": contract.binning,
+                "binning": binning_spec,
                 "chart": {
                     "type": "histogram",
                     "orientation": "vertical",

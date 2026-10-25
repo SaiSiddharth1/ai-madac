@@ -141,7 +141,11 @@ class QueryContract:
     Structured query contract created before chart selection.
     Source of truth for validation, chart selection, data calculation, and rendering.
     """
-    raw_question: str
+    raw_question: str = ""
+    query_id: Optional[str] = None
+    dataset_id: Optional[str] = None
+    original_query: Optional[str] = None
+    suggested_chart_type: Optional[str] = None
     visualization_required: bool = False
     intent: str = "categorical_comparison"
     requested_dimensions: list[str] = field(default_factory=list)
@@ -157,11 +161,17 @@ class QueryContract:
     secondary_measure: Optional[str] = None
     color_by: Optional[str] = None
     is_follow_up: bool = False
-    x_axis: Optional[str] = None
-    y_axis: Optional[str] = None
     aggregation: Optional[str] = None
     measure_column: Optional[str] = None
-    explicit_chart_type: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.raw_question and self.original_query:
+            self.raw_question = self.original_query
+        if not self.requested_chart and self.suggested_chart_type:
+            self.requested_chart = self.suggested_chart_type
+        if self.requested_chart and not self.suggested_chart_type:
+            self.suggested_chart_type = self.requested_chart
+
 
     # Backward compatibility properties
     @property
@@ -557,11 +567,35 @@ def extract_query_contract(
 
     # Detect Intent
     intent = "categorical_comparison"
-    if explicit_chart == "histogram" or re.search(r"\b(?:distribution|histogram|spread)\b", q):
+    if explicit_chart == "histogram":
         intent = "distribution"
-        explicit_chart = "histogram"
         if not bin_spec:
             bin_spec = {"mode": "auto"}
+    elif re.search(r"\b(?:distribution|histogram|spread)\b", q):
+        # Determine if target dimension is numeric or categorical
+        dist_candidate = (
+            plot_dimensions[0] if plot_dimensions
+            else (numeric_matched[0] if numeric_matched
+            else (categorical_matched[0] if categorical_matched
+            else None))
+        )
+        is_num = False
+        if dist_candidate:
+            col_type = dtypes_map.get(dist_candidate, "")
+            is_num = any(nt in col_type for nt in ("int", "float", "double", "number", "real", "numeric", "decimal", "bigint"))
+            if not col_type:
+                is_num = any(k in dist_candidate.lower() for k in ("income", "salary", "age", "rate", "cost", "price", "sales", "revenue", "amount", "profit"))
+
+        if is_num:
+            intent = "distribution"
+            explicit_chart = "histogram"
+            if not bin_spec:
+                bin_spec = {"mode": "auto"}
+        else:
+            intent = "categorical_comparison"
+            measure_type = "count"
+            if not explicit_chart:
+                explicit_chart = "bar"
     elif explicit_chart in ("scatter", "relationship"):
         intent = "relationship"
         explicit_chart = "scatter"

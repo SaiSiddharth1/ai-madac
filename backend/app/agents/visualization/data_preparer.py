@@ -266,13 +266,13 @@ class DataPreparer:
             else:
                 # Column is purely categorical: route to Bar chart of counts
                 prepared_df = work_df[x_col].value_counts().reset_index()
-                prepared_df.columns = [x_col, "investor_count"]
+                prepared_df.columns = [x_col, "total_records"]
                 parameters_used.append(f"Category: {x_col}")
                 parameters_used.append("Note: Categorical data represented via Bar chart frequency")
                 applied_params = {
                     "chart_type": "Bar chart (Categorical Distribution)",
                     "x_axis": x_col,
-                    "y_axis": "investor_count",
+                    "y_axis": "total_records",
                     "observation_count": total_filtered_rows,
                 }
                 insights.append(f"Distribution of categorical field '{x_col}' across {total_filtered_rows} observations.")
@@ -716,9 +716,9 @@ class DataPreparer:
                 prepared_df = (
                     work_df.groupby(x_col)
                     .size()
-                    .reset_index(name="investor_count")
+                    .reset_index(name="total_records")
                 )
-                val_col = "investor_count"
+                val_col = "total_records"
                 agg_label = "Count"
                 parameters_used.append(f"Category: {x_col}")
                 parameters_used.append("Aggregation: Count")
@@ -744,11 +744,11 @@ class DataPreparer:
 
             if not prepared_df.empty:
                 top_row = prepared_df.iloc[0]
-                if val_col == "investor_count" and total_filtered_rows > 0:
+                if val_col == "total_records" and total_filtered_rows > 0:
                     pct = round(100.0 * top_row[val_col] / total_filtered_rows, 1)
                     filter_clause = f" among the {total_filtered_rows} filtered records" if filters else ""
                     insights.append(
-                        f"Top category is '{top_row[x_col]}' with {top_row[val_col]} investors ({pct}% of total{filter_clause})."
+                        f"Top category is '{top_row[x_col]}' with {top_row[val_col]} records ({pct}% of total{filter_clause})."
                     )
                 else:
                     val_display = f"{top_row[val_col]:.1f}%" if "pct" in val_col or "return" in val_col else str(top_row[val_col])
