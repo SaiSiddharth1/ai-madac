@@ -11,7 +11,18 @@ Validates Gemini specification against:
 from __future__ import annotations
 
 from typing import Any, Optional
+import re
+
 from app.agents.visualization.contract import QueryContract
+from app.utils.temporal import is_temporal_column
+
+
+def format_col_label(col: Any) -> str:
+    """Format column name splitting camelCase and underscores into title case words."""
+    if not col:
+        return ""
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(col))
+    return s.replace("_", " ").title().strip()
 
 
 SUPPORTED_CHART_TYPES = {
@@ -207,25 +218,32 @@ class SpecValidator:
             explicit_chart in ("line", "trend", "multi_line", "multiline")
             or intent in ("trend", "time_series")
             or bool(contract.time_granularity)
-            or any("date" in str(f).lower() or "time" in str(f).lower() or "year" in str(f).lower() for f in requested + dims)
+            or any(is_temporal_column(str(f)) for f in requested + dims)
         )
         if is_line_chart:
-            # Check for temporal column first
-            time_col = next((
-                c for c in dims + requested + avail
-                if any(k in c.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day", "created_at", "saledate"))
-            ), None)
+            # 1. Prioritize contract.x_axis if already resolved by Semantic Planner
+            x_col = getattr(contract, "x_axis", None)
+            time_col = None
+            if not x_col:
+                time_col = next((
+                    c for c in dims + requested + avail
+                    if is_temporal_column(c)
+                ), None)
+                x_col = time_col or (dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "X")))
+            elif is_temporal_column(x_col):
+                time_col = x_col
 
-            # If no temporal column, use first dimension or requested column (e.g. Age)
-            x_col = time_col or (dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "X")))
-
-            # Multi-series line chart dimension check
+            # 2. Multi-series line chart dimension check
             series_dim = getattr(contract, "series_dimension", None)
             if not series_dim and len(dims) > 1:
                 series_dim = next((d for d in dims if d != x_col), None)
 
-            # Detect measure column for Y
-            meas_col = contract.measure.get("column") if isinstance(contract.measure, dict) else (getattr(contract, "measure_column", None) or getattr(contract, "measure", None))
+            # 3. Detect measure column for Y
+            meas_col = (
+                getattr(contract, "measure_column", None)
+                or getattr(contract, "y_axis", None)
+                or (contract.measure.get("column") if isinstance(contract.measure, dict) else getattr(contract, "measure", None))
+            )
             if not meas_col or meas_col in (x_col, series_dim):
                 meas_candidates = [c for c in requested if c not in (x_col, series_dim)]
                 if meas_candidates:
@@ -236,15 +254,23 @@ class SpecValidator:
                         if c not in (x_col, series_dim) and any(k in c.lower() for k in ("return", "expect", "revenue", "total", "quantity", "price", "amount", "sales", "profit", "value", "unitprice", "score"))
                     ), next((c for c in avail if c not in (x_col, series_dim)), "Value"))
 
-            meas_type = contract.measure.get("type", "avg") if isinstance(contract.measure, dict) else (contract.aggregation or "avg")
-            if meas_type in ("SUM", "AVG", "MIN", "MAX", "COUNT"):
-                meas_type = meas_type.lower()
-            meas_label = str(meas_col).replace("_", " ").title()
+            # 4. Preserve requested aggregation
+            meas_raw = getattr(contract, "aggregation", None) or (contract.measure.get("type") if isinstance(contract.measure, dict) else None) or "avg"
+            meas_type = str(meas_raw).lower()
+            if meas_type in ("mean", "average"):
+                meas_type = "avg"
+            elif meas_type not in ("sum", "avg", "min", "max", "count", "raw"):
+                meas_type = "avg"
 
-            title_parts = [f"{meas_type.upper()} {meas_label}" if meas_type != "raw" else meas_label, f"by {str(x_col).replace('_', ' ').title()}"]
+            meas_label = format_col_label(meas_col)
+            agg_display = "Average" if meas_type == "avg" else ("Total" if meas_type == "sum" else ("Maximum" if meas_type == "max" else ("Minimum" if meas_type == "min" else ("Count of" if meas_type == "count" else ""))))
+
+            title_parts = [f"{agg_display} {meas_label}".strip() if meas_type != "raw" else meas_label, f"by {format_col_label(x_col)}"]
             if series_dim:
-                title_parts.append(f"for {str(series_dim).replace('_', ' ').title()}")
+                title_parts.append(f"and {format_col_label(series_dim)}")
             chart_title = " ".join(title_parts)
+
+            final_chart_type = "multi_line" if (explicit_chart in ("multi_line", "multiline") or bool(series_dim)) else "line"
 
             return {
                 "visualization_available": True,
@@ -263,42 +289,49 @@ class SpecValidator:
                     "column": meas_col,
                 },
                 "filters": contract.filters,
-                "sorting": {"field": x_col, "direction": "asc"},
+                "sorting": getattr(contract, "sorting", {"field": x_col, "direction": "asc"}),
                 "limit": contract.limit,
                 "binning": None,
                 "time_granularity": getattr(contract, "time_granularity", None) or ("month" if time_col else None),
                 "chart": {
-                    "type": "line",
+                    "type": final_chart_type,
                     "orientation": "vertical",
                     "mode": "lines+markers",
                 },
                 "title": chart_title,
                 "axis_labels": {
-                    "x": str(x_col).replace("_", " ").title(),
-                    "y": meas_label,
+                    "x": format_col_label(x_col),
+                    "y": f"{agg_display} {meas_label}".strip(),
                 },
                 "legend": {
                     "show": bool(series_dim),
-                    "title": str(series_dim).replace("_", " ").title() if series_dim else None,
+                    "title": format_col_label(series_dim) if series_dim else None,
                 },
             }
 
         # Case 1: Relationship / Scatter Plot (raw observations between two numeric columns)
         if intent == "relationship" or explicit_chart == "scatter":
-            num_cols = [
-                c for c in requested + avail
-                if any(k in c.lower() for k in ("quantity", "price", "unitprice", "age", "income", "amount", "sales", "profit", "cost", "value", "return", "midpoint"))
-            ]
-            x_col = num_cols[0] if len(num_cols) > 0 else (requested[0] if requested else (avail[0] if avail else "X"))
-            y_col = num_cols[1] if len(num_cols) > 1 else (requested[1] if len(requested) > 1 else (avail[1] if len(avail) > 1 else x_col))
+            x_col = getattr(contract, "x_axis", None)
+            y_col = getattr(contract, "y_axis", None)
+            if not x_col or not y_col:
+                if len(requested) >= 2:
+                    x_col = x_col or requested[0]
+                    y_col = y_col or requested[1]
+                else:
+                    num_cols = [
+                        c for c in requested + avail
+                        if any(k in c.lower() for k in ("income", "age", "quantity", "price", "sales", "profit", "cost", "value", "rate", "amount"))
+                    ]
+                    x_col = x_col or (num_cols[0] if len(num_cols) > 0 else (requested[0] if requested else avail[0]))
+                    y_col = y_col or (num_cols[1] if len(num_cols) > 1 else (requested[1] if len(requested) > 1 else x_col))
 
-            color_col = getattr(contract, "color_by", None)
+            color_col = getattr(contract, "color_by", None) or getattr(contract, "series_dimension", None)
             if not color_col and len(dims) > 0 and dims[0] not in (x_col, y_col):
                 color_col = dims[0]
 
-            title_text = f"{str(y_col).replace('_', ' ').title()} vs {str(x_col).replace('_', ' ').title()}"
+            title_text = f"{format_col_label(x_col)} vs {format_col_label(y_col)}"
             if color_col:
-                title_text += f" by {str(color_col).replace('_', ' ').title()}"
+                title_text += f" by {format_col_label(color_col)}"
 
             return {
                 "visualization_available": True,
@@ -327,18 +360,23 @@ class SpecValidator:
                 },
                 "title": title_text,
                 "axis_labels": {
-                    "x": str(x_col).replace("_", " ").title(),
-                    "y": str(y_col).replace("_", " ").title(),
+                    "x": format_col_label(x_col),
+                    "y": format_col_label(y_col),
                 },
                 "legend": {
                     "show": bool(color_col),
-                    "title": str(color_col).replace("_", " ").title() if color_col else None,
+                    "title": format_col_label(color_col) if color_col else None,
                 },
             }
 
         # Case 2: Distribution / Histogram (raw observations of one numeric column)
         if intent == "distribution" or explicit_chart == "histogram":
-            target_col = requested[0] if requested else (dims[0] if dims else (avail[0] if avail else "Value"))
+            target_col = (
+                getattr(contract, "x_axis", None)
+                or getattr(contract, "measure_column", None)
+                or (contract.measure.get("column") if isinstance(contract.measure, dict) else getattr(contract, "measure", None))
+                or (requested[0] if requested else (dims[0] if dims else (avail[0] if avail else "Value")))
+            )
             return {
                 "visualization_available": True,
                 "query_interpretation": {
@@ -364,9 +402,9 @@ class SpecValidator:
                     "orientation": "vertical",
                     "mode": "overlay",
                 },
-                "title": f"Distribution of {str(target_col).replace('_', ' ').title()}",
+                "title": f"Distribution of {format_col_label(target_col)}",
                 "axis_labels": {
-                    "x": str(target_col).replace("_", " ").title(),
+                    "x": format_col_label(target_col),
                     "y": "Count of Observations",
                 },
                 "legend": {
@@ -554,13 +592,18 @@ class SpecValidator:
             }
 
         # Case 7: Single category aggregation / Ranking Bar chart (Generic Default)
-        x_col = dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Category"))
-        meas_type = contract.measure.get("type", "count") if isinstance(contract.measure, dict) else "count"
-        meas_col = (
+        x_col = getattr(contract, "x_axis", None) or (dims[0] if dims else (requested[0] if requested else (avail[0] if avail else "Category")))
+        meas_raw = getattr(contract, "aggregation", None) or (contract.measure.get("type") if isinstance(contract.measure, dict) else None) or "count"
+        meas_type = str(meas_raw).lower()
+        if meas_type in ("mean", "average"):
+            meas_type = "avg"
+
+        meas_col = getattr(contract, "measure_column", None) or getattr(contract, "y_axis", None) or (
             contract.measure.get("column") if isinstance(contract.measure, dict) else None
         ) or next((c for c in avail if c != x_col), None)
 
-        y_label = f"Total {str(meas_col).replace('_', ' ').title()}" if (meas_col and meas_type != "count") else "Count"
+        agg_display = "Average" if meas_type == "avg" else ("Total" if meas_type == "sum" else ("Maximum" if meas_type == "max" else ("Minimum" if meas_type == "min" else ("Count of" if meas_type == "count" else ""))))
+        y_label = f"{agg_display} {str(meas_col).replace('_', ' ').title()}".strip() if (meas_col and meas_type != "count") else "Count"
 
         # Determine orientation: Ranking / Top-N queries use horizontal bar for readability
         is_horizontal = (

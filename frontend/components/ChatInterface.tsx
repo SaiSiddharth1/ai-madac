@@ -381,10 +381,16 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
                       || rInfo.answer?.toLowerCase().includes("not related to the currently loaded dataset")
                     );
                     const hasChart = chartPaths.length > 0;
+                    const isExplicitChartRequested = Boolean(
+                      rInfo.data_used?.analysis_plan?.explicit_chart_type
+                      || rInfo.visualization?.chart_type
+                      || rInfo.visualization_result?.visualization_available
+                    );
                     const isVisualization = (
                       rInfo.response_type === "VISUALIZATION"
                       || Boolean(rInfo.visualization?.should_visualize)
                       || hasChart
+                      || (isExplicitChartRequested && hasChart)
                     );
                     const isScalar = (
                       !isVisualization && (

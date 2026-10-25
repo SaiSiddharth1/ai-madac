@@ -15,6 +15,9 @@ from typing import Any, Optional
 import pandas as pd
 
 
+from app.utils.temporal import is_temporal_column, is_temporal_intent
+
+
 # Known semantic aliases mapped to common analytical concepts
 SEMANTIC_ALIASES: dict[str, list[str]] = {
     "gender": ["gender", "sex", "male", "female", "males", "females", "men", "women"],
@@ -86,7 +89,7 @@ class DataTypeClassifier:
             name_lower = col_name.lower()
             if any(k in name_lower for k in ("id", "uuid", "key", "code")):
                 return "identifier"
-            if any(k in name_lower for k in ("date", "time", "year", "month", "day", "quarter")):
+            if is_temporal_column(col_name):
                 return "datetime"
             if any(k in name_lower for k in ("age", "salary", "income", "amount", "price", "count", "sales")):
                 return "numerical"
@@ -102,7 +105,7 @@ class DataTypeClassifier:
             return "categorical"
 
         # Check datetime
-        if pd.api.types.is_datetime64_any_dtype(series):
+        if pd.api.types.is_datetime64_any_dtype(series) or is_temporal_column(col_name):
             return "datetime"
 
         # Check numerical dtype
@@ -154,6 +157,11 @@ class QueryContract:
     secondary_measure: Optional[str] = None
     color_by: Optional[str] = None
     is_follow_up: bool = False
+    x_axis: Optional[str] = None
+    y_axis: Optional[str] = None
+    aggregation: Optional[str] = None
+    measure_column: Optional[str] = None
+    explicit_chart_type: Optional[str] = None
 
     # Backward compatibility properties
     @property
@@ -437,7 +445,7 @@ def extract_query_contract(
         is_currency_or_rate = any(k in c.lower() for k in ("income", "salary", "rate", "cost", "price", "fee", "expense", "charges", "sales", "revenue", "amount", "profit", "balance", "limit", "age", "quantity"))
         if is_currency_or_rate or any(nt in col_type for nt in ("int", "float", "double", "number", "real", "numeric", "decimal", "bigint")):
             numeric_matched.append(c)
-        elif any(dt in col_type for dt in ("date", "time", "timestamp")) or any(k in c.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "created_at", "saledate", "purchasedate")):
+        elif is_temporal_column(c) or any(dt in col_type for dt in ("date", "timestamp")):
             datetime_matched.append(c)
         elif any(rt in c.lower() for rt in ("expect", "return", "range", "bracket")) and not any(nt in col_type for nt in ("int", "float", "double")):
             range_matched.append(c)
@@ -591,14 +599,7 @@ def extract_query_contract(
     series_dim = None
     sec_measure = None
 
-    is_temporal = (
-        bool(re.search(r"\b(?:trend|over time|growth|over the years|timeline|trajectory|month by month|year by year)\b", q))
-        or (
-            bool(re.search(r"\b(?:daily|weekly|monthly|quarterly|yearly|annually)\b", q))
-            and not any(k in q.lower() for k in ("monthly income", "monthly salary", "monthly charges", "monthly rate", "monthly expense", "monthly cost", "daily rate", "hourly rate"))
-        )
-        or (datetime_matched and len(datetime_matched) > 0 and not any(k in q.lower() for k in ("min", "max", "average", "avg", "sum", "total") if not any(w in q.lower() for w in ("by", "per", "across", "trend"))))
-    )
+    is_temporal = is_temporal_intent(q, available_cols)
     if is_temporal:
         intent = "trend"
         explicit_chart = explicit_chart or "line"
@@ -621,9 +622,12 @@ def extract_query_contract(
     # Line and Multi-line handling
     color_by_col = None
     if explicit_chart in ("line", "multi_line"):
-        intent = "trend"
+        intent = "trend" if is_temporal else "categorical_comparison"
         if explicit_chart == "multi_line" or (plot_dimensions and len(plot_dimensions) >= 1):
-            if plot_dimensions:
+            if len(plot_dimensions) > 1:
+                series_dim = plot_dimensions[1]
+                color_by_col = series_dim
+            elif plot_dimensions:
                 series_dim = plot_dimensions[0]
                 color_by_col = series_dim
 
@@ -665,13 +669,15 @@ def extract_query_contract(
         if is_temporal:
             x_dim = next((
                 c for c in datetime_matched + available_cols
-                if any(k in c.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day", "created_at", "saledate"))
+                if is_temporal_column(c)
             ), None)
 
         if not x_dim:
             by_match = re.search(r"\b(?:by|across|per)\s+([a-zA-Z0-9_]+)", q)
             if by_match:
                 x_dim = resolve_column_semantically(by_match.group(1), available_cols)
+        if not x_dim and plot_dimensions:
+            x_dim = plot_dimensions[0]
         if not x_dim:
             x_dim = next((c for c in datetime_matched + numeric_matched + matched_cols if c != measure_col and c != series_dim), None)
         dimensions = [x_dim] if x_dim else []

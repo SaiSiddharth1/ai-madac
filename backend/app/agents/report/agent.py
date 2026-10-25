@@ -217,6 +217,9 @@ class ReportAgent:
             return {"final_report": final_report, "agents_used": list(set(agents_used))}
 
         # Handle SCALAR results
+        explanation_data: Optional[dict[str, Any]] = None
+        kpi_data: Optional[dict[str, Any]] = None
+
         is_scalar = (
             (sql_result and sql_result.get("response_type") == "SCALAR")
             or structured_intent.get("answer_type") == "SCALAR"
@@ -351,11 +354,28 @@ class ReportAgent:
         # When a visualization was explicitly requested, use visualization explanation
         if viz_result and viz_result.get("explanation"):
             if any(w in question.lower() for w in ("chart", "plot", "pie", "graph", "visualiz")):
-                answer = viz_result["explanation"]
+                if isinstance(viz_result["explanation"], str):
+                    answer = viz_result["explanation"]
+                elif isinstance(viz_result["explanation"], dict):
+                    answer = viz_result["explanation"].get("what_this_shows", str(viz_result["explanation"]))
+                    explanation_data = dict(viz_result["explanation"])
                 if viz_result.get("key_insights"):
                     insights = viz_result["key_insights"]
-                if isinstance(viz_result.get("explanation"), dict):
-                    explanation_data = dict(viz_result["explanation"])
+
+        if explanation_data is None:
+            explanation_data = {
+                "what_this_shows": "Analysis findings derived from verified dataset records.",
+                "parameters_used": [],
+                "key_insights": insights,
+            }
+
+        if viz_result and viz_result.get("parameters") and isinstance(explanation_data, dict):
+            if not explanation_data.get("parameters_used"):
+                params = viz_result["parameters"]
+                if isinstance(params, dict):
+                    p_list = [f"{pk.replace('_', ' ').title()}: {pv}" for pk, pv in params.items() if pv is not None]
+                    if p_list:
+                        explanation_data["parameters_used"] = p_list
 
         has_chart = bool(chart_paths and len(chart_paths) > 0 and viz_result and viz_result.get("visualization_available", True))
 

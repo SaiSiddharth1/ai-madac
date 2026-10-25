@@ -191,24 +191,27 @@ class CalculationEngine:
         op_b = calc_spec.operands[1]
 
         # Find matching column names for A and B
-        meas_a = (op_a.measure or "metric_a").lower()
-        meas_b = (op_b.measure or "metric_b").lower()
+        meas_a = (op_a.measure or op_a.measure_column or "").lower()
+        meas_b = (op_b.measure or op_b.measure_column or "").lower()
+        name_a = (op_a.name or "").lower()
+        name_b = (op_b.name or "").lower()
 
-        col_a = next((c for c in cols if meas_a in c.lower()), None)
-        col_b = next((c for c in cols if meas_b in c.lower() and c != col_a), None)
-
-        if not col_a and len(cols) >= 1:
-            col_a = cols[0] if len(cols) == 1 or not isinstance(df[cols[0]].iloc[0], str) else cols[1]
-        if not col_b and len(cols) >= 2:
-            col_b = next((c for c in cols if c != col_a and not isinstance(df[c].iloc[0], str)), cols[-1])
+        col_a = next((c for c in cols if (name_a and name_a in c.lower()) or (meas_a and meas_a in c.lower())), None)
+        col_b = next((c for c in cols if c != col_a and ((name_b and name_b in c.lower()) or (meas_b and meas_b in c.lower()))), None)
 
         if not col_a or not col_b or col_a == col_b:
-            # Check if there are numeric columns to compute
-            num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
-            if len(num_cols) >= 2:
-                col_a, col_b = num_cols[0], num_cols[1]
-            else:
-                return df, None
+            logger.warning(f"Calculation operands could not be resolved from DataFrame columns: {cols}. Required: A={name_a or meas_a}, B={name_b or meas_b}")
+            error_calc = CalculationResult(
+                calculated=False,
+                operator=op,
+                label=calc_spec.label or "Calculation Error",
+                expression=calc_spec.label or "",
+                value=None,
+                formatted_value="N/A",
+                is_finite=False,
+                error=f"Required operand columns ({name_a or meas_a}, {name_b or meas_b}) not found in query results.",
+            )
+            return df, error_calc
 
         # If scalar row (1 row):
         if len(df) == 1:

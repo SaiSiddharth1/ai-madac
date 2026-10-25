@@ -218,14 +218,34 @@ class VisualizationAgent:
 
         # Merge fields from state query_contract if present
         if query_contract_dict:
-            if query_contract_dict.get("suggested_chart_type"):
-                contract.requested_chart = query_contract_dict["suggested_chart_type"]
+            chart_t = query_contract_dict.get("explicit_chart_type") or query_contract_dict.get("suggested_chart_type")
+            if chart_t:
+                contract.requested_chart = chart_t
+                contract.explicit_chart_type = chart_t
             if query_contract_dict.get("bin_width"):
                 contract.bin = {"mode": "fixed", "size": query_contract_dict["bin_width"]}
             if query_contract_dict.get("group_by"):
                 contract.requested_dimensions = query_contract_dict["group_by"]
             if query_contract_dict.get("series_dimension"):
                 contract.series_dimension = query_contract_dict["series_dimension"]
+            if query_contract_dict.get("x_axis"):
+                contract.x_axis = query_contract_dict["x_axis"]
+            if query_contract_dict.get("y_axis"):
+                contract.y_axis = query_contract_dict["y_axis"]
+            if query_contract_dict.get("measure_column"):
+                contract.measure_column = query_contract_dict["measure_column"]
+            if query_contract_dict.get("aggregation"):
+                contract.aggregation = query_contract_dict["aggregation"]
+                meas_t = query_contract_dict["aggregation"].lower()
+                if meas_t in ("mean", "average"):
+                    meas_t = "avg"
+                contract.requested_measures = [{"type": meas_t, "column": query_contract_dict.get("measure_column")}]
+            if query_contract_dict.get("intent"):
+                contract.intent = query_contract_dict["intent"]
+            if query_contract_dict.get("requested_fields"):
+                for rf in query_contract_dict["requested_fields"]:
+                    if rf and rf not in contract.requested_fields:
+                        contract.requested_fields.append(rf)
 
         if contract.is_follow_up and not sql_result and prev_result and prev_result.get("validated"):
             sql_result = {
@@ -256,14 +276,24 @@ class VisualizationAgent:
 
         candidate_spec = self._get_candidate_specification(question, contract, schema, available_cols)
         if query_contract_dict:
-            if query_contract_dict.get("suggested_chart_type"):
-                candidate_spec.setdefault("chart", {})["type"] = query_contract_dict["suggested_chart_type"]
+            chart_t = query_contract_dict.get("explicit_chart_type") or query_contract_dict.get("suggested_chart_type")
+            if chart_t:
+                candidate_spec.setdefault("chart", {})["type"] = chart_t
             if query_contract_dict.get("x_axis"):
                 candidate_spec.setdefault("fields", {})["x"] = query_contract_dict["x_axis"]
             if query_contract_dict.get("y_axis"):
                 candidate_spec.setdefault("fields", {})["y"] = query_contract_dict["y_axis"]
+            elif query_contract_dict.get("measure_column"):
+                candidate_spec.setdefault("fields", {})["y"] = query_contract_dict["measure_column"]
             if query_contract_dict.get("series_dimension"):
                 candidate_spec.setdefault("fields", {})["color"] = query_contract_dict["series_dimension"]
+            if query_contract_dict.get("aggregation"):
+                meas_t = query_contract_dict["aggregation"].lower()
+                if meas_t in ("mean", "average"):
+                    meas_t = "avg"
+                candidate_spec.setdefault("measure", {})["type"] = meas_t
+            if query_contract_dict.get("measure_column"):
+                candidate_spec.setdefault("measure", {})["column"] = query_contract_dict["measure_column"]
             if query_contract_dict.get("bin_width"):
                 candidate_spec["bin_width"] = query_contract_dict["bin_width"]
 
@@ -383,6 +413,24 @@ class VisualizationAgent:
                     "visualization_result": self._empty_visualization_result(reason),
                     "agents_used": list(set(state.get("agents_used", []) + ["chart_renderer"])),
                 }
+
+        x_field = spec.get("fields", {}).get("x")
+        y_field = spec.get("fields", {}).get("y")
+        color_field = spec.get("fields", {}).get("color")
+        logger.info(
+            "Plotly input telemetry: query_id=%s, chart_type=%s, x=%s (type=%s, shape=%s), y=%s (type=%s, shape=%s), series=%s (series_count=%s), row_count=%s",
+            state.get("query_id"),
+            spec.get("chart", {}).get("type"),
+            x_field,
+            str(prepared_df[x_field].dtype) if x_field in prepared_df else "N/A",
+            prepared_df[x_field].shape if x_field in prepared_df else "N/A",
+            y_field,
+            str(prepared_df[y_field].dtype) if y_field in prepared_df else "N/A",
+            prepared_df[y_field].shape if y_field in prepared_df else "N/A",
+            color_field,
+            prepared_df[color_field].nunique() if color_field in prepared_df else 0,
+            len(prepared_df),
+        )
 
         try:
             plotly_fig, chart_title, chart_path, json_path = PlotlyRenderer.render(

@@ -210,7 +210,7 @@ class DataPreparer:
             return work_df, {"chart_type": chart_type, "filters": filters}, ["No records match the requested filter criteria."]
 
         # Case A: Cross-Tabulation / Grouped Bar
-        if color_col and color_col in work_df.columns and x_col and x_col in work_df.columns and chart_type not in ("line", "trend", "scatter", "relationship"):
+        if color_col and color_col in work_df.columns and x_col and x_col in work_df.columns and chart_type not in ("line", "multi_line", "multiline", "trend", "scatter", "relationship"):
             prepared_df = (
                 work_df.groupby([x_col, color_col])
                 .size()
@@ -418,11 +418,14 @@ class DataPreparer:
 
             applied_params = {
                 "chart_type": "Scatter Plot",
+                "category": actual_x,
+                "value": actual_y,
                 "x_axis": actual_x,
                 "y_axis": actual_y,
                 "series": color_col if (color_col and color_col in prepared_df.columns) else None,
                 "observation_count": total_obs,
-                "filters": [f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters],
+                "sorting": f"{actual_x} ascending",
+                "filters": ", ".join([f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters]) if filters else "None",
             }
             return prepared_df, applied_params, insights
 
@@ -430,7 +433,32 @@ class DataPreparer:
         if (chart_type in ("line", "trend", "multi_line") or "time" in str(chart_type).lower()) and x_col and x_col in work_df.columns:
             other_cols = [c for c in work_df.columns if c not in (x_col, color_col)]
             val_col = y_col if (y_col and y_col in work_df.columns and y_col != x_col and y_col != color_col) else (other_cols[0] if other_cols else x_col)
-            meas_type = measure_type if measure_type in ("sum", "mean", "min", "max", "count") else "sum"
+            
+            meas_raw = str(measure_type or "avg").lower()
+            if meas_raw in ("mean", "average", "avg"):
+                meas_type = "avg"
+                agg_fn = "mean"
+                agg_display = "AVG"
+            elif meas_raw in ("sum", "total"):
+                meas_type = "sum"
+                agg_fn = "sum"
+                agg_display = "SUM"
+            elif meas_raw in ("max", "maximum", "highest"):
+                meas_type = "max"
+                agg_fn = "max"
+                agg_display = "MAX"
+            elif meas_raw in ("min", "minimum", "lowest"):
+                meas_type = "min"
+                agg_fn = "min"
+                agg_display = "MIN"
+            elif meas_raw in ("count", "distinct"):
+                meas_type = "count"
+                agg_fn = "count"
+                agg_display = "COUNT"
+            else:
+                meas_type = "avg"
+                agg_fn = "mean"
+                agg_display = "AVG"
 
             plot_df = work_df.copy()
 
@@ -468,6 +496,8 @@ class DataPreparer:
                 else:
                     plot_df["_x_clean"] = plot_df[x_col].astype(str)
 
+            sort_display = "Chronological Ascending" if is_valid_datetime else f"{x_col} ascending"
+
             # 2. Determine and parse value column (val_col)
             # Check if val_col is a range category (e.g. Expect '10-20%', '20-30%')
             val_is_range = (
@@ -483,7 +513,6 @@ class DataPreparer:
                 plot_df["_val_clean"] = pd.to_numeric(plot_df[val_col], errors="coerce")
 
             plot_df = plot_df.dropna(subset=["_val_clean"])
-            agg_fn = "mean" if meas_type in ("mean", "avg", "average") else ("count" if meas_type == "count" else meas_type)
 
             # 3. Multi-series vs Single-line
             has_multi_series = False
@@ -492,6 +521,8 @@ class DataPreparer:
                     n_uniq = plot_df[color_col].nunique()
                     if 1 < n_uniq <= 12:
                         has_multi_series = True
+
+            filter_str = ", ".join([f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters]) if filters else "None"
 
             if has_multi_series:
                 # Group by [X, series_dim] and aggregate
@@ -517,18 +548,20 @@ class DataPreparer:
                 series_vals = prepared_df[color_col].unique()
                 parameters_used.append(f"X-Axis: {x_col}")
                 parameters_used.append(f"Metric (Y-Axis): {val_col}")
-                parameters_used.append(f"Aggregation: {meas_type.upper()}")
+                parameters_used.append(f"Aggregation: {agg_display}")
                 parameters_used.append(f"Series (Lines): {color_col} ({len(series_vals)} lines: {', '.join(str(s) for s in series_vals[:5])})")
-                parameters_used.append(f"Sort: {x_col} Ascending ({'Numeric' if x_is_numeric else 'Chronological'})")
+                parameters_used.append(f"Sort: {sort_display}")
 
                 applied_params = {
-                    "chart_type": "Multi-Series Line Chart",
+                    "chart_type": "Multi-Line",
+                    "category": x_col,
                     "x_axis": x_col,
+                    "value": val_col,
                     "y_axis": val_col,
-                    "aggregation": meas_type.upper(),
+                    "aggregation": agg_display,
                     "series": color_col,
-                    "sorting": "Numeric Ascending" if x_is_numeric else "Chronological Ascending",
-                    "filters": [f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters],
+                    "sorting": sort_display,
+                    "filters": filter_str,
                 }
                 insights.append(
                     f"Multi-line trajectory of {val_col.replace('_', ' ').title()} across {x_col} grouped by {color_col}."
@@ -554,8 +587,8 @@ class DataPreparer:
 
             parameters_used.append(f"X-Axis: {x_col}")
             parameters_used.append(f"Metric (Y-Axis): {val_col}")
-            parameters_used.append(f"Aggregation: {meas_type.upper()}")
-            parameters_used.append(f"Sort: {x_col} Ascending ({'Numeric' if x_is_numeric else 'Chronological'})")
+            parameters_used.append(f"Aggregation: {agg_display}")
+            parameters_used.append(f"Sort: {sort_display}")
 
             if not prepared_df.empty:
                 first_pt = prepared_df.iloc[0]
@@ -570,11 +603,13 @@ class DataPreparer:
 
             applied_params = {
                 "chart_type": "Line Chart",
+                "category": x_col,
                 "x_axis": x_col,
+                "value": val_col,
                 "y_axis": val_col,
-                "aggregation": meas_type.upper(),
-                "sorting": "Numeric Ascending" if x_is_numeric else "Chronological Ascending",
-                "filters": [f"{f.get('column') or f.get('field')} {f.get('op') or f.get('operator')} {f.get('value')}" for f in filters],
+                "aggregation": agg_display,
+                "sorting": sort_display,
+                "filters": filter_str,
             }
             return prepared_df, applied_params, insights
 

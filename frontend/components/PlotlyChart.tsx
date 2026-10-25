@@ -358,19 +358,30 @@ export default function PlotlyChart({
                 Aggregation: <strong>{parameters.aggregation}</strong>
               </span>
             )}
-            {parameters.filters && (
+            {parameters.series && (
               <span
                 style={{
-                  background: "rgba(245, 158, 11, 0.15)",
-                  color: "#fcd34d",
-                  border: "1px solid rgba(245, 158, 11, 0.3)",
+                  background: "rgba(236, 72, 153, 0.15)",
+                  color: "#f472b6",
+                  border: "1px solid rgba(236, 72, 153, 0.3)",
                   padding: "3px 8px",
                   borderRadius: "6px",
                 }}
               >
-                Filter: <strong>{parameters.filters}</strong>
+                Series / Group: <strong>{parameters.series}</strong>
               </span>
             )}
+            <span
+              style={{
+                background: "rgba(245, 158, 11, 0.15)",
+                color: "#fcd34d",
+                border: "1px solid rgba(245, 158, 11, 0.3)",
+                padding: "3px 8px",
+                borderRadius: "6px",
+              }}
+            >
+              Filter: <strong>{parameters.filters || "None"}</strong>
+            </span>
             {parameters.sorting && (
               <span
                 style={{

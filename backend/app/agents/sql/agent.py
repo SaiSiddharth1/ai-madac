@@ -21,6 +21,7 @@ from app.db.database import sync_engine
 from app.schemas.query_contract import QueryContract
 from app.utils.serialization import to_json_safe
 from app.utils.sql_validator import sanitize_table_name, validate_sql
+from app.utils.temporal import is_temporal_column
 
 logger = logging.getLogger(__name__)
 
@@ -470,7 +471,7 @@ class SQLAgent:
             # 1. Genuine temporal time-series queries
             temporal_col = next((
                 g for g in contract.group_by
-                if any(k in g.lower() for k in ("invoicedate", "order_date", "orderdate", "date", "timestamp", "time", "year", "month", "day", "created_at", "saledate"))
+                if is_temporal_column(g)
             ), None)
 
             is_line_or_trend = (
@@ -549,7 +550,7 @@ class SQLAgent:
                 # Non-temporal numeric or ordinal line chart (e.g. Age, or Age + Gender)
                 x_col = contract.group_by[0]
                 other_group_cols = [quote_col(g) for g in contract.group_by[1:]]
-                order_expr = f"CAST({quote_col(x_col)} AS NUMERIC)"
+                order_expr = quote_col(x_col)
                 direction = "ASC"
                 if contract.sort:
                     direction = contract.sort.direction.upper()

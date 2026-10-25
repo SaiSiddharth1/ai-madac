@@ -98,6 +98,11 @@ class QueryContract(BaseModel):
     @property
     def requested_fields(self) -> list[str]:
         fields = list(self.dimensions)
+        for g in self.group_by:
+            if g not in fields:
+                fields.append(g)
+        if self.series_dimension and self.series_dimension not in fields:
+            fields.append(self.series_dimension)
         if self.measure_column and self.measure_column not in fields:
             fields.append(self.measure_column)
         if self.x_axis and self.x_axis not in fields:
