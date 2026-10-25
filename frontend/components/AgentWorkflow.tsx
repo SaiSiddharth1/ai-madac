@@ -64,9 +64,10 @@ export default function AgentWorkflow({ state }: AgentWorkflowProps) {
       badgeColor = "bg-rose-600 text-white";
       statusText = "Failed";
     } else if (status === "skipped") {
-      borderClass = "border-zinc-900/50 opacity-40";
-      bgStyle = "rgba(5, 5, 10, 0.3)";
-      badgeColor = "bg-zinc-800 text-zinc-500";
+      const isInfo = message?.toLowerCase().includes("kpi") || message?.toLowerCase().includes("represented");
+      borderClass = isInfo ? "border-sky-500/30 shadow-[0_0_15px_rgba(14,165,233,0.15)]" : "border-zinc-900/50 opacity-60";
+      bgStyle = isInfo ? "rgba(12, 28, 48, 0.7)" : "rgba(5, 5, 10, 0.3)";
+      badgeColor = isInfo ? "bg-sky-500/20 text-sky-300 border border-sky-500/30" : "bg-zinc-800 text-zinc-500";
       statusText = "Skipped";
     }
 

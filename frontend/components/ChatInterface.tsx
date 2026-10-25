@@ -64,6 +64,11 @@ export default function ChatInterface({ datasetId, datasetName }: ChatInterfaceP
         agents[a] = { status: 'skipped', message: 'Not required' };
       }
     });
+    if (report && !report.chart_paths?.length && (report.kpi || report.response_type === "SCALAR")) {
+      if (agents.chart_renderer) {
+        agents.chart_renderer = { status: 'skipped', message: 'Chart skipped — result is better represented as a KPI' };
+      }
+    }
     return {
       intent,
       executionPlan: plan,

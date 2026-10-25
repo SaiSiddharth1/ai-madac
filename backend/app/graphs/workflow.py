@@ -160,7 +160,11 @@ async def visualization_node(state: AgentState) -> dict[str, Any]:
         await workflow_event_manager.emit(query_id, "visualization_validator", "completed", "Specification validated against Query Contract")
         if not is_avail or not has_chart:
             reason = viz_res.get("reason") or "Interactive Plotly chart could not be generated."
-            await workflow_event_manager.emit(query_id, "chart_renderer", "failed", reason)
+            is_intentional_skip = any(k in reason.lower() for k in ("kpi", "single value", "single metric", "better communicated directly"))
+            if is_intentional_skip:
+                await workflow_event_manager.emit(query_id, "chart_renderer", "skipped", "Chart skipped — result is better represented as a KPI")
+            else:
+                await workflow_event_manager.emit(query_id, "chart_renderer", "failed", reason)
         else:
             await workflow_event_manager.emit(query_id, "chart_renderer", "completed", "Interactive Plotly chart generated")
         return _record_agent_completion(state, res, "visualization_agent")
@@ -211,7 +215,11 @@ async def chart_renderer_node(state: AgentState) -> dict[str, Any]:
         await workflow_event_manager.emit(query_id, "chart_renderer", "failed", f"Rendering error: {errors[0]}")
     elif not is_avail or not has_chart:
         reason = viz_res.get("reason") or "Interactive Plotly chart could not be generated."
-        await workflow_event_manager.emit(query_id, "chart_renderer", "failed", reason)
+        is_intentional_skip = any(k in reason.lower() for k in ("kpi", "single value", "single metric", "better communicated directly"))
+        if is_intentional_skip:
+            await workflow_event_manager.emit(query_id, "chart_renderer", "skipped", "Chart skipped — result is better represented as a KPI")
+        else:
+            await workflow_event_manager.emit(query_id, "chart_renderer", "failed", reason)
     else:
         await workflow_event_manager.emit(query_id, "chart_renderer", "completed", "Interactive Plotly chart generated successfully")
     return _record_agent_completion(state, res, "chart_renderer")
